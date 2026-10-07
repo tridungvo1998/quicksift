@@ -1,0 +1,17 @@
+if(NOT TARGET yuv)
+    get_filename_component(_LIBYUV_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+    add_library(yuv STATIC IMPORTED)
+    set_target_properties(yuv PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_LIBYUV_PREFIX}/include"
+        IMPORTED_LOCATION_RELEASE "${_LIBYUV_PREFIX}/lib/yuv.lib"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${_LIBYUV_PREFIX}/lib/yuv.lib"
+        IMPORTED_LOCATION_MINSIZEREL "${_LIBYUV_PREFIX}/lib/yuv.lib"
+        IMPORTED_LOCATION_DEBUG "${_LIBYUV_PREFIX}/debug/lib/yuvd.lib"
+        MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release
+        MAP_IMPORTED_CONFIG_MINSIZEREL Release
+    )
+endif()
+
+if(NOT TARGET libyuv::yuv)
+    add_library(libyuv::yuv ALIAS yuv)
+endif()

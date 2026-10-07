@@ -1,0 +1,66 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-vs2026",
+      "displayName": "QuickSift x64 \u2014 Visual Studio 2026",
+      "description": "Requires CMake 4.2 or newer and VCPKG_ROOT.",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64",
+      "binaryDir": "$env{LOCALAPPDATA}/QuickSiftBuild/presets/vs2026",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "$env{LOCALAPPDATA}/QuickSiftBuild/vcpkg_installed-vs18",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows",
+        "VCPKG_MANIFEST_INSTALL": "ON",
+        "QS_BUNDLE_CODECS": "ON",
+        "QS_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "windows-vs2022",
+      "displayName": "QuickSift x64 \u2014 Visual Studio 2022",
+      "description": "Requires CMake 3.24 or newer and VCPKG_ROOT.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "$env{LOCALAPPDATA}/QuickSiftBuild/presets/vs2022",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "$env{LOCALAPPDATA}/QuickSiftBuild/vcpkg_installed-vs17",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows",
+        "VCPKG_MANIFEST_INSTALL": "ON",
+        "QS_BUNDLE_CODECS": "ON",
+        "QS_WARNINGS_AS_ERRORS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "vs2026-debug",
+      "configurePreset": "windows-vs2026",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2026-release",
+      "configurePreset": "windows-vs2026",
+      "configuration": "Release"
+    },
+    {
+      "name": "vs2022-debug",
+      "configurePreset": "windows-vs2022",
+      "configuration": "Debug"
+    },
+    {
+      "name": "vs2022-release",
+      "configurePreset": "windows-vs2022",
+      "configuration": "Release"
+    }
+  ]
+}

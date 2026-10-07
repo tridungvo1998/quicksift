@@ -1,0 +1,43 @@
+#pragma code_page(65001)
+
+// Configured by CMake so the PE version resource cannot drift from project().
+// VERSIONINFO must use numeric resource ID 1. Otherwise rc.exe can treat
+// VS_VERSION_INFO as a literal string resource name, which GetFileVersionInfo()
+// does not discover.
+#define IDI_QS 101
+
+IDI_QS ICON "@QS_ICON_RESOURCE_PATH@"
+
+1 VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@PROJECT_VERSION_TWEAK@
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,@PROJECT_VERSION_TWEAK@
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x3L
+#else
+ FILEFLAGS 0x2L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Vo Hoang Tri Dung\0"
+            VALUE "FileDescription", "QuickSift — Fast Photo Culling for Windows\0"
+            VALUE "FileVersion", "@QS_FILE_VERSION@\0"
+            VALUE "InternalName", "QuickSift\0"
+            VALUE "LegalCopyright", "Copyright © 2026 Vo Hoang Tri Dung\0"
+            VALUE "OriginalFilename", "QuickSift.exe\0"
+            VALUE "ProductName", "QuickSift\0"
+            VALUE "ProductVersion", "@QS_DISPLAY_VERSION@\0"
+            VALUE "Comments", "https://quicksift.pages.dev/\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

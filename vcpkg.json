@@ -1,0 +1,40 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg/master/scripts/vcpkg.schema.json",
+  "name": "quicksift",
+  "version-string": "0.9",
+  "description": "Fast native Windows photo culling and comparison application",
+  "supports": "windows & !uwp",
+  "builtin-baseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+  "dependencies": [
+    "cppwinrt",
+    {
+      "name": "exiv2",
+      "default-features": false,
+      "features": [
+        "xmp",
+        "png",
+        "bmff"
+      ]
+    },
+    {
+      "name": "libraw",
+      "features": [
+        "dng-lossy"
+      ]
+    },
+    {
+      "name": "libavif",
+      "default-features": false,
+      "features": [
+        "dav1d"
+      ]
+    },
+    {
+      "name": "libwebp",
+      "default-features": false
+    },
+    "libjpeg-turbo",
+    "libyuv",
+    "sqlite3"
+  ]
+}

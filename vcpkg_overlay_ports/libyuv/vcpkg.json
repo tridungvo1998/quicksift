@@ -1,0 +1,13 @@
+{
+  "name": "libyuv",
+  "version-string": "2026-custom-clang2",
+  "description": "libyuv built with clang-cl on Windows so x64 SIMD acceleration is enabled",
+  "homepage": "https://chromium.googlesource.com/libyuv/libyuv",
+  "license": "BSD-3-Clause",
+  "dependencies": [
+    "libjpeg-turbo",
+    "vcpkg-cmake",
+    "vcpkg-cmake-config",
+    "vcpkg-cmake-get-vars"
+  ]
+}
