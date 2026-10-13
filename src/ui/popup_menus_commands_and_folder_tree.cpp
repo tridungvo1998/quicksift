@@ -1,6 +1,8 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
 
+#include <cmath>
+
 namespace quicksift::app {
 namespace {
 
@@ -22,6 +24,20 @@ MenuItem MakeMenuItem(std::wstring text, int command, bool checked = false,
 // UI command layer: custom popup menus, command dispatch, notifications, folder
 // tree population, visible-catalog rebuilding, status text, and invalidation.
 
+std::function<void()> QuickSiftApplicationImpl::DropdownMaintenancePump() {
+    return [this] {
+        // TrackDropdown owns a deliberately narrow nested message loop. Remove
+        // its wake-up messages and integrate results directly so decoded pixel
+        // buffers cannot pile up while any custom menu remains open.
+        MSG wake{};
+        while (PeekMessageW(&wake, hwnd_, WM_APP_BACKGROUND_COMPLETION,
+            WM_APP_BACKGROUND_COMPLETION, PM_REMOVE)) {
+        }
+        if (completionQueue_.Size() != 0) DrainBackgroundCompletions();
+    };
+}
+
+
 int QuickSiftApplicationImpl::TrackDropdownMenu(HWND anchor, std::vector<MenuItem> items) {
     if (!anchor || items.empty()) return 0;
     for (MenuItem& item : items) {
@@ -36,16 +52,7 @@ int QuickSiftApplicationImpl::TrackDropdownMenu(HWND anchor, std::vector<MenuIte
     request.font = uiFont_;
     request.dpi = currentDpi_;
     request.items = std::move(items);
-    request.maintenancePump = [this] {
-        // TrackDropdown owns a deliberately narrow nested message loop. Remove
-        // its wake-up messages and integrate results directly so decoded pixel
-        // buffers cannot pile up while any custom menu remains open.
-        MSG wake{};
-        while (PeekMessageW(&wake, hwnd_, WM_APP_BACKGROUND_COMPLETION,
-            WM_APP_BACKGROUND_COMPLETION, PM_REMOVE)) {
-        }
-        if (completionQueue_.Size() != 0) DrainBackgroundCompletions();
-    };
+    request.maintenancePump = DropdownMaintenancePump();
     request.errorSink = [](std::wstring_view operation) {
         quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Error,
             L"UI", operation);
@@ -91,6 +98,10 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
 
     void QuickSiftApplicationImpl::OnCommand(int id, int notifyCode, HWND source) {
         (void)source;
+        if (id == ID_THUMBNAIL_SEARCH) {
+            if (notifyCode == EN_CHANGE) OnSearchTextChanged();
+            return;
+        }
         if (id == ID_SETTING_LANGUAGE_SELECTOR) { ShowLanguageMenu(); return; }
         if (id == ID_SAVE_USER_COMMENT) { SaveUserComment(); return; }
         if (id == ID_LIBRARY_LIST && notifyCode == LBN_SELCHANGE) {
@@ -200,6 +211,24 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
         case ID_LABEL_FILTER:
             ShowColorLabelFilterMenu();
             break;
+        case ID_ISO_FILTER:
+            ShowIsoFilterMenu();
+            break;
+        case ID_APERTURE_FILTER:
+            ShowApertureFilterMenu();
+            break;
+        case ID_FOCAL_FILTER:
+            ShowFocalFilterMenu();
+            break;
+        case ID_SHUTTER_FILTER:
+            ShowShutterFilterMenu();
+            break;
+        case ID_CAMERA_FILTER:
+            ShowCameraFilterMenu();
+            break;
+        case ID_HOUR_FILTER:
+            ShowHourFilterMenu();
+            break;
         case ID_ZOOM_MODE:
             ShowZoomModeMenu();
             break;
@@ -210,6 +239,7 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             RotateView(90);
             break;
         case ID_SYNC_VIEW:
+            ClearFaceZoomToggle(); // toggle keys change (per pane <-> shared)
             reviewState_.SetSyncCompareView(!reviewState_.SyncCompareView());
             UpdateToggleButtons();
             UpdateZoomModeButton();
@@ -217,6 +247,7 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             InvalidateCanvas();
             break;
         case ID_FACE_LOCK:
+            ClearFaceZoomToggle();
             RefreshFaceDetectorCapability(false);
             if (faceAnalysisRetryPolicy_.Capability() !=
                 quicksift::core::FaceDetectorCapability::Available) {
@@ -257,6 +288,12 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
         case ID_HELP:
             ShowHelp();
             break;
+        case ID_RATINGS_EXCHANGE:
+            ShowRatingsExchangeChooser();
+            break;
+        case ID_BATCH_PROCESSING:
+            OpenBatchProcessingDialog();
+            break;
         case ID_FILMSTRIP:
             ToggleFilmstrip();
             break;
@@ -292,10 +329,17 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
 
     void QuickSiftApplicationImpl::RefreshLibraryList() {
         if (!libraryList_) return;
+        // 0.9.4.0 polish: bounded wait on the cache database; keep the current list
+        // and retry shortly instead of blocking the UI thread behind a cache write.
+        auto folders = persistentCache_.TryGetLibraryFolders();
+        if (!folders) {
+            SetTimer(hwnd_, ID_TIMER_LIBRARY_LIST_RETRY, 150, nullptr);
+            return;
+        }
         SendMessageW(libraryList_, WM_SETREDRAW, FALSE, 0);
         SendMessageW(libraryList_, LB_RESETCONTENT, 0, 0);
         libraryPaths_.clear();
-        for (const auto& [path, timestamp] : persistentCache_.GetLibraryFolders()) {
+        for (const auto& [path, timestamp] : *folders) {
             (void)timestamp;
             libraryPaths_.push_back(path);
             SendMessageW(libraryList_, LB_ADDSTRING, 0,
@@ -322,11 +366,32 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
 
 
     bool QuickSiftApplicationImpl::CullAllowed(const PhotoItem& item) const {
+        // Filter tab AND thumbnail search: both evaluate core::predicate clauses over the
+        // same authoritative record (see core/image_metadata.h).
+        return FilterAllowed(item) && SearchAllows(item);
+    }
+
+
+    bool QuickSiftApplicationImpl::FilterAllowed(const PhotoItem& item) const {
         FormatSelection formatSelection;
         for (const auto& [group, enabled] : formats_) formatSelection.SetEnabled(group, enabled);
-        return quicksift::core::IsFormatAllowed(item.extension, formatSelection) &&
-            quicksift::core::IsDateAllowed(item.modified, dateFilter_) &&
-            quicksift::core::IsCullAllowed(item, ratingFilter_, pickFilter_, colorLabelFilter_);
+        if (!quicksift::core::IsFormatAllowed(item.extension, formatSelection) ||
+            !quicksift::core::IsDateAllowed(item.modified, dateFilter_) ||
+            !quicksift::core::IsCullAllowed(item, ratingFilter_, pickFilter_, colorLabelFilter_)) {
+            return false;
+        }
+        if (isoFilter_ >= 0 && (!item.cameraSettingsKnown || item.iso != isoFilter_)) return false;
+        if (apertureFilter_ > 0.0 && (!item.cameraSettingsKnown ||
+            std::abs(item.aperture - apertureFilter_) > 0.05)) return false;
+        if (focalFilter_ > 0.0 && (!item.cameraSettingsKnown ||
+            std::abs(item.focalLength - focalFilter_) > 0.5)) return false;
+        if (shutterFilter_ > 0.0 && (!item.cameraSettingsKnown ||
+            std::abs(item.shutterSpeed - shutterFilter_) > shutterFilter_ * 0.05)) return false;
+        if (!cameraFilter_.empty() && (!item.cameraSettingsKnown ||
+            item.camera.find(cameraFilter_) == std::wstring::npos)) return false;
+        if (hourFilter_ >= 0 && (item.captureTimeSource == quicksift::core::predicate::CaptureTimeSource::Unknown ||
+            item.captureTime.hour != hourFilter_)) return false;
+        return true;
     }
 
 
@@ -355,15 +420,22 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             pickFilter_ != PickFilter::All ||
             colorLabelFilter_ != ColorLabelFilter::All ||
             dateFilter_ != DateFilter::Any ||
+            isoFilter_ >= 0 || apertureFilter_ > 0.0 || focalFilter_ > 0.0 ||
+            shutterFilter_ > 0.0 || !cameraFilter_.empty() || hourFilter_ >= 0 ||
             std::any_of(formats_.begin(), formats_.end(),
                 [](const auto& entry) { return !entry.second; });
-        const size_t visibleCount = static_cast<size_t>(std::count_if(
-            catalog_.Photos().begin(), catalog_.Photos().end(), [this](const PhotoItem& photo) { return CullAllowed(photo); }));
+        // One pass: the Filter tab decides the search box's "of N" total, the search
+        // (when active) narrows it further.
         std::vector<size_t> visibleOrder;
-        visibleOrder.reserve(visibleCount);
+        visibleOrder.reserve(catalog_.PhotoCount());
+        size_t filterCount = 0;
         for (size_t catalogIndex = 0; catalogIndex < catalog_.PhotoCount(); ++catalogIndex) {
-            if (CullAllowed(catalog_.PhotoAt(catalogIndex))) visibleOrder.push_back(catalogIndex);
+            const PhotoItem& photo = catalog_.PhotoAt(catalogIndex);
+            if (!FilterAllowed(photo)) continue;
+            ++filterCount;
+            if (SearchAllows(photo)) visibleOrder.push_back(catalogIndex);
         }
+        searchBaseCount_ = filterCount;
         std::stable_sort(visibleOrder.begin(), visibleOrder.end(),
             [this](size_t left, size_t right) {
                 return PhotoSortLess(catalog_.PhotoAt(left), catalog_.PhotoAt(right));
@@ -430,7 +502,8 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
 
     std::wstring QuickSiftApplicationImpl::FileOperationStatusLine() const {
         const auto progress = transactions_.FileProgress();
-        if (!progress || progress->totalFiles == 0) return {};
+        // Ratings export/import progress shares the status progress line.
+        if (!progress || progress->totalFiles == 0) return RatingsStatusLine();
 
         const std::wstring action = progress->deleteToFolder ? Tr(L"Deleting") :
             (progress->copy ? Tr(L"Copying") : Tr(L"Moving"));
@@ -495,7 +568,14 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             else if (reviewState_.Mode() == ViewMode::Compare) text << L"  •  synchronized wheel zoom and drag pan  •  click a pane, then 1–5 to rate";
             else text << L"  •  Enter: open selection  •  Ctrl+A: select all  •  1–5: rate selection";
         }
-        const std::wstring localizedStatus = Tr(text.str());
+        std::wstring localizedStatus = Tr(text.str());
+        // Red-border reason for the photo being reviewed (already localized pieces).
+        if (!currentFolder_.empty() && reviewState_.Mode() != ViewMode::Thumbnails) {
+            if (const PhotoItem* active = PhotoForPath(ActiveInfoPath())) {
+                const std::wstring reason = FaceWarningReasonText(*active);
+                if (!reason.empty()) localizedStatus += L"  •  " + reason;
+            }
+        }
         const std::wstring nextRightText = Tr(SingleStatusDetail());
         const std::wstring nextProgressText = FileOperationStatusLine();
         const bool progressVisibilityChanged = nextProgressText.empty() != statusProgressText_.empty();

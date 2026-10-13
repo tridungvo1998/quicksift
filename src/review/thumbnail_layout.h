@@ -11,6 +11,9 @@ struct ThumbnailLayoutMetrics {
     float canvasHeight = 0.0f;
     float padding = 12.0f;
     float leftInset = 12.0f;
+    // Distance from the canvas top to the first row (>= padding). Larger while the
+    // floating Thumbnail search field reserves its lane above the grid.
+    float topInset = 12.0f;
     float cellWidth = 0.0f;
     float cellHeight = 0.0f;
     float cardWidth = 0.0f;
@@ -29,7 +32,8 @@ struct ThumbnailRect {
 };
 
 [[nodiscard]] ThumbnailLayoutMetrics CalculateThumbnailLayout(float canvasWidth,
-    float canvasHeight, int thumbnailSize, std::size_t itemCount, float leftInset) noexcept;
+    float canvasHeight, int thumbnailSize, std::size_t itemCount, float leftInset,
+    float topInset = 0.0f) noexcept;
 [[nodiscard]] ThumbnailRect ThumbnailCardRect(const ThumbnailLayoutMetrics& metrics,
     std::size_t index, float scrollOffset) noexcept;
 [[nodiscard]] std::optional<std::size_t> HitTestThumbnail(const ThumbnailLayoutMetrics& metrics,

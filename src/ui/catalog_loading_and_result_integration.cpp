@@ -1,5 +1,7 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "diagnostics/log_categories.h"
+#include "core/log_rate_limiter.h"
 
 #include <cmath>
 namespace quicksift::app {
@@ -26,6 +28,245 @@ void QuickSiftApplicationImpl::RememberTransientDecodeFailure(const std::wstring
     // The timer is one-shot, so this does not create a continuous polling loop.
     StartUiTimer(ID_TIMER_IDLE_QUALITY, 260, L"retry-after-backoff");
 }
+
+// ---------------------------------------------------------------------------------
+// 0.9.4.0 decode retry policy (thumbnails and the Single/Compare view lane).
+//
+//  * At most kMaxDecodeAttempts (3) worker attempts per path. The worker escalates the
+//    per-attempt timeout (base, 2x, 4x - Worker::CalculateAdaptiveTimeoutMs).
+//  * Short backoff between attempts (150 ms, then 600 ms) instead of an immediate
+//    re-enqueue that hits the same locked file again.
+//  * Transient failures (sharing/lock violation, network/device error, zero-length
+//    file still being written) and timeouts use all attempts; the last attempt also
+//    switches to the WIC -> Shell thumbnail fallback chain.
+//  * Deterministic failures (file readable, every codec rejected it) skip straight to
+//    the fallback attempt; a missing file is terminal immediately.
+//  * The failed placeholder is shown only after the final attempt (terminal). A
+//    terminal entry resets automatically when the file's size/mtime changes, on folder
+//    reload, or via manual retry (View > Retry failed images / Ctrl+Shift+R). A
+//    transient terminal failure also re-arms itself after 30 s while visible.
+// ---------------------------------------------------------------------------------
+namespace {
+constexpr auto kDecodeRetryFirstBackoff = std::chrono::milliseconds(150);
+constexpr auto kDecodeRetrySecondBackoff = std::chrono::milliseconds(600);
+constexpr auto kTransientTerminalRearm = std::chrono::seconds(30);
+
+bool IsTransientFailureKind(DecodeFailureKind kind) noexcept {
+    return kind == DecodeFailureKind::Transient || kind == DecodeFailureKind::Timeout ||
+        kind == DecodeFailureKind::None;
+}
+
+const wchar_t* FailureKindName(DecodeFailureKind kind) noexcept {
+    switch (kind) {
+    case DecodeFailureKind::None: return L"unknown";
+    case DecodeFailureKind::Transient: return L"transient";
+    case DecodeFailureKind::Timeout: return L"timeout";
+    case DecodeFailureKind::Missing: return L"missing";
+    case DecodeFailureKind::Decode: return L"decode";
+    }
+    return L"unknown";
+}
+
+template <typename State>
+bool FileChangedSinceFailure(const State& state, std::uint64_t fileSize, std::int64_t modifiedStamp) noexcept {
+    if (state.fileSize == 0 && state.modifiedStamp == 0) return false;
+    if (fileSize == 0 && modifiedStamp == 0) return false;
+    return (fileSize != 0 && state.fileSize != 0 && fileSize != state.fileSize) ||
+        (modifiedStamp != 0 && state.modifiedStamp != 0 && modifiedStamp != state.modifiedStamp);
+}
+} // namespace
+
+bool QuickSiftApplicationImpl::ThumbnailDecodeAdmissible(const PhotoItem& photo,
+    const std::wstring& key, std::chrono::steady_clock::time_point now,
+    int& retryAttempt, bool& forceWic) {
+    retryAttempt = 0;
+    forceWic = false;
+    const auto it = thumbnailRetryState_.find(key);
+    if (it == thumbnailRetryState_.end()) {
+        // A terminal mark without state (legacy path) is honoured as-is.
+        return !failedThumbnailPaths_.contains(key);
+    }
+    DecodeRetryState& state = it->second;
+    if (FileChangedSinceFailure(state, photo.fileSize, photo.modifiedStamp)) {
+        // The file was rewritten by another app: forget the failure entirely.
+        thumbnailRetryState_.erase(it);
+        failedThumbnailPaths_.erase(key);
+        return true;
+    }
+    if (state.terminal) {
+        if (IsTransientFailureKind(state.lastFailure) && now >= state.nextRetryAt) {
+            thumbnailRetryState_.erase(it);
+            failedThumbnailPaths_.erase(key);
+            return true;
+        }
+        return false;
+    }
+    if (now < state.nextRetryAt) return false;
+    retryAttempt = std::clamp(state.failedAttempts, 0, kMaxDecodeAttempts - 1);
+    forceWic = state.lastFailure == DecodeFailureKind::Decode ||
+        retryAttempt >= kMaxDecodeAttempts - 1;
+    return true;
+}
+
+void QuickSiftApplicationImpl::RecordThumbnailDecodeFailure(const WorkResult& result) {
+    const std::wstring key = NormalizedPathKey(result.path);
+    const auto now = std::chrono::steady_clock::now();
+    DecodeRetryState& state = thumbnailRetryState_[key];
+    state.failedAttempts = std::max(state.failedAttempts + 1, result.retryAttempt + 1);
+    DecodeFailureKind kind = result.timedOut ? DecodeFailureKind::Timeout : result.failureKind;
+    if (kind == DecodeFailureKind::None) kind = DecodeFailureKind::Transient;
+    state.lastFailure = kind;
+    state.fileSize = result.fileSize;
+    state.modifiedStamp = result.modifiedStamp;
+    if (state.fileSize == 0 && state.modifiedStamp == 0) {
+        if (const auto index = CatalogIndexForPath(result.path.wstring())) {
+            const PhotoItem& photo = catalog_.PhotoAt(*index);
+            state.fileSize = photo.fileSize;
+            state.modifiedStamp = photo.modifiedStamp;
+        }
+    }
+    const bool fallbackAlreadyTried = result.forceWic;
+    state.terminal = kind == DecodeFailureKind::Missing ||
+        state.failedAttempts >= kMaxDecodeAttempts ||
+        (kind == DecodeFailureKind::Decode && fallbackAlreadyTried);
+    if (state.terminal) {
+        state.nextRetryAt = IsTransientFailureKind(kind) ?
+            now + kTransientTerminalRearm : std::chrono::steady_clock::time_point::max();
+        failedThumbnailPaths_.insert(key);
+    } else {
+        state.nextRetryAt = now + (state.failedAttempts <= 1 ?
+            kDecodeRetryFirstBackoff : kDecodeRetrySecondBackoff);
+        failedThumbnailPaths_.erase(key);
+    }
+    // Structured + privacy-respecting (file name and path id instead of the full
+    // path); a whole folder of unreadable files is rate-limited, terminal verdicts
+    // are always recorded.
+    static quicksift::core::LogRateLimiter limiter(20, std::chrono::seconds(10));
+    std::uint64_t suppressed = 0;
+    if (state.terminal || limiter.Allow(&suppressed)) {
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kThumbReliability,
+            state.terminal ? L"thumbnail_marked_failed" : L"thumbnail_retry_scheduled",
+            { L"file", quicksift::diagnostics::LogFileName(result.path) },
+            { L"path_id", quicksift::diagnostics::LogPathId(result.path) },
+            { L"attempt", std::to_wstring(state.failedAttempts) },
+            { L"max_attempts", std::to_wstring(kMaxDecodeAttempts) },
+            { L"kind", std::wstring(FailureKindName(kind)) },
+            { L"fallback", fallbackAlreadyTried ? L"1" : L"0" },
+            { L"suppressed", std::to_wstring(suppressed) });
+    }
+    ArmDecodeRetryTimer();
+    ArmThumbnailReconcile(0);
+}
+
+bool QuickSiftApplicationImpl::ViewDecodeAdmissible(const fs::path& path, int& retryAttempt) {
+    retryAttempt = 0;
+    const std::wstring key = NormalizedPathKey(path);
+    const auto it = viewRetryState_.find(key);
+    if (it == viewRetryState_.end()) return true;
+    DecodeRetryState& state = it->second;
+    if (const auto index = CatalogIndexForPath(path.wstring())) {
+        const PhotoItem& photo = catalog_.PhotoAt(*index);
+        if (FileChangedSinceFailure(state, photo.fileSize, photo.modifiedStamp)) {
+            viewRetryState_.erase(it);
+            return true;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (state.terminal) {
+        if (IsTransientFailureKind(state.lastFailure) && now >= state.nextRetryAt) {
+            viewRetryState_.erase(it);
+            return true;
+        }
+        return false;
+    }
+    if (now < state.nextRetryAt) return false;
+    retryAttempt = std::clamp(state.failedAttempts, 0, kMaxDecodeAttempts - 1);
+    return true;
+}
+
+bool QuickSiftApplicationImpl::ViewDecodeTerminallyFailed(const fs::path& path) {
+    const auto it = viewRetryState_.find(NormalizedPathKey(path));
+    return it != viewRetryState_.end() && it->second.terminal;
+}
+
+void QuickSiftApplicationImpl::RecordViewDecodeFailure(const WorkResult& result) {
+    const std::wstring key = NormalizedPathKey(result.path);
+    const auto now = std::chrono::steady_clock::now();
+    DecodeRetryState& state = viewRetryState_[key];
+    state.failedAttempts = std::max(state.failedAttempts + 1, result.retryAttempt + 1);
+    DecodeFailureKind kind = result.timedOut ? DecodeFailureKind::Timeout : result.failureKind;
+    if (kind == DecodeFailureKind::None) kind = DecodeFailureKind::Transient;
+    state.lastFailure = kind;
+    state.fileSize = result.fileSize;
+    state.modifiedStamp = result.modifiedStamp;
+    if (state.fileSize == 0 && state.modifiedStamp == 0) {
+        if (const auto index = CatalogIndexForPath(result.path.wstring())) {
+            const PhotoItem& photo = catalog_.PhotoAt(*index);
+            state.fileSize = photo.fileSize;
+            state.modifiedStamp = photo.modifiedStamp;
+        }
+    }
+    // A view decode already runs the full codec chain including the Shell provider
+    // (worker Full/Preview paths), so a deterministic failure gets one more attempt
+    // only if it was the first; Missing is terminal immediately.
+    state.terminal = kind == DecodeFailureKind::Missing ||
+        state.failedAttempts >= kMaxDecodeAttempts ||
+        (kind == DecodeFailureKind::Decode && state.failedAttempts >= 2);
+    if (state.terminal) {
+        state.nextRetryAt = IsTransientFailureKind(kind) ?
+            now + kTransientTerminalRearm : std::chrono::steady_clock::time_point::max();
+    } else {
+        state.nextRetryAt = now + (state.failedAttempts <= 1 ?
+            kDecodeRetryFirstBackoff : kDecodeRetrySecondBackoff);
+    }
+    QS_LOG_WARNING(L"Decode", std::wstring(L"View decode attempt failed") +
+        (state.terminal ? L"; marked failed" : L"; retry scheduled") +
+        L": " + result.path.wstring() +
+        L" attempt=" + std::to_wstring(state.failedAttempts) +
+        L"/" + std::to_wstring(kMaxDecodeAttempts) +
+        L" kind=" + FailureKindName(kind));
+    ArmDecodeRetryTimer();
+}
+
+void QuickSiftApplicationImpl::ArmDecodeRetryTimer() {
+    if (!hwnd_) return;
+    // One timer services every pending backoff. Only deadlines in the future count,
+    // so an expired entry can never spin the timer at 1 ms.
+    const auto now = std::chrono::steady_clock::now();
+    auto next = std::chrono::steady_clock::time_point::max();
+    const auto consider = [&](const std::unordered_map<std::wstring, DecodeRetryState>& states) {
+        for (const auto& [path, state] : states) {
+            (void)path;
+            if (state.nextRetryAt > now && state.nextRetryAt < next) next = state.nextRetryAt;
+        }
+    };
+    consider(thumbnailRetryState_);
+    consider(viewRetryState_);
+    if (next == std::chrono::steady_clock::time_point::max()) {
+        KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
+        return;
+    }
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(next - now).count();
+    const UINT delay = static_cast<UINT>(std::clamp<long long>(remaining + 1, 10, 60000));
+    StartUiTimer(ID_TIMER_THUMBNAIL_RETRY_COOLDOWN, delay, L"decode retry backoff");
+}
+
+void QuickSiftApplicationImpl::RetryFailedImageLoads() {
+    // Manual retry: forget every failure mark (terminal or backing off) and ask the
+    // visible surfaces to request again.
+    failedThumbnailPaths_.clear();
+    thumbnailRetryState_.clear();
+    viewRetryState_.clear();
+    failedDecodes_.clear();
+    shellFallbackCache_.clear();
+    if (hwnd_) KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
+    QS_LOG_INFO(L"Decode", L"Manual retry of failed image loads requested");
+    if (reviewState_.Mode() == ViewMode::Thumbnails) {
+        ScheduleVisibleWork();
+        ArmThumbnailReconcile(0);
+    }
+    InvalidateCanvas();
+}
 // CODE GUIDE: See CODE_GUIDE.md -> "Opening a folder".
 // OWNER: Catalog-load lifecycle and stale-safe worker-result admission on the UI thread.
 // Catalog controller: folder loading, scanner batches, result integration,
@@ -34,17 +275,22 @@ void QuickSiftApplicationImpl::RememberTransientDecodeFailure(const std::wstring
         const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         persistentCache_.AddLibraryFolder(folder, now);
         RefreshLibraryList();
-        QS_LOG_INFO(L"Catalog", L"Loading folder: " + folder.wstring());
+        // Privacy (CODE_GUIDE 5.6): folder name + path id, not the full path.
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Catalog", L"folder_load",
+            { L"folder", quicksift::diagnostics::LogFileName(folder) },
+            { L"path_id", quicksift::diagnostics::LogPathId(folder) });
         currentFolder_ = folder;
+        ClearFaceZoomToggle();
+        faceOutlineFade_.Reset();
+        if (pendingRatingsImport_) CancelRatingsImport();
         backgroundFaceCursor_ = 0;
         backgroundFaceAttemptsSinceWork_ = 0;
         backgroundFacePauseUntil_ = std::chrono::steady_clock::time_point{};
         faceAnalysisRetryPolicy_.ClearFileRetries();
         failedThumbnailPaths_.clear();
-        thumbnailRetryAttempts_.clear();
-        thumbnailRetryCooldown_.clear();
+        thumbnailRetryState_.clear();
+        viewRetryState_.clear();
         KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
-        thumbnailFailureRetryViewportEpochs_.clear();
         lastScheduledThumbnailViewportEpoch_ = 0;
         cpuSampleValid_ = false;
         storageProfile_ = quicksift::DetectStorageProfile(folder, systemProfile_.lowMemory);
@@ -61,6 +307,7 @@ void QuickSiftApplicationImpl::RememberTransientDecodeFailure(const std::wstring
         // A folder switch is an infrequent, natural boundary where releasing that
         // storage is worth more than preserving allocation capacity.
         catalog_.ClearAndRelease();
+        OnSearchFolderChanged(); // keeps the query text; drops per-folder match state
         selection_.Reset(true);
         pendingRatings_ = 0;
         metadataJobsInFlight_ = 0;
@@ -460,6 +707,14 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                     item.faceBlurScanned = result->faceBlurScanned;
                     item.faceBlurry = result->faceBlurry;
                     item.faceSharpness = result->faceSharpness;
+                    item.faceQualities = result->faceBlurScanned ? result->faceQualities :
+                        std::vector<quicksift::FaceQualityRecord>{};
+                    // A FaceLock choice made in this session (or already hydrated) wins
+                    // over the persisted one carried by the worker's cache lookup.
+                    if (!item.faceSelectionKnown && result->faceSelectionKnown) {
+                        item.faceSelectionKnown = true;
+                        item.faceSelection = result->faceSelection;
+                    }
                 });
                 if (reviewState_.FaceLockEnabled() && ActiveInfoPath() == path) ApplyFaceLockForActive(false);
                 InvalidateCanvas();
@@ -481,46 +736,38 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                 // Viewport/navigation cancellation is not a decode failure. A later
                 // viewport pass will request the image again if it becomes visible.
                 failedDecodes_.erase(failureKey);
-                if (thumbnail && thumbnailMode) ScheduleVisibleWork();
+                if (thumbnail && thumbnailMode) {
+                    // Cancelled work (fling, viewport jump, stale target) re-enters
+                    // through the reconciliation sweep once the grid settles.
+                    ScheduleVisibleWork();
+                    ArmThumbnailReconcile(0);
+                }
                 InvalidateCanvas();
                 return;
             }
 
             if (thumbnail && retryableFailure) {
-                const std::wstring thumbnailKey = NormalizedPathKey(fs::path(path));
-                const int nextAttempt = result->retryAttempt + 1;
+                // 0.9.4.0 retry policy: record the attempt; the backoff timer / the
+                // visible-cell reconciliation sweep issues the next attempt (with the
+                // worker's escalated timeout) only while the cell is still wanted.
                 failedDecodes_.erase(failureKey);
-                thumbnailRetryAttempts_[thumbnailKey] = nextAttempt;
-                failedThumbnailPaths_.insert(thumbnailKey);
+                RecordThumbnailDecodeFailure(*result);
+                (void)visibleThumbnail;
+                InvalidateCanvas();
+                return;
+            }
 
-                const bool forceWic = (nextAttempt % 2 == 1);
-                const bool isSingleView = currentAppState_.mode == ViewMode::Single;
-                const int adaptiveTimeoutMs = worker_.CalculateAdaptiveTimeoutMs(fs::path(path), nextAttempt, isSingleView);
-
-                if (nextAttempt < 8 && visibleThumbnail) {
-                    failedThumbnailPaths_.erase(thumbnailKey);
-                    worker_.EnqueuePreview(fs::path(path), ThumbnailDecodeTarget(), generation_,
-                        JobPriority::Interactive, CacheClass::Thumbnail, 0,
-                        reviewState_.Epochs().thumbnailViewport, nextAttempt, forceWic, adaptiveTimeoutMs);
-                } else {
-                    failedThumbnailPaths_.insert(thumbnailKey);
-                }
-
-                QS_LOG_WARNING(L"Decode", L"Thumbnail decode attempt failed" +
-                    std::wstring(nextAttempt > 6 ?
-                        L"; retries exhausted" :
-                        (forceWic && visibleThumbnail ? L"; retrying with WIC" :
-                            (visibleThumbnail ? L"; retrying immediately" : L"; waiting for visibility"))) +
-                    L": " + path + L" attempt=" + std::to_wstring(nextAttempt) +
-                    L" timed_out=" + (timedOut ? L"1" : L"0") +
-                    L" workFailed=" + (result->workFailed ? L"1" : L"0"));
-                ScheduleVisibleWork();
+            if (!thumbnail && retryableFailure && result->kind != JobKind::DecodeTile) {
+                failedDecodes_.erase(failureKey);
+                RecordViewDecodeFailure(*result);
                 InvalidateCanvas();
                 return;
             }
 
             if (thumbnail) {
-                failedThumbnailPaths_.insert(NormalizedPathKey(fs::path(path)));
+                // Not retryable (e.g. no pixels without a failure flag): treat it as
+                // one failed attempt so it still goes through the bounded policy.
+                RecordThumbnailDecodeFailure(*result);
             } else {
                 RememberTransientDecodeFailure(failureKey);
             }
@@ -541,8 +788,22 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
             result->kind == JobKind::DecodePreview || result->kind == JobKind::DecodeFull) {
             const std::wstring thumbnailKey = NormalizedPathKey(result->path);
             failedThumbnailPaths_.erase(thumbnailKey);
-            thumbnailRetryAttempts_.erase(thumbnailKey);
-            thumbnailRetryCooldown_.erase(thumbnailKey);
+            thumbnailRetryState_.erase(thumbnailKey);
+            if (result->cacheClass != CacheClass::Thumbnail && !result->previewOnly)
+                viewRetryState_.erase(thumbnailKey);
+            if (result->viewLane && result->kind == JobKind::DecodeFull && result->previewOnly &&
+                !(loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path)))) {
+                // The full decode could only produce a preview (every codec failed, the
+                // Shell fallback succeeded). That is the best this file can give: remember
+                // it so paint/backstop do not re-run the expensive full decode forever.
+                DecodeRetryState& state = viewRetryState_[thumbnailKey];
+                state.failedAttempts = kMaxDecodeAttempts;
+                state.lastFailure = DecodeFailureKind::Decode;
+                state.terminal = true;
+                state.nextRetryAt = std::chrono::steady_clock::time_point::max();
+                state.fileSize = result->fileSize;
+                state.modifiedStamp = result->modifiedStamp;
+            }
         }
 
         if (loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path)) &&
@@ -602,7 +863,14 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
             }
         }
 
-        if (const auto catalogIndex = CatalogIndexForPath(path)) {
+        // 0.9.4.0: in Thumbnail view the worker cancels every Face job while the grid
+        // viewport is active (Worker::IsCancelled), so enqueueing one per thumbnail
+        // completion only produced queue churn (a key build, a worker-lock round trip,
+        // and a dequeue/stat/cancel cycle on a decode worker). Background face analysis
+        // keeps its own scheduler; Single/Compare admission is unchanged.
+        const bool thumbnailGridResult = result->cacheClass == CacheClass::Thumbnail &&
+            reviewState_.Mode() == ViewMode::Thumbnails;
+        if (const auto catalogIndex = thumbnailGridResult ? std::optional<size_t>{} : CatalogIndexForPath(path)) {
             const PhotoItem& photo = catalog_.PhotoAt(*catalogIndex);
             if (!photo.facesScanned || (!photo.faces.empty() && !photo.faceBlurScanned)) {
                 const bool foregroundFace = reviewState_.FaceLockEnabled() &&
@@ -631,12 +899,15 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                 reclaimableBytes = existing->second.bytes;
             }
             if (result->cacheClass == CacheClass::Thumbnail) {
-                for (const auto& [cachedKey, cached] : bitmapCache_) {
-                    if (cachedKey.path == path &&
-                        cachedKey.cacheClass == CacheClass::Thumbnail &&
-                        !(cachedKey == *incomingBitmapKey)) {
-                        reclaimableBytes = cached.bytes > SIZE_MAX - reclaimableBytes ?
-                            SIZE_MAX : reclaimableBytes + cached.bytes;
+                // 0.9.4.0: probe only this path's indexed size buckets rather than
+                // scanning the whole bitmap cache for every thumbnail completion.
+                if (const auto sizes = pathToBitmapSizes_.find(path); sizes != pathToBitmapSizes_.end()) {
+                    for (const int size : sizes->second) {
+                        if (size == incomingBitmapKey->size) continue;
+                        const auto cached = bitmapCache_.find(CacheKey{ path, size, CacheClass::Thumbnail });
+                        if (cached == bitmapCache_.end()) continue;
+                        reclaimableBytes = cached->second.bytes > SIZE_MAX - reclaimableBytes ?
+                            SIZE_MAX : reclaimableBytes + cached->second.bytes;
                     }
                 }
             }
@@ -688,13 +959,19 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
         if (result->cacheClass == CacheClass::Thumbnail) {
             // Keep one GPU thumbnail per photo. Retaining old size buckets is pure
             // memory churn and was the main trigger for Large/Huge grid flicker.
-            for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
-                if (it->first.path == path && it->first.cacheClass == CacheClass::Thumbnail &&
-                    !(it->first == key)) {
-                    RemoveCacheBytes(it->second.cacheClass, it->second.bytes);
-                    it = bitmapCache_.erase(it);
-                } else {
-                    ++it;
+            // 0.9.4.0: index-driven (O(buckets for this path)) instead of a full
+            // cache scan per completion, and the size index is kept consistent.
+            if (const auto sizes = pathToBitmapSizes_.find(path); sizes != pathToBitmapSizes_.end()) {
+                std::vector<int> staleSizes;
+                for (const int size : sizes->second) {
+                    if (size != key.size) staleSizes.push_back(size);
+                }
+                for (const int size : staleSizes) {
+                    const auto stale = bitmapCache_.find(CacheKey{ path, size, CacheClass::Thumbnail });
+                    if (stale == bitmapCache_.end()) continue;
+                    RemoveCacheBytes(stale->second.cacheClass, stale->second.bytes);
+                    UnindexBitmapSize(stale->first);
+                    bitmapCache_.erase(stale);
                 }
             }
         }
@@ -717,8 +994,11 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
         AddCacheBytes(entry.cacheClass, entry.bytes);
         const std::wstring insertedPath = key.path;
         pathToBitmapSizes_[key.path].insert(key.size);
+        const bool insertedThumbnail = entry.cacheClass == CacheClass::Thumbnail;
         bitmapCache_[std::move(key)] = std::move(entry);
-        PruneSupersededViewBitmaps(insertedPath);
+        // Pruning depends only on this path's Preview/Full entries, which a thumbnail
+        // admission never changes, so skip the work for the hot thumbnail path.
+        if (!insertedThumbnail) PruneSupersededViewBitmaps(insertedPath);
         EvictBitmapCache();
         InvalidateCanvas();
     }

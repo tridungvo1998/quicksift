@@ -113,7 +113,10 @@ fs::path UniqueSidecarPrivatePath(const fs::path& path, std::wstring_view role) 
 }
 
 bool WriteTextFile(const fs::path& path, const std::wstring& text, TextFileEncoding encoding,
-    const AtomicFileSnapshot& expectedDestination) {
+    const AtomicFileSnapshot& expectedDestination, TextFileWriteStatus* status) {
+    TextFileWriteStatus ignored;
+    TextFileWriteStatus& outcome = status ? *status : ignored;
+    outcome = TextFileWriteStatus{};
     // Never truncate an existing sidecar/session file in place. The verified
     // private object is published by its own locked handle, so path swapping
     // cannot redirect either publication or rollback to an unrelated file.
@@ -125,7 +128,10 @@ bool WriteTextFile(const fs::path& path, const std::wstring& text, TextFileEncod
     if (!text.empty() && bytes.empty()) return false;
     constexpr std::uint64_t kSidecarReserveBytes = 8ull * 1024ull * 1024ull;
     if (!HasStorageHeadroom(path, static_cast<std::uint64_t>(bytes.size()),
-        kSidecarReserveBytes)) return false;
+        kSidecarReserveBytes)) {
+        outcome.lowStorage = true;
+        return false;
+    }
 
     static std::atomic<std::uint64_t> sequence{ 0 };
     fs::path temporary;
@@ -139,7 +145,10 @@ bool WriteTextFile(const fs::path& path, const std::wstring& text, TextFileEncod
             FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr));
         if (temporaryHandle.get() != INVALID_HANDLE_VALUE) break;
         const DWORD error = GetLastError();
-        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) return false;
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+            outcome.win32Error = error;
+            return false;
+        }
     }
     if (temporaryHandle.get() == INVALID_HANDLE_VALUE) return false;
 
@@ -173,24 +182,40 @@ bool WriteTextFile(const fs::path& path, const std::wstring& text, TextFileEncod
         originalGuard.reset(CreateFileW(path.c_str(),
             GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        if (originalGuard.get() == INVALID_HANDLE_VALUE ||
-            !CaptureAtomicFileSnapshotFromHandle(originalGuard.get(), currentDestination) ||
-            !SameAtomicFileSnapshot(currentDestination, expectedDestination)) return false;
+        if (originalGuard.get() == INVALID_HANDLE_VALUE) {
+            // Another handle (editor, sync client) refused DELETE / deny-write
+            // sharing. Not a content change: the write lane retries.
+            outcome.win32Error = GetLastError();
+            return false;
+        }
+        if (!CaptureAtomicFileSnapshotFromHandle(originalGuard.get(), currentDestination) ||
+            !SameAtomicFileSnapshot(currentDestination, expectedDestination)) {
+            outcome.destinationChanged = true;
+            return false;
+        }
 
         backup = UniqueSidecarPrivatePath(path, L"backup");
         if (backup.empty()) return false;
         moveOriginalToBackup.emplace(backup);
-        if (!moveOriginalToBackup->Valid() || !restoreOriginal.Valid() ||
-            !moveOriginalToBackup->Apply(originalGuard.get())) return false;
+        if (!moveOriginalToBackup->Valid() || !restoreOriginal.Valid()) return false;
+        if (!moveOriginalToBackup->Apply(originalGuard.get())) {
+            outcome.win32Error = GetLastError();
+            return false;
+        }
     } else if (!CaptureAtomicFileSnapshot(path, currentDestination) ||
         currentDestination.exists) {
+        outcome.destinationChanged = currentDestination.exists;
         return false;
     }
 
     if (!publishTemporary.Apply(temporaryHandle.get())) {
+        const DWORD publishError = GetLastError();
+        bool restored = true;
         if (expectedDestination.exists) {
-            static_cast<void>(restoreOriginal.Apply(originalGuard.get()));
+            restored = restoreOriginal.Apply(originalGuard.get());
         }
+        // Retryable only when the original pathname is back (no corruption risk).
+        if (restored) outcome.win32Error = publishError;
         return false;
     }
     temporaryCleanup.Release();

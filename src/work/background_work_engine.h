@@ -5,6 +5,7 @@
 #include "work/background_completion_queue.h"
 
 #include <array>
+#include <unordered_set>
 
 namespace quicksift::app {
 
@@ -36,6 +37,9 @@ public:
         quicksift::PersistentCache* persistentCache, const SystemProfile& profile);
     ~Worker();
     void Stop();
+    // Signal stop and drop queued work without joining threads. Safe to call
+    // from the UI thread before DestroyWindow so decoding cannot block close.
+    void RequestStop() noexcept;
     void SetNotify(HWND notify);
     void SetPersistentCache(quicksift::PersistentCache* persistentCache);
     void SetStorageProfile(const quicksift::StorageProfile& storage);
@@ -61,6 +65,8 @@ public:
         const std::vector<std::wstring>& desiredPaths,
         const std::vector<std::wstring>& visiblePaths);
     [[nodiscard]] bool IsThumbnailJobPendingOrActive(const fs::path& path) const;
+    // One lock acquisition for a whole viewport plan; returns path.wstring() values.
+    [[nodiscard]] std::unordered_set<std::wstring> PendingOrActiveThumbnailPaths() const;
     void DiscardQueuedTiles();
     void RequestCacheFlush();
     void QueueRecordCacheWrite(const fs::path& path, quicksift::CachedImageRecord record);
@@ -84,6 +90,19 @@ public:
         CacheClass cacheClass = CacheClass::Preview, uint64_t epoch = 0,
         uint64_t viewportEpoch = 0, int retryAttempt = 0, bool forceWic = false,
         bool isSingleView = false, uint64_t viewInteractionEpoch = 0);
+    // 0.9.4.0 dedicated Single/Compare view lane. Full-size (and intermediate /
+    // embedded-preview) view decodes run on their own thread with their own decode
+    // budget, so the thumbnail pool can never starve them and vice versa. Foreground
+    // requests carry the navigation epoch (latest request wins: SetNavigationEpoch
+    // drops queued older requests and IsCancelled aborts the in-flight one).
+    // prefetch=true queues low-priority neighbour work that yields to any foreground
+    // view request and is cancelled when it leaves the published prefetch set.
+    void EnqueueViewDecode(const fs::path& path, JobKind kind, int targetSize,
+        uint64_t generation, CacheClass cacheClass, uint64_t epoch, bool isSingleView,
+        uint64_t viewInteractionEpoch, bool prefetch = false, int retryAttempt = 0);
+    // Paths (path.wstring()) whose view-lane prefetch may continue; pass the current
+    // image plus its neighbours. An empty set cancels all view prefetch.
+    void SetViewPrefetchPaths(const std::vector<std::wstring>& paths);
     void EnqueueTile(const fs::path& path, int x, int y, int width, int height,
         int level, uint64_t generation, uint64_t epoch);
     [[nodiscard]] bool PromoteJob(const std::wstring& key, CacheClass cacheClass);
@@ -94,7 +113,9 @@ public:
     // while the set is empty.
     void SetVisualPriorityPaths(const std::vector<std::wstring>& paths);
     [[nodiscard]] bool IsQueueEmpty() const;
-    [[nodiscard]] int CalculateAdaptiveTimeoutMs(const fs::path& path, int attempt, bool isSingleView) const;
+    // probeFileSize=false never touches the file system and is safe on the UI thread.
+    [[nodiscard]] int CalculateAdaptiveTimeoutMs(const fs::path& path, int attempt, bool isSingleView,
+        bool probeFileSize = true) const;
     [[nodiscard]] bool EnqueueMetadata(const fs::path& path, uint64_t generation,
         uint64_t metadataRevision = 0, JobPriority priority = JobPriority::Idle);
     void PromoteQueuedMetadata(uint64_t generation,
@@ -108,6 +129,11 @@ public:
     void PublishDecoderSessionPaths(size_t threadIndex,
         const std::vector<std::filesystem::path>& paths) noexcept;
     [[nodiscard]] bool IsPathBlockedForDecoder(const fs::path& path) const noexcept;
+    // True while a foreground Single/Compare decode is queued or running (lock-free).
+    [[nodiscard]] bool ViewForegroundBusy() const noexcept {
+        return viewForegroundQueued_.load(std::memory_order_acquire) != 0 ||
+            viewForegroundRunning_.load(std::memory_order_acquire);
+    }
 
 private:
     [[nodiscard]] bool IsThumbnailPathCurrent(const fs::path& path) const noexcept;
@@ -130,7 +156,23 @@ private:
     static bool IsCoalescibleVisualJob(const WorkJob& job);
     static bool SameDecodeFamily(const WorkJob& a, const WorkJob& b);
     bool Enqueue(WorkJob job);
-    WorkJob PopWork(bool allowIdle);
+    // viewForeground: Single/Compare is decoding the image on screen (P2). Only
+    // interactive work and at most priority::kPoolCapDuringViewLoad thumbnail decodes
+    // are admitted; prefetch / face / idle / analysis wait (core/priority_policy.h).
+    WorkJob PopWork(bool allowIdle, bool viewForeground = false);
+    // mutex_ held.
+    [[nodiscard]] bool ViewForegroundActiveLocked() const noexcept {
+        return viewForegroundQueued_.load(std::memory_order_acquire) != 0 ||
+            (activeViewJob_.active && !activeViewJob_.prefetch);
+    }
+    // Publishes the view lane's foreground demand to priority::Demand() (lock-free).
+    void NoteViewForegroundChanged() noexcept;
+    // P3: a focused search box or applied query pauses face / analysis jobs.
+    [[nodiscard]] static bool SearchPausesBackgroundAnalysis() noexcept;
+    WorkJob PopViewWork();
+    void ReleaseActiveVisualFamily(const WorkJob& job, bool viewLane);
+    [[nodiscard]] bool IsViewPrefetchPathAllowed(const fs::path& path) const;
+    static DecodeFailureKind ClassifyDecodeFailure(const fs::path& path) noexcept;
     void FinishAnalysisJob(const WorkJob& job);
     static bool FileFingerprint(const fs::path& path, uint64_t& size, int64_t& modified);
     void QueueDerivedCacheLevels(IWICImagingFactory* factory, const WorkJob& sourceJob,
@@ -138,7 +180,7 @@ private:
         const std::shared_ptr<WorkResult>& source);
     bool TryPostMetadataAbort(const WorkJob& job);
     bool TryPostResult(const WorkJob& job, const std::shared_ptr<WorkResult>& result);
-    void Run(bool allowIdle, size_t threadIndex, bool metadataOnly = false);
+    void Run(bool allowIdle, size_t threadIndex, bool metadataOnly = false, bool viewLane = false);
     void QueueBitmapCacheWrite(const WorkJob& job, uint64_t fileSize, int64_t modifiedStamp,
         int64_t sidecarStamp, const std::shared_ptr<const WorkResult>& result);
     void RunCacheWriter();
@@ -157,6 +199,7 @@ private:
     std::shared_ptr<DecodeBudget> decodeBudget_;
     std::vector<std::thread> threads_;
     std::thread metadataThread_;
+    std::thread viewThread_;
     std::thread cacheWriter_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -199,6 +242,27 @@ private:
     std::mutex cacheIoMutex_;
     std::mutex heavyBundledDecodeMutex_;
     std::deque<WorkJob> interactiveQueue_, visibleQueue_, predictiveQueue_, faceQueue_, idleQueue_, analysisQueue_, metadataQueue_;
+    // View lane (guarded by mutex_). Only viewThread_ pops these queues; the pool
+    // lanes never look at them.
+    std::deque<WorkJob> viewQueue_, viewPrefetchQueue_;
+    struct ActiveViewJob {
+        bool active = false;
+        bool prefetch = false;
+        JobKind kind = JobKind::DecodeFull;
+        CacheClass cacheClass = CacheClass::Full;
+        int targetSize = 0;
+        bool rawJpegPreviewOnly = false;
+        std::wstring path;
+    } activeViewJob_;
+    std::shared_ptr<DecodeBudget> viewDecodeBudget_;
+    std::atomic<unsigned> viewForegroundQueued_{ 0 };
+    // Mirrors activeViewJob_.active && !prefetch for lock-free readers.
+    std::atomic<bool> viewForegroundRunning_{ false };
+    // Non-zero while the running view job is a prefetch that a foreground request
+    // adopted; holds that request's navigation epoch (latest-wins still applies).
+    std::atomic<std::uint64_t> viewActiveAdoptedEpoch_{ 0 };
+    mutable std::mutex viewPrefetchMutex_;
+    std::unordered_set<std::wstring> viewPrefetchPaths_;
     size_t analysisInFlight_ = 0;
     size_t foregroundBurstSinceIdle_ = 0;
     std::deque<BitmapCacheWrite> cacheWriteQueue_;

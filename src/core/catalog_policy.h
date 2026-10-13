@@ -5,6 +5,8 @@
 
 #include "app_types.h"
 #include "image_formats.h"
+#include "image_metadata.h"
+#include "photo_predicate.h"
 
 #include <array>
 #include <chrono>
@@ -32,6 +34,12 @@ struct FormatSelection {
     std::filesystem::file_time_type now = std::filesystem::file_time_type::clock::now()) noexcept;
 [[nodiscard]] bool IsCullAllowed(const PhotoItem& item, RatingFilter rating,
     PickFilter pick, ColorLabelFilter label) noexcept;
+// Filter-tab criteria in the shared predicate structure (see core/photo_predicate.h).
+// static_asserts in catalog_policy.cpp pin the enum <-> int mapping.
+[[nodiscard]] predicate::FilterCriteria FilterCriteriaFor(RatingFilter rating,
+    PickFilter pick, ColorLabelFilter label) noexcept;
+[[nodiscard]] bool MatchesFilter(const predicate::MetadataFactsView& facts,
+    const predicate::FilterCriteria& criteria) noexcept;
 [[nodiscard]] bool PhotoSortLess(const PhotoItem& left, const PhotoItem& right,
     SortMode mode) noexcept;
 

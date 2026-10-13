@@ -1,5 +1,6 @@
 // OWNER: Shared native helpers used by UI and background services.
 #include "app/application_support.h"
+#include "core/metadata_vocabulary.h"
 
 namespace quicksift::app {
 
@@ -276,14 +277,13 @@ std::optional<int> ReadShellRating(const fs::path& image) {
     PropVariantClear(&value);
     return rating;
 }
+// Both names come from the canonical vocabulary (core/metadata_vocabulary.h).
 std::wstring LabelName(int label) {
-    static const wchar_t* names[] = { L"", L"Red", L"Yellow", L"Green", L"Blue", L"Purple" };
-    return names[std::clamp(label, 0, 5)];
+    return std::wstring(quicksift::core::vocabulary::Color(label).xmpLabel);
 }
 
 std::wstring LabelDisplayName(int label) {
-    static const wchar_t* names[] = { L"None", L"Red", L"Yellow", L"Green", L"Blue", L"Purple" };
-    return names[std::clamp(label, 0, 5)];
+    return std::wstring(quicksift::core::vocabulary::Color(label).label);
 }
 
 namespace {
@@ -393,6 +393,7 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
         MetadataFieldId conflict{};
         if (!MetadataExpectedMatches(result.before, patch, &conflict)) {
             result.conflict = true;
+            // loc-composed: every full sentence variant is in kDynamicFragments.
             result.detail = std::wstring(L"The file's ") + MetadataFieldDisplayName(conflict) +
                 L" changed outside QuickSift, so the metadata update was stopped.";
             return result;
@@ -426,9 +427,18 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
             result.detail = L"The pick-state property could not be updated without rewriting unfamiliar XMP.";
             return result;
         }
-        if (!WriteTextFile(sidecar, text, encoding, expectedSidecar)) {
-            result.conflict = true;
-            result.detail = L"The XMP sidecar changed or could not be published atomically.";
+        TextFileWriteStatus writeStatus;
+        if (!WriteTextFile(sidecar, text, encoding, expectedSidecar, &writeStatus)) {
+            // Only a real destination change is an external conflict (reconcile).
+            // A refused handle/rename is a transient lock the write lane retries.
+            result.conflict = writeStatus.destinationChanged;
+            result.win32Error = writeStatus.win32Error;
+            result.lowStorage = writeStatus.lowStorage;
+            result.detail = writeStatus.destinationChanged ?
+                L"The XMP sidecar changed outside QuickSift, so the metadata update was stopped." :
+                (writeStatus.win32Error != 0 ?
+                    L"Another app is using the XMP sidecar, so it could not be published yet." :
+                    L"The XMP sidecar could not be published atomically.");
             return result;
         }
         result.after = ReadPhotoMetadata(image);

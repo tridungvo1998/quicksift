@@ -187,6 +187,51 @@ void SetDocumentControlText(HWND edit, std::wstring_view text, bool helpDocument
     InvalidateRect(edit, nullptr, TRUE);
 }
 
+void SetDocumentPlainText(HWND edit, std::wstring_view text, bool richEdit,
+    const ThemePalette& theme) {
+    if (!edit) return;
+    SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+    // Normalize to CRLF without touching line content (EDIT needs CRLF; RichEdit
+    // copies its internal CR back out as CRLF).
+    std::wstring normalized;
+    normalized.reserve(text.size() + text.size() / 16);
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const wchar_t ch = text[index];
+        if (ch == L'\r') {
+            normalized += L"\r\n";
+            if (index + 1 < text.size() && text[index + 1] == L'\n') ++index;
+        } else if (ch == L'\n') {
+            normalized += L"\r\n";
+        } else {
+            normalized += ch;
+        }
+    }
+    if (richEdit) {
+        SendMessageW(edit, EM_SETREADONLY, FALSE, 0);
+        SendMessageW(edit, EM_SETTEXTMODE, TM_PLAINTEXT, 0);
+        CHARFORMAT2W format{};
+        format.cbSize = sizeof(format);
+        format.dwMask = CFM_COLOR | CFM_FACE | CFM_SIZE | CFM_BOLD | CFM_ITALIC;
+        format.crTextColor = theme.text;
+        format.yHeight = 200; // 10 pt (twips)
+        wcscpy_s(format.szFaceName, L"Consolas");
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_DEFAULT, reinterpret_cast<LPARAM>(&format));
+        SetWindowTextW(edit, normalized.c_str());
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_ALL, reinterpret_cast<LPARAM>(&format));
+        SendMessageW(edit, EM_SETREADONLY, TRUE, 0);
+        SendMessageW(edit, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(theme.panel));
+        SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(14, 14));
+    } else {
+        SetWindowTextW(edit, normalized.c_str());
+        SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(12, 12));
+    }
+    SendMessageW(edit, EM_SETSEL, 0, 0);
+    SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+    SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(edit, nullptr, TRUE);
+}
+
 bool EnsureRichEditLoaded() {
     static HMODULE module = LoadLibraryExW(L"Msftedit.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     return module != nullptr;
@@ -194,6 +239,52 @@ bool EnsureRichEditLoaded() {
 
 LRESULT CALLBACK DocumentWindowSubclassProc(HWND window, UINT message, WPARAM wParam,
     LPARAM lParam, UINT_PTR subclassId, DWORD_PTR reference);
+
+namespace {
+// Background gradient, custom title bar (close light), the rounded content panel
+// that wraps the text control, and the accent strip. Called once per WM_PAINT.
+void PaintDocumentChrome(HWND window, const DocumentWindowState* state, HDC dc, const RECT& client) {
+    state->framework->PaintWindowBackground(dc, client, state->theme);
+    const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
+    const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
+    const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
+    quicksift::ui::framework::TitleBarPresentation title{};
+    wchar_t titleText[256]{};
+    GetWindowTextW(window, titleText, static_cast<int>(std::size(titleText)));
+    title.title = titleText;
+    title.titleTextRect = { px(16), 0, client.right - px(80), titleHeight };
+    title.titleFont = state->semiboldFont ? state->semiboldFont : state->normalFont;
+    title.active = GetActiveWindow() == window;
+    const int diameter = px(12);
+    const int rightMargin = px(15);
+    const int closeTop = (titleHeight - diameter) / 2;
+    title.trafficLights[0].rect = { client.right - rightMargin - diameter, closeTop,
+        client.right - rightMargin, closeTop + diameter };
+    title.trafficLights[0].color = RGB(255, 95, 87);
+    title.trafficLights[0].hot = state->titleCloseHot;
+    title.trafficLights[0].pressed = state->titleClosePressed;
+    state->framework->PaintTitleBar(dc, client, titleHeight, title, state->theme, dpi);
+    if (state->edit) {
+        // The text control is rectangular. Inset it inside a small-radius panel by
+        // more than r * (1 - 1/sqrt 2) so its square corners never poke through the
+        // rounded border (the old 1 px inflate at radius 14 showed square corners).
+        RECT panel{};
+        GetWindowRect(state->edit, &panel);
+        MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&panel), 2);
+        InflateRect(&panel, px(2), px(2));
+        state->framework->PaintPanel(dc, panel,
+            quicksift::ui::framework::PanelPresentation{ false, false,
+                quicksift::ui::layout::kDocumentPanelRadiusDip },
+            state->theme, dpi);
+    }
+    RECT accent = client;
+    accent.left += px(22);
+    accent.right -= px(22);
+    accent.top = titleHeight + px(7);
+    accent.bottom = titleHeight + px(10);
+    state->framework->PaintAccentStrip(dc, accent, state->theme);
+}
+} // namespace
 
 LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARAM wParam,
     LPARAM lParam, UINT_PTR, DWORD_PTR reference) {
@@ -205,6 +296,15 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
     case WM_NCPAINT:
         return 0;
     case WM_NCACTIVATE:
+        // Custom title bar: the inactive (grey traffic light, muted title) state is
+        // painted in the client, so repaint the title strip on every (de)activation.
+        if (state) {
+            RECT title{};
+            GetClientRect(window, &title);
+            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
+            title.bottom = MulDiv(quicksift::ui::layout::kTitleBarHeightDip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI);
+            InvalidateRect(window, &title, FALSE);
+        }
         return TRUE;
     case WM_NCHITTEST:
         if (state) {
@@ -241,76 +341,35 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
         break;
     case WM_PAINT:
         if (state && state->framework) {
+            // One double-buffered pass (background, title bar, content panel,
+            // accent strip). WS_CLIPCHILDREN keeps it off the edit and buttons.
+            // It used to paint the chrome in WM_ERASEBKGND and again (unbuffered)
+            // in WM_PAINT, over the children: visible flicker on every resize.
             PAINTSTRUCT paint{};
-            HDC dc = BeginPaint(window, &paint);
+            HDC target = BeginPaint(window, &paint);
             RECT client{};
             GetClientRect(window, &client);
-            state->framework->PaintWindowBackground(dc, client, state->theme);
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            quicksift::ui::framework::TitleBarPresentation title{};
-            wchar_t titleText[256]{};
-            GetWindowTextW(window, titleText, static_cast<int>(std::size(titleText)));
-            title.title = titleText;
-            title.titleTextRect = { px(16), 0, client.right - px(80), titleHeight };
-            title.titleFont = state->semiboldFont ? state->semiboldFont : state->normalFont;
-            title.active = GetActiveWindow() == window;
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            const int closeTop = (titleHeight - diameter) / 2;
-            title.trafficLights[0].rect = { client.right - rightMargin - diameter, closeTop,
-                client.right - rightMargin, closeTop + diameter };
-            title.trafficLights[0].color = RGB(255, 95, 87);
-            title.trafficLights[0].hot = state->titleCloseHot;
-            title.trafficLights[0].pressed = state->titleClosePressed;
-            state->framework->PaintTitleBar(dc, client, titleHeight, title, state->theme, dpi);
+            const int width = std::max(1, static_cast<int>(client.right - client.left));
+            const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+            HDC buffer = target ? CreateCompatibleDC(target) : nullptr;
+            HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, width, height) : nullptr;
+            HGDIOBJ previous = bitmap ? SelectObject(buffer, bitmap) : nullptr;
+            const bool buffered = previous && previous != HGDI_ERROR;
+            HDC dc = buffered ? buffer : target;
+            if (dc) PaintDocumentChrome(window, state, dc, client);
+            if (buffered) {
+                BitBlt(target, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+                SelectObject(buffer, previous);
+            }
+            if (bitmap) DeleteObject(bitmap);
+            if (buffer) DeleteDC(buffer);
             EndPaint(window, &paint);
             return 0;
         }
         break;
     case WM_ERASEBKGND:
-        if (state && state->framework) {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            RECT client{};
-            GetClientRect(window, &client);
-            state->framework->PaintWindowBackground(dc, client, state->theme);
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            quicksift::ui::framework::TitleBarPresentation title{};
-            wchar_t titleText[256]{};
-            GetWindowTextW(window, titleText, static_cast<int>(std::size(titleText)));
-            title.title = titleText;
-            title.titleTextRect = { px(16), 0, client.right - px(80), titleHeight };
-            title.titleFont = state->semiboldFont ? state->semiboldFont : state->normalFont;
-            title.active = GetActiveWindow() == window;
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            const int closeTop = (titleHeight - diameter) / 2;
-            title.trafficLights[0].rect = { client.right - rightMargin - diameter, closeTop,
-                client.right - rightMargin, closeTop + diameter };
-            title.trafficLights[0].color = RGB(255, 95, 87);
-            title.trafficLights[0].hot = state->titleCloseHot;
-            title.trafficLights[0].pressed = state->titleClosePressed;
-            state->framework->PaintTitleBar(dc, client, titleHeight, title, state->theme, dpi);
-            if (state->edit) {
-                RECT panel{};
-                GetWindowRect(state->edit, &panel);
-                MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&panel), 2);
-                InflateRect(&panel, 1, 1);
-                state->framework->PaintPanel(dc, panel,
-                    quicksift::ui::framework::PanelPresentation{ false, false, 14 },
-                    state->theme, quicksift::ui::GetWindowDpi(window));
-            }
-            RECT accent = client;
-            accent.left += px(22);
-            accent.right -= px(22);
-            accent.top = titleHeight + px(7);
-            accent.bottom = titleHeight + px(10);
-            state->framework->PaintAccentStrip(dc, accent, state->theme);
-            return 1;
-        }
+        // WM_PAINT paints every pixel (buffered); erasing first only flashes.
+        if (state && state->framework) return 1;
         break;
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC:
@@ -337,6 +396,20 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
                 presentation.state.focused = (draw->itemState & ODS_FOCUS) != 0;
                 presentation.hoverBlend = state->framework->ButtonHoverBlend(draw->hwndItem);
                 presentation.pressBlend = presentation.state.pressed ? 1.0f : 0.0f;
+                {
+                    // The buttons sit on the window's vertical background gradient:
+                    // sample it at the button's centre for the AA corner colour.
+                    RECT client{};
+                    RECT item{};
+                    GetClientRect(window, &client);
+                    GetWindowRect(draw->hwndItem, &item);
+                    MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&item), 2);
+                    const int clientHeight = std::max(1, static_cast<int>(client.bottom - client.top));
+                    const float t = std::clamp(static_cast<float>((item.top + item.bottom) / 2) /
+                        static_cast<float>(clientHeight), 0.0f, 1.0f);
+                    presentation.parentSurface = static_cast<std::uint32_t>(
+                        quicksift::ui::BlendColor(state->theme.windowTop, state->theme.windowBottom, t));
+                }
                 state->framework->PaintButton(draw->hDC, draw->rcItem, presentation,
                     state->theme, quicksift::ui::GetWindowDpi(window),
                     state->normalFont, state->semiboldFont);
@@ -420,7 +493,9 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
             return 0;
         }
         break;
+    case WM_CAPTURECHANGED:
     case WM_CANCELMODE:
+        // Capture lost mid-press (Alt+Tab, a modal): clear the pressed close light.
         if (state && state->titleClosePressed) {
             state->titleClosePressed = false;
             state->titleCloseHot = false;
@@ -428,7 +503,18 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
             InvalidateRect(window, nullptr, FALSE);
         }
         break;
+    case WM_DPICHANGED:
+        // Mixed-DPI: move to the suggested rect for the new monitor; WM_SIZE then
+        // re-lays out in the new DPI (px() reads the window DPI) and repaints.
+        if (const auto* suggested = reinterpret_cast<const RECT*>(lParam)) {
+            SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                suggested->right - suggested->left, suggested->bottom - suggested->top,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
     case WM_SIZE:
+        if (wParam == SIZE_MINIMIZED) return 0;
         if (state) {
             const int width = LOWORD(lParam);
             const int height = HIWORD(lParam);
@@ -452,8 +538,8 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
                 if (!button) return;
                 MoveWindow(button, x, buttonY, buttonWidth, buttonHeight, TRUE);
                 if (state->framework) {
-                    state->framework->ApplyRoundedControlRegion(button, buttonWidth,
-                        buttonHeight, px(9));
+                    state->framework->ApplyAntialiasedControlRegion(button, buttonWidth,
+                        buttonHeight, px(quicksift::ui::layout::kButtonRadiusDip));
                 }
             };
             const int closeX = std::max(margin, width - margin - buttonWidth);
@@ -476,12 +562,16 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
             std::filesystem::path exported;
             if (quicksift::diagnostics::ExportSnapshotInteractive(window, &exported)) {
                 QS_LOG_INFO(L"Diagnostics", L"Diagnostic snapshot exported to " + exported.wstring());
-                MessageBoxW(window, (L"Diagnostic log exported to:\r\n\r\n" + exported.wstring()).c_str(),
+                const std::wstring heading = state->Tr ? state->Tr(L"Diagnostic log exported to:")
+                                                       : std::wstring(L"Diagnostic log exported to:");
+                MessageBoxW(window, (heading + L"\r\n\r\n" + exported.wstring()).c_str(),
                     L"QuickSift", MB_OK | MB_ICONINFORMATION);
             } else if (!exported.empty() || CommDlgExtendedError() != 0) {
                 QS_LOG_WARNING(L"Diagnostics", L"Diagnostic snapshot export failed");
-                MessageBoxW(window, L"QuickSift could not export the diagnostic log to that location.",
-                    L"QuickSift", MB_OK | MB_ICONWARNING);
+                const std::wstring failure = state->Tr
+                    ? state->Tr(L"QuickSift could not export the diagnostic log to that location.")
+                    : std::wstring(L"QuickSift could not export the diagnostic log to that location."); // loc-key
+                MessageBoxW(window, failure.c_str(), L"QuickSift", MB_OK | MB_ICONWARNING);
             }
             return 0;
         }

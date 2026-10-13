@@ -12,6 +12,8 @@
 
 #include <array>
 
+#include "ui/ui_design_tokens.h"
+
 namespace quicksift::core { enum class AppTheme; }
 
 namespace quicksift::ui {
@@ -40,9 +42,38 @@ struct ThemePalette {
     COLORREF menuSelected{};
     COLORREF title{};
     bool dark = true;
+    // Text drawn on accent fills (selected buttons, active tabs, primary alert
+    // button) and on the selected menu row. White / palette text for the built-in
+    // themes; HIGHLIGHTTEXT in high contrast; contrast-picked for system accents.
+    COLORREF accentText = RGB(255, 255, 255);
+    COLORREF menuSelectedText = CLR_INVALID; // CLR_INVALID: use `text`
+    bool highContrast = false;
 };
 
+// Built-in palette (no accessibility or system-accent adjustments).
 ThemePalette GetThemePalette(core::AppTheme theme) noexcept;
+// The palette every surface should use: high contrast -> system colours; otherwise
+// the built-in palette with the Windows accent colour (contrast-guarded) applied.
+ThemePalette ResolveThemePalette(core::AppTheme theme) noexcept;
+ThemePalette HighContrastPalette() noexcept;
+// Contrast-guarded accent derivation for a palette (pure; used by the resolver and
+// the portable checks through the same arithmetic).
+void ApplyAccentToPalette(ThemePalette& palette, COLORREF accent) noexcept;
+COLORREF MenuSelectedTextColor(const ThemePalette& palette) noexcept;
+
+// Accessibility / effect policy, cached on the UI thread. RefreshVisualEffects()
+// re-reads high contrast, client-area animations, transparency and the system
+// accent; it returns true when anything changed (callers then re-theme).
+const tokens::VisualEffects& CurrentVisualEffects() noexcept;
+bool RefreshVisualEffects() noexcept;
+
+// Font families from the design tokens, resolved once: Segoe UI Variable where it is
+// installed (Windows 11), plain Segoe UI otherwise. GDI would otherwise silently map a
+// missing family to an unrelated face.
+enum class FontRole { Text, Display };
+const wchar_t* UiFontFamily(FontRole role) noexcept;
+// Device-pixel stroke width for a DIP stroke token (never thinner than one pixel).
+float StrokePx(float dip, UINT dpi) noexcept;
 const std::array<COLORREF, 5>& BackgroundAccentColors() noexcept;
 UINT GetWindowDpi(HWND window) noexcept;
 

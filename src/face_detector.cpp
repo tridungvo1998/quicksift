@@ -5,6 +5,7 @@
 #include "core/face_policy.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -29,6 +30,20 @@ namespace {
 #if defined(QS_HAS_WINDOWS_FACE_ANALYSIS)
 constexpr std::uint32_t kMaximumFacesPerImage = 512;
 thread_local winrt::Windows::Media::FaceAnalysis::FaceDetector gThreadFaceDetector{ nullptr };
+// Set once if the Gray8 input path ever throws on this machine; every later call goes
+// straight to the original Bgra8 path instead of paying for a failing attempt.
+std::atomic<bool> gGray8InputRejected{ false };
+
+// BT.601-style luma on tightly packed BGRA (same weights as the quality analyzer).
+std::vector<std::uint8_t> BgraToGray8(const std::uint8_t* pixels, std::size_t pixelCount) {
+    std::vector<std::uint8_t> gray(pixelCount);
+    for (std::size_t index = 0; index < pixelCount; ++index) {
+        const std::uint8_t* pixel = pixels + index * 4u;
+        const unsigned luma = (29u * pixel[0] + 150u * pixel[1] + 77u * pixel[2]) >> 8;
+        gray[index] = static_cast<std::uint8_t>(std::min(luma, 255u));
+    }
+    return gray;
+}
 #endif
 std::mutex gCapabilityMutex;
 core::FaceDetectorCapability gCapability = core::FaceDetectorCapability::Unknown;
@@ -93,21 +108,43 @@ core::FaceAnalysisOutcome DetectFacesFastBgra(
         using namespace winrt::Windows::Storage::Streams;
 
         const std::size_t byteCount = static_cast<std::size_t>(byteCount64);
-        DataWriter writer;
-        writer.WriteBytes(winrt::array_view<const std::uint8_t>(pixels, pixels + byteCount));
-        const IBuffer buffer = writer.DetachBuffer();
-        const SoftwareBitmap bitmap = SoftwareBitmap::CreateCopyFromBuffer(
-            buffer,
-            BitmapPixelFormat::Bgra8,
-            width,
-            height,
-            BitmapAlphaMode::Premultiplied);
 
         // One detector per worker thread avoids repeated WinRT activation while
         // keeping detector objects off the UI thread.
         if (!gThreadFaceDetector) gThreadFaceDetector = FaceDetector::CreateAsync().get();
 
-        const auto faces = gThreadFaceDetector.DetectFacesAsync(bitmap).get();
+        // Gray8 is the detector's native input format; handing it Gray8 skips the
+        // detector's internal colour conversion and quarters the copied buffer. Any
+        // failure in this optional path falls back to the original Bgra8 path below.
+        winrt::Windows::Foundation::Collections::IVector<DetectedFace> faces{ nullptr };
+        if (!gGray8InputRejected.load(std::memory_order_relaxed)) {
+            try {
+                if (FaceDetector::IsBitmapPixelFormatSupported(BitmapPixelFormat::Gray8)) {
+                    const std::vector<std::uint8_t> gray = BgraToGray8(pixels, byteCount / 4u);
+                    DataWriter grayWriter;
+                    grayWriter.WriteBytes(winrt::array_view<const std::uint8_t>(
+                        gray.data(), gray.data() + gray.size()));
+                    const SoftwareBitmap grayBitmap = SoftwareBitmap::CreateCopyFromBuffer(
+                        grayWriter.DetachBuffer(), BitmapPixelFormat::Gray8, width, height);
+                    faces = gThreadFaceDetector.DetectFacesAsync(grayBitmap).get();
+                }
+            } catch (...) {
+                faces = nullptr;
+                gGray8InputRejected.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (!faces) {
+            DataWriter writer;
+            writer.WriteBytes(winrt::array_view<const std::uint8_t>(pixels, pixels + byteCount));
+            const IBuffer buffer = writer.DetachBuffer();
+            const SoftwareBitmap bitmap = SoftwareBitmap::CreateCopyFromBuffer(
+                buffer,
+                BitmapPixelFormat::Bgra8,
+                width,
+                height,
+                BitmapAlphaMode::Premultiplied);
+            faces = gThreadFaceDetector.DetectFacesAsync(bitmap).get();
+        }
         output.reserve(std::min<std::uint32_t>(faces.Size(), kMaximumFacesPerImage));
         for (const auto& detected : faces) {
             if (output.size() >= kMaximumFacesPerImage) break;
@@ -127,12 +164,17 @@ core::FaceAnalysisOutcome DetectFacesFastBgra(
                 static_cast<float>(static_cast<double>(right - left) / width),
                 static_cast<float>(static_cast<double>(bottom - top) / height)
             };
+            // Conservative noise filter: only boxes that are tiny both in pixels and
+            // relative to the image are dropped (see core/face_policy.h).
+            if (core::IsNoiseFace(face, width, height)) continue;
             output.push_back(face);
         }
 
-        // The largest face is the default anchor. This is deterministic and avoids
-        // expensive subject classification during rapid navigation.
-        std::sort(output.begin(), output.end(), quicksift::core::FaceAnchorComesBefore);
+        // Default FaceLock target = face closest to the dead centre of the image
+        // (ties: larger, then top, then left). Deterministic and cheap; faces[0] is
+        // the default anchor everywhere (FaceAnchorComesBefore ordering).
+        core::RankFacesForAnchor(output,
+            static_cast<float>(static_cast<double>(width) / static_cast<double>(height)));
         return core::FaceAnalysisOutcome::Completed;
     } catch (...) {
         output.clear();

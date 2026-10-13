@@ -264,7 +264,7 @@ function Read-QuickSiftVersion {
     }
     $ProductVersion = $Matches[1]
     if ($ProductVersion -notmatch '^\d+\.\d+\.\d+\.\d+\s+(?:RC|Beta|Alpha)\d*$') {
-        throw "QS_VERSION_STRING must use a numeric four-component version followed by a release label such as '0.9.3.0 RC'; got '$ProductVersion'."
+        throw "QS_VERSION_STRING must use a numeric four-component version followed by a release label such as '0.9.4.0 RC'; got '$ProductVersion'."
     }
     return ($ProductVersion -replace '\s+', '-')
 }

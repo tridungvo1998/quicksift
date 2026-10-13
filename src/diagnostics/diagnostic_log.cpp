@@ -5,6 +5,8 @@
 
 #include "../version.h"
 #include "platform/application_data_paths.h"
+#include "core/priority_policy.h"
+#include "core/lock_order.h"
 
 #include <commdlg.h>
 #include <dbghelp.h>
@@ -46,7 +48,13 @@ struct Entry {
     std::wstring event;
 };
 
+// Lock order: streamMutex -> mutex. Loggers (any thread, including the UI thread)
+// take only `mutex`, for an in-memory push. Disk I/O happens under `streamMutex`
+// alone (writer thread, Critical sync flush, shutdown), so a slow disk can never
+// stall a logging thread (0.9.4.0 polish: the writer used to write under `mutex`,
+// and every Warning flushed synchronously on the calling thread).
 struct State {
+    std::mutex streamMutex; // guards stream, diskBytes, diskLimitReached
     std::mutex mutex;
     std::deque<Entry> entries;
     fs::path sessionPath;
@@ -65,6 +73,8 @@ struct State {
     std::uint64_t eventsByLevel[5]{};
     std::uint64_t lastSystemSnapshotMs = 0;
     bool diskLimitReached = false;
+    std::atomic<bool> streamWritable{ false };   // lock-free gate for producers
+    std::atomic<bool> flushRequested{ false };   // a Warning+ line awaits an OS flush
     LPTOP_LEVEL_EXCEPTION_FILTER previousFilter = nullptr;
     std::atomic<bool> initialized{ false };
     std::atomic_flag crashInProgress = ATOMIC_FLAG_INIT;
@@ -346,28 +356,48 @@ bool WriteTextFile(const fs::path& path, std::wstring_view text) noexcept {
     }
 }
 
-void FlushDiskQueueLocked(State& state, bool flushStream) noexcept {
+// streamMutex held. Writes `batch` in order; honours the 16 MiB session cap.
+void WriteBatchStreamLocked(State& state, std::deque<std::string>& batch, bool flushStream) noexcept {
     try {
-        if (!state.stream || state.diskLimitReached) { state.diskQueue.clear(); return; }
-        while (!state.diskQueue.empty()) {
-            const std::string& line = state.diskQueue.front();
+        if (!state.stream || state.diskLimitReached) { batch.clear(); return; }
+        while (!batch.empty()) {
+            const std::string& line = batch.front();
             if (state.diskBytes + line.size() > kMaximumSessionLogBytes) {
                 static constexpr char marker[] =
                     "[QuickSift] On-disk session log reached the 16 MiB safety limit; additional entries remain in memory.\r\n";
                 state.stream.write(marker, static_cast<std::streamsize>(sizeof(marker) - 1));
                 state.diskLimitReached = true;
-                state.diskQueue.clear();
+                state.streamWritable.store(false, std::memory_order_release);
+                batch.clear();
                 break;
             }
             state.stream.write(line.data(), static_cast<std::streamsize>(line.size()));
             if (!state.stream) {
-                state.diskQueue.clear();
+                state.streamWritable.store(false, std::memory_order_release);
+                batch.clear();
                 break;
             }
             state.diskBytes += line.size();
-            state.diskQueue.pop_front();
+            batch.pop_front();
         }
         if (flushStream && state.stream) state.stream.flush();
+    } catch (...) {
+    }
+}
+
+// Takes streamMutex, then briefly `mutex` to swap the queue out; writes outside `mutex`.
+void DrainToDisk(State& state, bool flushStream) noexcept {
+    try {
+        std::lock_guard streamLock(state.streamMutex);
+        QS_LOCK_ORDER(quicksift::core::lock_order::Rank::LogStream);
+        std::deque<std::string> batch;
+        {
+            std::lock_guard lock(state.mutex);
+            QS_LOCK_ORDER(quicksift::core::lock_order::Rank::LogState);
+            batch.swap(state.diskQueue);
+        }
+        const bool flush = flushStream || state.flushRequested.exchange(false, std::memory_order_acq_rel);
+        WriteBatchStreamLocked(state, batch, flush);
     } catch (...) {
     }
 }
@@ -375,17 +405,36 @@ void FlushDiskQueueLocked(State& state, bool flushStream) noexcept {
 void DiskWriterMain() noexcept {
     State& state = GetState();
     try {
-        std::unique_lock lock(state.mutex);
         for (;;) {
-            state.diskCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
-                return state.diskStop || !state.diskQueue.empty();
-            });
-            FlushDiskQueueLocked(state, false);
-            if (state.diskStop && state.diskQueue.empty()) break;
+            bool stop = false;
+            {
+                std::unique_lock lock(state.mutex);
+                state.diskCv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                    return state.diskStop || !state.diskQueue.empty();
+                });
+                stop = state.diskStop;
+            }
+            DrainToDisk(state, false);
+            if (stop) break;
         }
-        FlushDiskQueueLocked(state, true);
+        DrainToDisk(state, true);
     } catch (...) {
     }
+}
+
+// Lock-free subsystem state for crash reports (atomics only; no locks, no I/O).
+std::wstring SubsystemStateText() {
+    namespace prio = quicksift::core::priority;
+    const prio::DemandSnapshot demand = prio::Demand().Snapshot();
+    std::wstring text;
+    text += L"Priority demand: highest=" + std::wstring(prio::TierName(prio::HighestDemand(demand)));
+    text += L" metadata_writes=" + std::to_wstring(demand.metadataWritesPending);
+    text += L" interactive_write_queued=" + std::wstring(demand.interactiveWritePending ? L"1" : L"0");
+    text += L" view_foreground=" + std::to_wstring(demand.viewForeground);
+    text += L" search_active=" + std::wstring(demand.searchActive ? L"1" : L"0");
+    text += L" search_focused=" + std::wstring(demand.searchFocused ? L"1" : L"0");
+    text += L" demand_epoch=" + std::to_wstring(prio::Demand().Epoch()) + L"\r\n";
+    return text;
 }
 
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* exceptionInfo) noexcept {
@@ -425,10 +474,18 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* exceptionInfo) noexcept {
             report << L"Exception address: " << exceptionInfo->ExceptionRecord->ExceptionAddress << L"\r\n";
         }
         report << L"\r\nRecent diagnostic log\r\n=====================\r\n";
+        report << L"\r\nSubsystem state\r\n===============\r\n" << SubsystemStateText();
+        report << L"\r\n";
         {
+            // Same order as everywhere: streamMutex -> mutex; never block in a crash.
+            std::unique_lock streamLock(state.streamMutex, std::try_to_lock);
             std::unique_lock lock(state.mutex, std::try_to_lock);
             if (lock.owns_lock()) {
-                FlushDiskQueueLocked(state, true);
+                if (streamLock.owns_lock()) {
+                    std::deque<std::string> batch;
+                    batch.swap(state.diskQueue);
+                    WriteBatchStreamLocked(state, batch, true);
+                }
                 report << SnapshotTextUnlocked(state);
             } else report << L"The in-memory log was unavailable because another thread held the log lock.\r\n"
                 << L"Use the session-log path above for entries flushed before the crash.\r\n";
@@ -527,6 +584,7 @@ bool Initialize() noexcept {
             state.sessionId = (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32) ^ MonotonicMilliseconds();
             state.diskBytes = sizeof(bom);
             PruneCrashReports(crashDirectory);
+            state.streamWritable.store(true, std::memory_order_release);
             state.initialized.store(true, std::memory_order_release);
             state.diskThread = std::thread(DiskWriterMain);
         }
@@ -538,7 +596,8 @@ bool Initialize() noexcept {
             state.diskStop = true;
             state.diskCv.notify_all();
             if (state.diskThread.joinable()) state.diskThread.join();
-            std::lock_guard lock(state.mutex);
+            std::lock_guard streamLock(state.streamMutex);
+            state.streamWritable.store(false, std::memory_order_release);
             if (state.stream) state.stream.close();
         } catch (...) {}
         return false;
@@ -556,9 +615,10 @@ void Shutdown() noexcept {
         }
         state.diskCv.notify_all();
         if (state.diskThread.joinable()) state.diskThread.join();
+        DrainToDisk(state, true);
         {
-            std::lock_guard lock(state.mutex);
-            FlushDiskQueueLocked(state, true);
+            std::lock_guard streamLock(state.streamMutex);
+            state.streamWritable.store(false, std::memory_order_release);
             if (state.stream) {
                 state.stream.flush();
                 state.stream.close();
@@ -618,22 +678,28 @@ void WriteEvent(Level level, std::wstring_view category, std::wstring_view event
         entry.event.assign(event);
         entry.message = std::move(message);
         const std::wstring line = FormatEntry(entry);
-        std::lock_guard lock(state.mutex);
-        state.entries.push_back(std::move(entry));
-        while (state.entries.size() > 12000) { state.entries.pop_front(); ++state.droppedEntries; }
-        state.eventsByLevel[static_cast<int>(level)]++;
-        if (state.stream && !state.diskLimitReached) {
-            const std::string utf8 = Utf8FromWide(line + L"\r\n");
+        const std::string utf8 = state.streamWritable.load(std::memory_order_acquire) ?
+            Utf8FromWide(line + L"\r\n") : std::string();
+        {
+            std::lock_guard lock(state.mutex);
+            QS_LOCK_ORDER(quicksift::core::lock_order::Rank::LogState);
+            state.entries.push_back(std::move(entry));
+            while (state.entries.size() > 12000) { state.entries.pop_front(); ++state.droppedEntries; }
+            state.eventsByLevel[static_cast<int>(level)]++;
             if (!utf8.empty()) {
                 if (state.diskQueue.size() >= 4096) {
                     state.diskQueue.pop_front();
                     ++state.diskQueueDropped;
                 }
                 state.diskQueue.push_back(utf8);
-                state.diskCv.notify_one();
-                if (level >= Level::Warning) FlushDiskQueueLocked(state, true);
+                // Warning/Error: the writer thread flushes the OS buffer on its next
+                // pass (no disk I/O on the calling thread, which may be the UI).
+                if (level >= Level::Warning) state.flushRequested.store(true, std::memory_order_release);
             }
         }
+        if (!utf8.empty()) state.diskCv.notify_one();
+        // Critical only: synchronous, so the line is on disk even if a crash follows.
+        if (!utf8.empty() && level >= Level::Critical) DrainToDisk(state, true);
     } catch (...) {
     }
 }
@@ -688,22 +754,28 @@ void Write(Level level, std::wstring_view category, std::wstring_view message) n
         entry.category.assign(category);
         entry.message.assign(message);
         const std::wstring line = FormatEntry(entry);
-        std::lock_guard lock(state.mutex);
-        state.entries.push_back(std::move(entry));
-        while (state.entries.size() > 12000) { state.entries.pop_front(); ++state.droppedEntries; }
-        state.eventsByLevel[static_cast<int>(level)]++;
-        if (state.stream && !state.diskLimitReached) {
-            const std::string utf8 = Utf8FromWide(line + L"\r\n");
+        const std::string utf8 = state.streamWritable.load(std::memory_order_acquire) ?
+            Utf8FromWide(line + L"\r\n") : std::string();
+        {
+            std::lock_guard lock(state.mutex);
+            QS_LOCK_ORDER(quicksift::core::lock_order::Rank::LogState);
+            state.entries.push_back(std::move(entry));
+            while (state.entries.size() > 12000) { state.entries.pop_front(); ++state.droppedEntries; }
+            state.eventsByLevel[static_cast<int>(level)]++;
             if (!utf8.empty()) {
                 if (state.diskQueue.size() >= 4096) {
                     state.diskQueue.pop_front();
                     ++state.diskQueueDropped;
                 }
                 state.diskQueue.push_back(utf8);
-                state.diskCv.notify_one();
-                if (level >= Level::Warning) FlushDiskQueueLocked(state, true);
+                // Warning/Error: the writer thread flushes the OS buffer on its next
+                // pass (no disk I/O on the calling thread, which may be the UI).
+                if (level >= Level::Warning) state.flushRequested.store(true, std::memory_order_release);
             }
         }
+        if (!utf8.empty()) state.diskCv.notify_one();
+        // Critical only: synchronous, so the line is on disk even if a crash follows.
+        if (!utf8.empty() && level >= Level::Critical) DrainToDisk(state, true);
     } catch (...) {}
 }
 

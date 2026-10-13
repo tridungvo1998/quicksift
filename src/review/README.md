@@ -85,6 +85,9 @@ These are requirements, not implementation accidents:
 11. Deep zoom retains a useful lower-resolution decode as an intermediate while a larger full decode is in flight.
 12. A tiny embedded JPEG/EXIF thumbnail cannot permanently satisfy a larger thumbnail bucket; it must refine to an adequate decode.
 13. UI result integration remains time-sliced and priority-aware; the review model does not bypass the completion queue.
+14. The FaceLock target is the user's (persisted) face selection when it still matches a detected face, otherwise the face closest to the image centre; result arrival still jumps the view to the target (intended).
+15. Face-outline click hit testing is derived from current layout and view state (`HitFaceOutline` + `transform::SourceToScreen`), never from rectangles retained from the last paint. A press that travels beyond the drag threshold (max of the system drag rectangle at window DPI and `kFaceClickMaxTravelDip`) is a pan; `PressGesture`, `FaceZoomToggle` and `FaceOutlineFade` (`face_interaction_policy.*`) hold the portable click, zoom-toggle and outline-fade rules.
+16. Clicking a face frames it at `kFaceClickFillFraction` of the clicked pane via `transform::FrameSourceRect`; with Sync the shared zoom follows while each pane centres on its own target.
 
 ## UI adapter rules
 

@@ -327,6 +327,31 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             [&](const auto& entry) { return entry.first.rfind(familyPrefix, 0) == 0; });
     }
 
+    std::unordered_set<std::wstring> Worker::PendingOrActiveThumbnailPaths() const {
+        // Batched form of IsThumbnailJobPendingOrActive (0.9.4.0). The viewport
+        // publisher used to call the single-path probe once per planned request; each
+        // call took mutex_ and prefix-scanned every pending key, i.e.
+        // O(requests x pending) string compares while decode workers contended for the
+        // same lock. This takes mutex_ once and is O(pending + active).
+        // Key layout (JobKey and VisualFamilyKey): "<path>|<kind>|<class>|...".
+        // '|' cannot occur in a Windows path, so the first '|' ends the path.
+        const std::wstring marker = L"|" +
+            std::to_wstring(static_cast<int>(JobKind::DecodePreview)) + L"|" +
+            std::to_wstring(static_cast<int>(CacheClass::Thumbnail)) + L"|";
+        std::unordered_set<std::wstring> paths;
+        const auto collect = [&](const std::wstring& key) {
+            const std::size_t separator = key.find(L'|');
+            if (separator == std::wstring::npos || separator == 0) return;
+            if (key.compare(separator, marker.size(), marker) != 0) return;
+            paths.emplace(key, 0, separator);
+        };
+        std::lock_guard lock(mutex_);
+        paths.reserve(pending_.size());
+        for (const std::wstring& key : pending_) collect(key);
+        for (const auto& entry : activeVisualFamilies_) collect(entry.first);
+        return paths;
+    }
+
     bool Worker::IsThumbnailPathCurrentKey(const std::wstring& key) const noexcept {
         try {
             std::lock_guard viewportLock(thumbnailViewportMutex_);
@@ -466,6 +491,9 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                 removePaths(faceQueue_);
                 removePaths(idleQueue_);
                 removePaths(analysisQueue_);
+                removePaths(viewQueue_);
+                removePaths(viewPrefetchQueue_);
+                viewForegroundQueued_.store(static_cast<unsigned>(viewQueue_.size()), std::memory_order_release); NoteViewForegroundChanged();
             }
             for (const WorkJob& removed : removedJobs) {
                 AcknowledgeUnpostedJob(removed, removed.key.empty() ? JobKey(removed) : removed.key);

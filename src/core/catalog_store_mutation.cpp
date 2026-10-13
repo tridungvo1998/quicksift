@@ -30,6 +30,7 @@ CatalogStore::Index CatalogStore::Append(PhotoItem item) {
     photos_.push_back(std::move(item));
     try { InsertPath(index, path); }
     catch (...) { photos_.pop_back(); throw; }
+    MarkFactsChanged(index);
     return index;
 }
 
@@ -69,6 +70,7 @@ std::vector<CatalogStore::Index> CatalogStore::AppendBatch(
         photos_.resize(originalSize);
         throw;
     }
+    MarkFactsChanged(originalSize); // the partial tail chunk (later chunks are new)
     return indexes;
 }
 
@@ -105,7 +107,9 @@ void CatalogStore::EditPhoto(Index index,
     if (!PathsEqualInsensitive(candidate.path.wstring(), item.path.wstring())) {
         throw std::logic_error("catalog path identity must be changed through ReplacePath");
     }
+    const bool factsChanged = !SameMetadataFacts(item, candidate);
     item = std::move(candidate);
+    if (factsChanged) MarkFactsChanged(index);
 }
 
 void CatalogStore::ReplacePath(Index index, std::filesystem::path path) {
@@ -133,6 +137,7 @@ void CatalogStore::ReplacePath(Index index, std::filesystem::path path) {
         throw;
     }
     RemovePath(index, oldPath);
+    MarkFactsChanged(index);
 }
 
 } // namespace quicksift::core

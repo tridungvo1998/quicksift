@@ -42,10 +42,20 @@ add_library(QuickSiftCore STATIC
     src/core/image_formats.cpp
     src/core/decode_budget.cpp
     src/core/face_policy.cpp
+    src/core/face_quality_policy.cpp
+    src/core/ratings_exchange.cpp
+    src/core/batch_match_policy.cpp
+    src/core/photo_predicate.cpp
+    src/core/search_query.cpp
+    src/core/exif_capture_time.cpp
     src/core/face_detection_policy.cpp
     src/core/performance_policy.cpp
     src/core/metadata_state.cpp
     src/core/catalog_store.cpp
+    src/core/priority_policy.cpp
+    src/core/write_retry_policy.cpp
+    src/core/metadata_edit_queue.cpp
+    src/core/user_error_catalog.cpp
     src/core/catalog_store_mutation.cpp
     src/core/path_identity.cpp
     src/core/selection_store.cpp
@@ -66,15 +76,32 @@ add_library(QuickSiftCore STATIC
     src/metadata/xmp_simple_property.cpp
     src/metadata/metadata_value_parser.cpp
     src/ui/framework/ui_models.cpp
+    src/ui/framework/ui_animation.cpp
+    src/ui/framework/ui_frost.cpp
     src/review/view_transform_policy.cpp
+    src/review/face_interaction_policy.cpp
     src/core/catalog_policy.h
     src/core/image_formats.h
     src/core/decode_budget.h
     src/core/face_policy.h
+    src/core/face_quality_policy.h
+    src/core/ratings_exchange.h
+    src/core/batch_match_policy.h
+    src/core/metadata_vocabulary.h
+    src/core/photo_predicate.h
+    src/core/search_query.h
+    src/core/exif_capture_time.h
+    src/core/image_metadata.h
     src/core/face_detection_policy.h
     src/core/performance_policy.h
     src/core/metadata_state.h
     src/core/catalog_store.h
+    src/core/priority_policy.h
+    src/core/write_retry_policy.h
+    src/core/metadata_edit_queue.h
+    src/core/user_error_catalog.h
+    src/core/log_rate_limiter.h
+    src/core/lock_order.h
     src/core/path_identity.h
     src/core/selection_store.h
     src/core/history_store.h
@@ -91,7 +118,10 @@ add_library(QuickSiftCore STATIC
     src/metadata/xmp_simple_property.h
     src/metadata/metadata_value_parser.h
     src/ui/framework/ui_models.h
+    src/ui/framework/ui_animation.h
+    src/ui/framework/ui_frost.h
     src/review/view_transform_policy.h
+    src/review/face_interaction_policy.h
     src/core/history_partition.h
     src/core/work_queue_policy.h
     src/core/stable_file_identity.h
@@ -190,10 +220,16 @@ set(QS_APP_SOURCES
     src/ui/performance_policy_controller.cpp
     src/ui/navigation_input_and_session.cpp
     src/ui/metadata_history_and_file_safety.cpp
+    src/ui/metadata_write_lane_controller.cpp
+    src/ui/metadata_photo_values.h
     src/ui/settings_filters_and_file_commands.cpp
+    src/ui/ratings_exchange_commands.cpp
+    src/ui/batch_processing_commands.cpp
+    src/ui/thumbnail_search_controller.cpp
     src/ui/document_and_menu_models.cpp
     src/core/system_profile.cpp
     src/diagnostics/diagnostic_log.cpp
+    src/diagnostics/log_categories.h
     src/persistent_cache.cpp
     src/bundled_codecs.cpp
     src/face_detector.cpp
@@ -211,6 +247,8 @@ set(QS_APP_SOURCES
     src/metadata/xmp_simple_property.h
     src/metadata/metadata_value_parser.h
     src/ui/framework/ui_models.h
+    src/ui/framework/ui_animation.h
+    src/ui/framework/ui_frost.h
     src/review/view_transform_policy.h
     src/core/history_partition.h
     src/core/work_queue_policy.h
@@ -229,13 +267,17 @@ set(QS_APP_SOURCES
     src/ui/framework/macos_ui_framework_gdi.cpp
     src/ui/framework/macos_ui_framework_popup.cpp
     src/ui/framework/macos_ui_framework_d2d.cpp
+    src/ui/framework/macos_ui_framework_form.cpp
     src/ui/ui_design_system.h
     src/ui/framework/macos_ui_framework.h
     src/ui/framework/ui_models.h
+    src/ui/framework/ui_animation.h
+    src/ui/framework/ui_frost.h
     src/review/view_transform_policy.h
     src/ui/ui_command_ids.h
     src/ui/ui_control_catalog.h
     src/ui/ui_layout_metrics.h
+    src/ui/ui_design_tokens.h
     resource.h
     resource.rc.in
     QuickSift.ico
@@ -299,7 +341,7 @@ target_compile_definitions(QuickSift PRIVATE QS_USE_SQLITE=1)
 
 target_link_libraries(QuickSift PRIVATE
     comctl32 d2d1 dwrite dwmapi uxtheme msimg32 windowscodecs shlwapi shell32
-    propsys ole32 uuid runtimeobject gdiplus d3d11 dxgi dbghelp psapi comdlg32
+    propsys ole32 uuid runtimeobject gdiplus d3d11 dxgi dbghelp psapi comdlg32 advapi32
 )
 
 if(TARGET Exiv2::exiv2lib)

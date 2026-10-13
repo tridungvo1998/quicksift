@@ -27,6 +27,15 @@ ViewPoint InverseRotate(ViewPoint point, int rotation) noexcept {
     }
 }
 
+ViewPoint ForwardRotate(ViewPoint point, int rotation) noexcept {
+    switch (NormalizedRotation(rotation)) {
+    case 90: return { -point.y, point.x };
+    case 180: return { -point.x, -point.y };
+    case 270: return { point.y, -point.x };
+    default: return point;
+    }
+}
+
 float AreaWidth(const ViewGeometry& geometry) noexcept {
     return std::max(1.0f, geometry.area.right - geometry.area.left);
 }
@@ -173,6 +182,49 @@ ViewState ZoomViewAt(const ViewState& input, const ViewGeometry& geometry,
     const ResolvedView newView = ResolveView(output, geometry);
     output.centerX = sourcePointX - fromCenter.x / newView.drawWidthDip;
     output.centerY = sourcePointY - fromCenter.y / newView.drawHeightDip;
+    return NormalizeView(output, geometry);
+}
+
+ViewPoint SourceToScreen(const ResolvedView& view, const ViewGeometry& geometry,
+    ViewPoint normalizedSource) noexcept {
+    const float areaCenterX = (geometry.area.left + geometry.area.right) * 0.5f;
+    const float areaCenterY = (geometry.area.top + geometry.area.bottom) * 0.5f;
+    if (!view.valid) return { areaCenterX, areaCenterY };
+    const ViewPoint unrotated{
+        (normalizedSource.x - view.state.centerX) * view.drawWidthDip,
+        (normalizedSource.y - view.state.centerY) * view.drawHeightDip };
+    const ViewPoint rotated = ForwardRotate(unrotated, view.state.rotation);
+    return { areaCenterX + rotated.x, areaCenterY + rotated.y };
+}
+
+ViewState FrameSourceRect(const ViewState& input, const ViewGeometry& geometry,
+    ViewRect normalizedRect, float fill) noexcept {
+    const ResolvedView current = ResolveView(input, geometry);
+    if (!current.valid || !std::isfinite(fill) || fill <= 0.0f) return input;
+    const float left = ClampFinite(std::min(normalizedRect.left, normalizedRect.right), 0.0f, 1.0f, 0.0f);
+    const float right = ClampFinite(std::max(normalizedRect.left, normalizedRect.right), 0.0f, 1.0f, 1.0f);
+    const float top = ClampFinite(std::min(normalizedRect.top, normalizedRect.bottom), 0.0f, 1.0f, 0.0f);
+    const float bottom = ClampFinite(std::max(normalizedRect.top, normalizedRect.bottom), 0.0f, 1.0f, 1.0f);
+    const float sourceRectWidth = std::max(1.0f, (right - left) * static_cast<float>(geometry.sourceWidth));
+    const float sourceRectHeight = std::max(1.0f, (bottom - top) * static_cast<float>(geometry.sourceHeight));
+    const bool quarterTurn = ((current.state.rotation / 90) & 1) != 0;
+    const float orientedWidth = quarterTurn ? sourceRectHeight : sourceRectWidth;
+    const float orientedHeight = quarterTurn ? sourceRectWidth : sourceRectHeight;
+    const float wanted = std::min(fill, 1.0f) *
+        std::min(AreaWidth(geometry) / orientedWidth, AreaHeight(geometry) / orientedHeight);
+    const float scaleDip = ClampFinite(wanted, current.fitScaleDip, current.fitScaleDip * 32.0f,
+        current.fitScaleDip);
+
+    ViewState output = current.state;
+    output.centerX = (left + right) * 0.5f;
+    output.centerY = (top + bottom) * 0.5f;
+    if (scaleDip <= current.fitScaleDip * 1.001f) {
+        output.mode = quicksift::core::ZoomMode::Fit;
+        output.zoom = 1.0f;
+    } else {
+        output.mode = quicksift::core::ZoomMode::Custom;
+        output.zoom = scaleDip * std::max(0.01f, geometry.displayScale);
+    }
     return NormalizeView(output, geometry);
 }
 

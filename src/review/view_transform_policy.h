@@ -56,4 +56,17 @@ ViewState ZoomViewAt(const ViewState& state, const ViewGeometry& geometry,
 float CustomPhysicalScaleFor(const ViewState& state, const ViewGeometry& geometry) noexcept;
 bool IsBeyondFit(const ViewState& state, const ViewGeometry& geometry) noexcept;
 
+// Maps a normalized source point (0..1 in oriented source pixels) to screen DIPs
+// for an already resolved view. Mirrors the bitmap placement and quarter-turn
+// rotation used by the renderer, so overlays and hit tests line up with pixels.
+ViewPoint SourceToScreen(const ResolvedView& view, const ViewGeometry& geometry,
+    ViewPoint normalizedSource) noexcept;
+
+// Frames a normalized source rectangle (left/top/right/bottom in 0..1) so that it
+// fills `fill` of the pane along its limiting axis, centered on the rectangle.
+// Magnification is limited to the same [Fit, 32x Fit] range as wheel zoom; when
+// the limit is Fit the result is the semantic Fit mode.
+ViewState FrameSourceRect(const ViewState& state, const ViewGeometry& geometry,
+    ViewRect normalizedRect, float fill) noexcept;
+
 } // namespace quicksift::review::transform

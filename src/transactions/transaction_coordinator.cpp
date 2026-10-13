@@ -37,6 +37,10 @@ std::optional<FileTransactionProgress> TransactionCoordinator::FileProgress() co
     return fileService_.Progress();
 }
 
+std::optional<MetadataTransactionProgress> TransactionCoordinator::MetadataProgress() const noexcept {
+    return metadataService_.Progress();
+}
+
 std::uint64_t TransactionCoordinator::SubmitFile(FileTransactionPlan& plan) {
     if (stopped_ || closeRequested_ || Busy()) return 0;
     const std::uint64_t token = nextFileToken_;
@@ -63,6 +67,25 @@ std::uint64_t TransactionCoordinator::SubmitMetadata(MetadataTransactionPlan& pl
     return token;
 }
 
+std::uint64_t TransactionCoordinator::SubmitUrgentMetadata(MetadataTransactionPlan& plan) {
+    if (stopped_ || closeRequested_ || fileService_.Busy() || !metadataService_.Busy() ||
+        activeUrgentMetadataToken_ != 0) return 0;
+    const std::uint64_t token = nextMetadataToken_;
+    plan.token = token;
+    if (!metadataService_.SubmitUrgent(std::move(plan))) {
+        plan.token = 0;
+        return 0;
+    }
+    if (++nextMetadataToken_ == 0) ++nextMetadataToken_;
+    activeUrgentMetadataToken_ = token;
+    return token;
+}
+
+bool TransactionCoordinator::MetadataUrgentSlotFree() const {
+    return !stopped_ && !closeRequested_ && !fileService_.Busy() &&
+        activeUrgentMetadataToken_ == 0 && metadataService_.UrgentSlotFree();
+}
+
 std::optional<FileTransactionResult> TransactionCoordinator::TakeFileResult() {
     return fileService_.TakeResult();
 }
@@ -78,9 +101,16 @@ bool TransactionCoordinator::AcceptFileResult(std::uint64_t token) noexcept {
 }
 
 bool TransactionCoordinator::AcceptMetadataResult(std::uint64_t token) noexcept {
-    if (token == 0 || token != activeMetadataToken_) return false;
-    activeMetadataToken_ = 0;
-    return true;
+    if (token == 0) return false;
+    if (token == activeMetadataToken_) {
+        activeMetadataToken_ = 0;
+        return true;
+    }
+    if (token == activeUrgentMetadataToken_) {
+        activeUrgentMetadataToken_ = 0;
+        return true;
+    }
+    return false;
 }
 
 void TransactionCoordinator::RequestCloseAtSafeBoundary() noexcept {
@@ -115,6 +145,7 @@ void TransactionCoordinator::Stop() noexcept {
     fileService_.Stop();
     activeFileToken_ = 0;
     activeMetadataToken_ = 0;
+    activeUrgentMetadataToken_ = 0;
 }
 
 } // namespace quicksift::transactions

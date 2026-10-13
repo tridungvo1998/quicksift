@@ -401,6 +401,10 @@ bool DecodeRawEmbedded(LibRaw& processor, const DecodeOptions& options,
 #if defined(QS_USE_TURBOJPEG)
         DecodeOptions previewOptions = options;
         previewOptions.preferEmbeddedPreview = false;
+        // Single View (targetSize <= 0 or large): keep the embedded JPEG at full
+        // quality. Grid thumbs may still scale.
+        if (options.rawJpegPreviewOnly && options.targetSize <= 0)
+            previewOptions.targetSize = 0;
         if (!DecodeJpegBytes({ thumbnail->data, thumbnail->data_size }, previewOptions, decoded, true)) return false;
 #else
         return false;
@@ -424,8 +428,14 @@ bool DecodeRawEmbedded(LibRaw& processor, const DecodeOptions& options,
     }
 
     if (decoded.pixels.empty()) return false;
-    // Preserve full RAW dimensions even though the pixels came from an embedded JPEG,
-    // while matching those dimensions to the orientation of the decoded preview.
+    // Single View with JPEG-preview mode expects the full embedded JPEG, not a
+    // tiny thumbnail. If LibRaw returned a small thumb, reject it so the caller
+    // can fall through to a larger preview scan.
+    if (options.rawJpegPreviewOnly && options.targetSize <= 0) {
+        const int longest = std::max(decoded.width, decoded.height);
+        const int sourceLongest = std::max(rawWidth, rawHeight);
+        if (sourceLongest > 0 && longest * 4 < sourceLongest) return false;
+    }
     SetRawSourceGeometry(decoded, rawWidth, rawHeight);
     const int longest = std::max(decoded.width, decoded.height);
     const std::int64_t minimumPreview = options.targetSize > 0
@@ -451,6 +461,41 @@ bool DecodeRaw(const fs::path& path, const DecodeOptions& options, DecodedImageD
     const int rawWidth = static_cast<int>(processor.imgdata.sizes.width);
     const int rawHeight = static_cast<int>(processor.imgdata.sizes.height);
     if (DecodeRawEmbedded(processor, options, rawWidth, rawHeight, output)) return true;
+    // LibRaw thumb was missing or too small for Single View. Scan the file for
+    // the largest embedded JPEG (the full-quality preview many cameras store).
+    if (options.rawJpegPreviewOnly && options.preferEmbeddedPreview) {
+        MappedFileView mapped;
+        const std::uint64_t limit = std::min(options.mappedInputLimit,
+            gMappedInputLimit.load(std::memory_order_relaxed));
+        if (mapped.Open(path, MappedFileView::AccessPattern::Sequential, limit, true)) {
+            const auto bytes = mapped.Bytes();
+            std::size_t bestStart = 0, bestLen = 0;
+            for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
+                if (bytes[i] == 0xFF && bytes[i + 1] == 0xD8) {
+                    std::size_t end = i + 2;
+                    while (end + 1 < bytes.size() && !(bytes[end] == 0xFF && bytes[end + 1] == 0xD9)) ++end;
+                    if (end + 1 < bytes.size()) {
+                        const std::size_t len = end + 2 - i;
+                        if (len > bestLen && len > 64 * 1024) { bestStart = i; bestLen = len; }
+                    }
+                    i = end;
+                }
+            }
+            if (bestLen > 0) {
+#if defined(QS_USE_TURBOJPEG)
+                DecodeOptions previewOptions = options;
+                previewOptions.preferEmbeddedPreview = false;
+                previewOptions.targetSize = 0; // full quality
+                DecodedImageData decoded;
+                if (DecodeJpegBytes(bytes.subspan(bestStart, bestLen), previewOptions, decoded, true)) {
+                    SetRawSourceGeometry(decoded, rawWidth, rawHeight);
+                    output = std::move(decoded);
+                    return true;
+                }
+#endif
+            }
+        }
+    }
     if (options.rawJpegPreviewOnly || Cancelled(options)) return false;
 
     const int longest = std::max(rawWidth, rawHeight);

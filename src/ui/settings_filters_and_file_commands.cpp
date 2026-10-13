@@ -1,8 +1,17 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "core/exif_capture_time.h"
+#include "core/priority_policy.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <set>
 
 namespace quicksift::app {
 namespace {
+
+namespace vocab = quicksift::core::vocabulary;
 
 MenuItem MakeMenuItem(std::wstring text, int command, bool checked = false,
     bool destructive = false) {
@@ -38,12 +47,13 @@ MenuItem MakeHeader(std::wstring text) {
 void QuickSiftApplicationImpl::ShowRatingMenu() {
         const int active = ActiveRatingForUi();
         std::vector<MenuItem> items = {
-            MakeMenuItem(L"0 ★ (Unrated)", ID_RATE_CLEAR, active == 0),
-            MakeMenuItem(L"1 ★", ID_RATE_1, active == 1),
-            MakeMenuItem(L"2 ★", ID_RATE_2, active == 2),
-            MakeMenuItem(L"3 ★", ID_RATE_3, active == 3),
-            MakeMenuItem(L"4 ★", ID_RATE_4, active == 4),
-            MakeMenuItem(L"5 ★", ID_RATE_5, active == 5),
+            // Labels come from the canonical vocabulary (core/metadata_vocabulary.h).
+            MakeMenuItem(std::wstring(vocab::StarLabel(0)), ID_RATE_CLEAR, active == 0),
+            MakeMenuItem(std::wstring(vocab::StarLabel(1)), ID_RATE_1, active == 1),
+            MakeMenuItem(std::wstring(vocab::StarLabel(2)), ID_RATE_2, active == 2),
+            MakeMenuItem(std::wstring(vocab::StarLabel(3)), ID_RATE_3, active == 3),
+            MakeMenuItem(std::wstring(vocab::StarLabel(4)), ID_RATE_4, active == 4),
+            MakeMenuItem(std::wstring(vocab::StarLabel(5)), ID_RATE_5, active == 5),
         };
         const int command = TrackDropdownMenu(controls_[ID_RATING_MENU], std::move(items));
         if (command == ID_RATE_CLEAR) {
@@ -56,9 +66,9 @@ void QuickSiftApplicationImpl::ShowRatingMenu() {
 void QuickSiftApplicationImpl::ShowPickStateMenu() {
     const int active = ActivePickStateForUi();
     std::vector<MenuItem> items = {
-        MakeMenuItem(L"Pick", ID_PICK_STATE_PICK, active == 1),
-        MakeMenuItem(L"Reject", ID_PICK_STATE_REJECT, active == -1),
-        MakeMenuItem(L"Unmark", ID_PICK_STATE_UNMARK, active == 0),
+        MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickPicked).command), ID_PICK_STATE_PICK, active == 1),
+        MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickRejected).command), ID_PICK_STATE_REJECT, active == -1),
+        MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickNone).command), ID_PICK_STATE_UNMARK, active == 0),
     };
     const int command = TrackDropdownMenu(controls_[ID_PICK_STATE_MENU], std::move(items));
     switch (command) {
@@ -72,12 +82,12 @@ void QuickSiftApplicationImpl::ShowPickStateMenu() {
 void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         const int active = ActiveColorLabelForUi();
         std::vector<MenuItem> items = {
-            MakeMenuItem(L"None", ID_LABEL_NONE, active == 0),
-            MakeMenuItem(L"Red", ID_LABEL_RED, active == 1),
-            MakeMenuItem(L"Yellow", ID_LABEL_YELLOW, active == 2),
-            MakeMenuItem(L"Green", ID_LABEL_GREEN, active == 3),
-            MakeMenuItem(L"Blue", ID_LABEL_BLUE, active == 4),
-            MakeMenuItem(L"Purple", ID_LABEL_PURPLE, active == 5),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorNone).label), ID_LABEL_NONE, active == 0),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorRed).label), ID_LABEL_RED, active == 1),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorYellow).label), ID_LABEL_YELLOW, active == 2),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorGreen).label), ID_LABEL_GREEN, active == 3),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorBlue).label), ID_LABEL_BLUE, active == 4),
+            MakeMenuItem(std::wstring(vocab::Color(vocab::kColorPurple).label), ID_LABEL_PURPLE, active == 5),
         };
         const int command = TrackDropdownMenu(controls_[ID_COLOR_LABEL], std::move(items));
         if (command >= ID_LABEL_NONE && command <= ID_LABEL_PURPLE) ApplyColorLabel(command - ID_LABEL_NONE);
@@ -85,16 +95,12 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowRatingFilterMenu() {
         const int active = static_cast<int>(ratingFilter_);
-        std::vector<MenuItem> items = {
-            MakeMenuItem(L"All ratings", ID_RATING_FILTER_ALL, active == 0),
-            MakeMenuItem(L"No stars", ID_RATING_FILTER_NONE, active == 1),
-            MakeMenuItem(L"Exactly 1 star", ID_RATING_FILTER_1, active == 2),
-            MakeMenuItem(L"Exactly 2 stars", ID_RATING_FILTER_2, active == 3),
-            MakeMenuItem(L"Exactly 3 stars", ID_RATING_FILTER_3, active == 4),
-            MakeMenuItem(L"Exactly 4 stars", ID_RATING_FILTER_4, active == 5),
-            MakeMenuItem(L"Exactly 5 stars", ID_RATING_FILTER_5, active == 6),
-            MakeMenuItem(L"4 stars and up", ID_RATING_FILTER_4PLUS, active == 7),
-        };
+        // Filter labels from the canonical vocabulary, indexed by RatingFilter.
+        std::vector<MenuItem> items;
+        for (int index = 0; index <= ID_RATING_FILTER_4PLUS - ID_RATING_FILTER_ALL; ++index) {
+            items.push_back(MakeMenuItem(std::wstring(vocab::kRatingFilterLabels[static_cast<std::size_t>(index)]),
+                ID_RATING_FILTER_ALL + index, active == index));
+        }
         const int command = TrackDropdownMenu(controls_[ID_STAR_FILTER], std::move(items));
         if (command < ID_RATING_FILTER_ALL || command > ID_RATING_FILTER_4PLUS) return;
         ratingFilter_ = static_cast<RatingFilter>(command - ID_RATING_FILTER_ALL);
@@ -107,10 +113,10 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
     void QuickSiftApplicationImpl::ShowPickFilterMenu() {
         const int active = static_cast<int>(pickFilter_);
         std::vector<MenuItem> items = {
-            MakeMenuItem(L"All pick states", ID_PICK_FILTER_ALL, active == 0),
-            MakeMenuItem(L"Picks only", ID_PICK_FILTER_PICKS, active == 1),
-            MakeMenuItem(L"Rejected only", ID_PICK_FILTER_REJECTS, active == 2),
-            MakeMenuItem(L"Unmarked only", ID_PICK_FILTER_UNMARKED, active == 3),
+            MakeMenuItem(std::wstring(vocab::kPickFilterAllLabel), ID_PICK_FILTER_ALL, active == 0),
+            MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickPicked).filterLabel), ID_PICK_FILTER_PICKS, active == 1),
+            MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickRejected).filterLabel), ID_PICK_FILTER_REJECTS, active == 2),
+            MakeMenuItem(std::wstring(vocab::Pick(vocab::kPickNone).filterLabel), ID_PICK_FILTER_UNMARKED, active == 3),
         };
         const int command = TrackDropdownMenu(controls_[ID_PICK_FILTER], std::move(items));
         if (command < ID_PICK_FILTER_ALL || command > ID_PICK_FILTER_UNMARKED) return;
@@ -124,14 +130,12 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
     void QuickSiftApplicationImpl::ShowColorLabelFilterMenu() {
         const int active = static_cast<int>(colorLabelFilter_);
         std::vector<MenuItem> items = {
-            MakeMenuItem(L"All labels", ID_LABEL_FILTER_ALL, active == 0),
-            MakeMenuItem(L"Unlabeled only", ID_LABEL_FILTER_NONE, active == 1),
-            MakeMenuItem(L"Red only", ID_LABEL_FILTER_RED, active == 2),
-            MakeMenuItem(L"Yellow only", ID_LABEL_FILTER_YELLOW, active == 3),
-            MakeMenuItem(L"Green only", ID_LABEL_FILTER_GREEN, active == 4),
-            MakeMenuItem(L"Blue only", ID_LABEL_FILTER_BLUE, active == 5),
-            MakeMenuItem(L"Purple only", ID_LABEL_FILTER_PURPLE, active == 6),
+            MakeMenuItem(std::wstring(vocab::kColorFilterAllLabel), ID_LABEL_FILTER_ALL, active == 0),
         };
+        for (const vocab::ColorEntry& color : vocab::kColors) {
+            items.push_back(MakeMenuItem(std::wstring(color.filterLabel),
+                ID_LABEL_FILTER_NONE + color.value, active == color.value + 1));
+        }
         const int command = TrackDropdownMenu(controls_[ID_LABEL_FILTER], std::move(items));
         if (command < ID_LABEL_FILTER_ALL || command > ID_LABEL_FILTER_PURPLE) return;
         colorLabelFilter_ = static_cast<ColorLabelFilter>(command - ID_LABEL_FILTER_ALL);
@@ -402,6 +406,287 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         RebuildVisiblePhotos();
         ScheduleVisibleWork();
         UpdateStatus();
+        InvalidateCanvas();
+    }
+
+    // ---- Camera-settings filters (options from indexed values in the folder) ----
+
+    void QuickSiftApplicationImpl::HydrateMetadataForFilters() {
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const PhotoItem& view = catalog_.PhotoAt(i);
+            const bool needCamera = !view.cameraSettingsKnown;
+            const bool needTime = view.captureTimeSource ==
+                quicksift::core::predicate::CaptureTimeSource::Unknown;
+            if (!needCamera && !needTime) continue;
+
+            int iso = view.iso;
+            double aperture = view.aperture;
+            double focal = view.focalLength;
+            double shutter = view.shutterSpeed;
+            std::wstring camera = view.camera;
+            std::wstring lens = view.lens;
+            bool cameraKnown = view.cameraSettingsKnown;
+            auto capture = view.captureTime;
+            auto captureSource = view.captureTimeSource;
+
+            if (needCamera) {
+                if (auto cached = persistentCache_.LookupCameraSettings(view.path)) {
+                    iso = cached->iso;
+                    aperture = cached->aperture;
+                    focal = cached->focalLength;
+                    shutter = cached->shutterSpeed;
+                    camera = std::move(cached->camera);
+                    lens = std::move(cached->lens);
+                    cameraKnown = true;
+                }
+            }
+            if (!cameraKnown || needTime) {
+                // Do not compete with Single View. Cache-only while a view decode
+                // is in flight; the next open fills the rest.
+                if (quicksift::core::priority::Demand().Snapshot().viewForeground > 0) continue;
+                HANDLE file = CreateFileW(view.path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                if (file != INVALID_HANDLE_VALUE) {
+                    std::vector<std::uint8_t> buffer(quicksift::core::exif::kCaptureTimeReadBytes);
+                    DWORD read = 0;
+                    if (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0) {
+                        buffer.resize(read);
+                        if (!cameraKnown) {
+                            const auto settings = quicksift::core::exif::FindCameraSettings(buffer);
+                            iso = settings.iso;
+                            aperture = settings.aperture;
+                            focal = settings.focalLength;
+                            shutter = settings.shutterSpeed;
+                            camera = settings.camera;
+                            lens = settings.lens;
+                            cameraKnown = settings.known;
+                            CachedImageRecord rec;
+                            rec.iso = settings.iso;
+                            rec.aperture = settings.aperture;
+                            rec.focalLength = settings.focalLength;
+                            rec.shutterSpeed = settings.shutterSpeed;
+                            rec.camera = settings.camera;
+                            rec.lens = settings.lens;
+                            rec.cameraSettingsKnown = settings.known;
+                            persistentCache_.UpdateCameraSettings(view.path, rec);
+                        }
+                        if (needTime) {
+                            if (auto found = quicksift::core::exif::FindCaptureTime(buffer)) {
+                                capture = found->time;
+                                captureSource = quicksift::core::predicate::CaptureTimeSource::Exif;
+                            }
+                        }
+                    }
+                    CloseHandle(file);
+                }
+            }
+            if (cameraKnown || captureSource != view.captureTimeSource) {
+                catalog_.EditPhoto(i, [&](PhotoItem& p) {
+                    p.iso = iso;
+                    p.aperture = aperture;
+                    p.focalLength = focal;
+                    p.shutterSpeed = shutter;
+                    p.camera = std::move(camera);
+                    p.lens = std::move(lens);
+                    p.cameraSettingsKnown = cameraKnown;
+                    p.captureTime = capture;
+                    p.captureTimeSource = captureSource;
+                });
+            }
+        }
+    }
+
+    void QuickSiftApplicationImpl::ShowIsoFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<int> values;
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.cameraSettingsKnown && p.iso > 0) values.insert(p.iso);
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, isoFilter_ < 0));
+        int id = 2;
+        for (int v : values) {
+            items.push_back(MakeMenuItem(L"ISO " + std::to_wstring(v), id, isoFilter_ == v));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_ISO_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) isoFilter_ = -1;
+        else {
+            auto it = values.begin();
+            std::advance(it, command - 2);
+            isoFilter_ = *it;
+        }
+        std::wstring isoLabel = isoFilter_ < 0 ? std::wstring(L"ISO: All")
+            : L"ISO: " + std::to_wstring(isoFilter_);
+        SetWindowTextW(controls_[ID_ISO_FILTER], isoLabel.c_str());
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ShowApertureFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<int> cents; // f-number * 100
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.cameraSettingsKnown && p.aperture > 0.0) cents.insert(static_cast<int>(p.aperture * 100.0 + 0.5));
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, apertureFilter_ <= 0.0));
+        int id = 2;
+        for (int c : cents) {
+            const int whole = c / 100;
+            const int frac = c % 100;
+            std::wstring text = L"f/" + std::to_wstring(whole) + L"." + std::to_wstring(frac / 10);
+            items.push_back(MakeMenuItem(text, id, std::abs(apertureFilter_ - c / 100.0) < 0.05));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_APERTURE_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) apertureFilter_ = 0.0;
+        else {
+            auto it = cents.begin();
+            std::advance(it, command - 2);
+            apertureFilter_ = *it / 100.0;
+        }
+        std::wstring label;
+        if (apertureFilter_ <= 0.0) label = L"Aperture: All";
+        else label = L"Aperture: f/" + std::to_wstring(static_cast<int>(apertureFilter_ * 10) / 10.0);
+        SetWindowTextW(controls_[ID_APERTURE_FILTER], label.c_str());
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ShowFocalFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<int> mms;
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.cameraSettingsKnown && p.focalLength > 0.0) mms.insert(static_cast<int>(p.focalLength + 0.5));
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, focalFilter_ <= 0.0));
+        int id = 2;
+        for (int mm : mms) {
+            items.push_back(MakeMenuItem(std::to_wstring(mm) + L"mm", id, std::abs(focalFilter_ - mm) < 0.5));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_FOCAL_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) focalFilter_ = 0.0;
+        else {
+            auto it = mms.begin();
+            std::advance(it, command - 2);
+            focalFilter_ = static_cast<double>(*it);
+        }
+        std::wstring focalLabel = focalFilter_ <= 0.0 ? std::wstring(L"Focal: All")
+            : L"Focal: " + std::to_wstring(static_cast<int>(focalFilter_)) + L"mm";
+        SetWindowTextW(controls_[ID_FOCAL_FILTER], focalLabel.c_str());
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ShowShutterFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<int> denoms; // reciprocal, e.g. 160 for 1/160
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.cameraSettingsKnown && p.shutterSpeed > 0.0 && p.shutterSpeed < 1.0) {
+                denoms.insert(static_cast<int>(std::lround(1.0 / p.shutterSpeed)));
+            } else if (p.cameraSettingsKnown && p.shutterSpeed >= 1.0) {
+                denoms.insert(-static_cast<int>(std::lround(p.shutterSpeed))); // negative = whole seconds
+            }
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, shutterFilter_ <= 0.0));
+        int id = 2;
+        for (int d : denoms) {
+            std::wstring label = d < 0 ? std::to_wstring(-d) + L"s" : L"1/" + std::to_wstring(d);
+            const double seconds = d < 0 ? static_cast<double>(-d) : 1.0 / d;
+            items.push_back(MakeMenuItem(label, id, std::abs(shutterFilter_ - seconds) < seconds * 0.02));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_SHUTTER_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) shutterFilter_ = 0.0;
+        else {
+            auto it = denoms.begin();
+            std::advance(it, command - 2);
+            shutterFilter_ = *it < 0 ? static_cast<double>(-*it) : 1.0 / *it;
+        }
+        std::wstring label = L"Shutter: All";
+        if (shutterFilter_ > 0.0) {
+            if (shutterFilter_ >= 1.0) label = L"Shutter: " + std::to_wstring(static_cast<int>(std::lround(shutterFilter_))) + L"s";
+            else label = L"Shutter: 1/" + std::to_wstring(static_cast<int>(std::lround(1.0 / shutterFilter_)));
+        }
+        SetWindowTextW(controls_[ID_SHUTTER_FILTER], label.c_str());
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ShowCameraFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<std::wstring> cams;
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.cameraSettingsKnown && !p.camera.empty()) cams.insert(p.camera);
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, cameraFilter_.empty()));
+        int id = 2;
+        for (const auto& c : cams) {
+            items.push_back(MakeMenuItem(c, id, cameraFilter_ == c));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_CAMERA_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) cameraFilter_.clear();
+        else {
+            auto it = cams.begin();
+            std::advance(it, command - 2);
+            cameraFilter_ = *it;
+        }
+        std::wstring camLabel = cameraFilter_.empty() ? std::wstring(L"Camera: All")
+            : L"Camera: " + cameraFilter_;
+        SetWindowTextW(controls_[ID_CAMERA_FILTER], camLabel.c_str());
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ShowHourFilterMenu() {
+        HydrateMetadataForFilters();
+        std::set<int> hours;
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            const auto& p = catalog_.PhotoAt(i);
+            if (p.captureTimeSource != quicksift::core::predicate::CaptureTimeSource::Unknown)
+                hours.insert(p.captureTime.hour);
+        }
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, hourFilter_ < 0));
+        int id = 2;
+        for (int h : hours) {
+            std::wstring text = (h < 10 ? L"0" : L"") + std::to_wstring(h) + L":00";
+            items.push_back(MakeMenuItem(text, id, hourFilter_ == h));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_HOUR_FILTER], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) hourFilter_ = -1;
+        else {
+            auto it = hours.begin();
+            std::advance(it, command - 2);
+            hourFilter_ = *it;
+        }
+        std::wstring label;
+        if (hourFilter_ < 0) label = L"Hour: All";
+        else {
+            std::wstring pad = hourFilter_ < 10 ? std::wstring(L"0") : std::wstring(L"");
+            label = L"Hour: " + pad + std::to_wstring(hourFilter_) + L":00";
+        }
+        SetWindowTextW(controls_[ID_HOUR_FILTER], label.c_str());
+        RebuildVisiblePhotos();
         InvalidateCanvas();
     }
 

@@ -1,6 +1,6 @@
-# QuickSift 0.9.3.0 RC
+# QuickSift 0.9.4.0 RC
 
-QuickSift is a native Windows photo-culling application built for fast, careful review of production media. Version **0.9.3.0 RC** is a release candidate: the feature set is substantially complete, but the native Windows binary still requires final build, signing, clean-machine, and destructive-operation validation before public release.
+QuickSift is a native Windows photo-culling application built for fast, careful review of production media. Version **0.9.4.0 RC** is a release candidate: the feature set is substantially complete, but the native Windows binary still requires final build, signing, clean-machine, and destructive-operation validation before public release.
 
 ## Current feature set
 

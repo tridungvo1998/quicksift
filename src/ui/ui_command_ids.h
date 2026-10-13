@@ -56,6 +56,17 @@ inline constexpr int ID_PICK_STATE_MENU = 1048;
 inline constexpr int ID_PICK_STATE_PICK = 1049;
 inline constexpr int ID_PICK_STATE_REJECT = 1050;
 inline constexpr int ID_PICK_STATE_UNMARK = 1051;
+// File tab: Import / Export Ratings (opens the in-canvas chooser).
+inline constexpr int ID_RATINGS_EXCHANGE = 1052;
+// File tab: Batch Processing (opens the framework form dialog).
+inline constexpr int ID_BATCH_PROCESSING = 1053;
+// Filter tab: camera-settings filters (dynamic options from indexed values).
+inline constexpr int ID_ISO_FILTER = 1054;
+inline constexpr int ID_APERTURE_FILTER = 1055;
+inline constexpr int ID_FOCAL_FILTER = 1056;
+inline constexpr int ID_SHUTTER_FILTER = 1057;
+inline constexpr int ID_CAMERA_FILTER = 1058;
+inline constexpr int ID_HOUR_FILTER = 1059;
 inline constexpr int ID_FMT_JPEG = 2001;
 inline constexpr int ID_FMT_PNG = 2002;
 inline constexpr int ID_FMT_HEIF = 2003;
@@ -156,6 +167,7 @@ inline constexpr int ID_SETTING_SECTION_RAW = 3022;
 inline constexpr int ID_SETTING_SECTION_METADATA = 3023;
 inline constexpr int ID_SETTING_SECTION_DIAGNOSTICS = 3024;
 inline constexpr int ID_SETTING_SECTION_LANGUAGE = 3025;
+inline constexpr int ID_THUMBNAIL_SEARCH = 3026;
 
 inline constexpr int ID_DOCUMENT_TEXT = 5001;
 inline constexpr int ID_DOCUMENT_EXPORT = 5002;
@@ -170,6 +182,8 @@ inline constexpr std::array kAllIds{
     ID_COPY,
     ID_MOVE,
     ID_DELETE,
+    ID_RATINGS_EXCHANGE,
+    ID_BATCH_PROCESSING,
     ID_FORMATS,
     ID_SORT,
     ID_THUMB_SIZE,
@@ -200,6 +214,12 @@ inline constexpr std::array kAllIds{
     ID_THEME_TOGGLE,
     ID_HELP,
     ID_LABEL_FILTER,
+    ID_ISO_FILTER,
+    ID_APERTURE_FILTER,
+    ID_FOCAL_FILTER,
+    ID_SHUTTER_FILTER,
+    ID_CAMERA_FILTER,
+    ID_HOUR_FILTER,
     ID_FULLSCREEN,
     ID_FILMSTRIP,
     ID_PICK_STATE_MENU, ID_PICK_STATE_PICK, ID_PICK_STATE_REJECT, ID_PICK_STATE_UNMARK,
@@ -283,6 +303,7 @@ inline constexpr std::array kAllIds{
     ID_EXIF_PANEL,
     ID_USER_COMMENT_EDIT,
     ID_SAVE_USER_COMMENT,
+    ID_THUMBNAIL_SEARCH,
     ID_SETTING_LANGUAGE_SELECTOR,
     ID_FLYOUT_BACKDROP,
     ID_FULLSCREEN_TITLE_OVERLAY,

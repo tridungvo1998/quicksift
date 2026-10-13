@@ -1,7 +1,11 @@
 // OWNER: Platform-neutral UI component state and interaction implementation.
 #include "ui/framework/ui_models.h"
+#include "ui/ui_design_tokens.h"
+
+#include <array>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 
@@ -97,31 +101,48 @@ void AlertPresenter::Show(AlertRequest request) {
     visible_ = true;
     primaryRect_ = {};
     secondaryRect_ = {};
+    tertiaryRect_ = {};
     primaryHot_ = false;
     secondaryHot_ = false;
+    tertiaryHot_ = false;
+    focused_ = AlertButton::Primary;
+    focusVisible_ = false;
 }
 
 void AlertPresenter::Clear() noexcept {
     request_ = {};
     primaryRect_ = {};
     secondaryRect_ = {};
+    tertiaryRect_ = {};
     visible_ = false;
     primaryHot_ = false;
     secondaryHot_ = false;
+    tertiaryHot_ = false;
+    focused_ = AlertButton::Primary;
+    focusVisible_ = false;
 }
 
-void AlertPresenter::SetButtonRects(FloatRect primary, FloatRect secondary) noexcept {
+bool AlertPresenter::HasTertiary() const noexcept {
+    return request_.mode == AlertMode::Confirmation && !request_.tertiaryText.empty();
+}
+
+void AlertPresenter::SetButtonRects(FloatRect primary, FloatRect secondary,
+    FloatRect tertiary) noexcept {
     primaryRect_ = primary;
     secondaryRect_ = request_.mode == AlertMode::Confirmation ? secondary : FloatRect{};
+    tertiaryRect_ = HasTertiary() ? tertiary : FloatRect{};
 }
 
 bool AlertPresenter::UpdateHover(float x, float y) noexcept {
     const bool primary = visible_ && primaryRect_.Contains(x, y);
     const bool secondary = visible_ && request_.mode == AlertMode::Confirmation &&
         secondaryRect_.Contains(x, y);
-    const bool changed = primary != primaryHot_ || secondary != secondaryHot_;
+    const bool tertiary = visible_ && HasTertiary() && tertiaryRect_.Contains(x, y);
+    const bool changed = primary != primaryHot_ || secondary != secondaryHot_ ||
+        tertiary != tertiaryHot_;
     primaryHot_ = primary;
     secondaryHot_ = secondary;
+    tertiaryHot_ = tertiary;
     return changed;
 }
 
@@ -131,6 +152,7 @@ AlertHit AlertPresenter::HitTest(float x, float y) const noexcept {
     if (request_.mode == AlertMode::Confirmation && secondaryRect_.Contains(x, y)) {
         return AlertHit::Secondary;
     }
+    if (HasTertiary() && tertiaryRect_.Contains(x, y)) return AlertHit::Tertiary;
     return AlertHit::ModalBackdrop;
 }
 
@@ -140,6 +162,30 @@ std::optional<std::uint64_t> AlertPresenter::Resolve(bool accepted) noexcept {
     const std::uint64_t token = request_.actionToken;
     Clear();
     return dispatch ? std::optional<std::uint64_t>(token) : std::nullopt;
+}
+
+std::optional<std::uint64_t> AlertPresenter::ActivateTertiary() noexcept {
+    if (!visible_ || !HasTertiary()) return std::nullopt;
+    const std::uint64_t token = request_.tertiaryActionToken;
+    if (!request_.tertiaryKeepsOpen) Clear();
+    return token != 0 ? std::optional<std::uint64_t>(token) : std::nullopt;
+}
+
+void AlertPresenter::MoveFocus(bool backwards) noexcept {
+    if (!visible_) return;
+    std::array<AlertButton, 3> order{};
+    std::size_t count = 0;
+    if (HasTertiary()) order[count++] = AlertButton::Tertiary;
+    if (request_.mode == AlertMode::Confirmation) order[count++] = AlertButton::Secondary;
+    order[count++] = AlertButton::Primary;
+    std::size_t current = count - 1;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (order[index] == focused_) current = index;
+    }
+    // The first Tab only reveals the ring on the default (primary) button.
+    if (focusVisible_) current = backwards ? (current + count - 1) % count : (current + 1) % count;
+    focused_ = order[current];
+    focusVisible_ = true;
 }
 
 ToastPresenter::ToastPresenter(std::chrono::milliseconds duration) noexcept
@@ -181,15 +227,23 @@ bool ToastPresenter::Tick(TimePoint now) {
     return visible_;
 }
 
+std::chrono::milliseconds ToastPresenter::Remaining(TimePoint now) const noexcept {
+    if (!visible_) return std::chrono::milliseconds(0);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startedAt_);
+    if (elapsed.count() < 0) return duration_;
+    return elapsed >= duration_ ? std::chrono::milliseconds(0) : duration_ - elapsed;
+}
+
 float ToastPresenter::Opacity(TimePoint now) const noexcept {
     if (!visible_) return 0.0f;
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startedAt_);
     if (elapsed.count() < 0 || elapsed >= duration_) return 0.0f;
-    constexpr auto fadeIn = std::chrono::milliseconds(140);
-    constexpr auto fadeOut = std::chrono::milliseconds(240);
+    if (!animationsEnabled_) return 1.0f;
+    constexpr auto fadeIn = std::chrono::milliseconds(tokens::kMotionFastMs);
+    constexpr auto fadeOut = std::chrono::milliseconds(tokens::kMotionSlowMs);
     if (elapsed < fadeIn) {
-        return std::clamp(static_cast<float>(elapsed.count()) /
-            static_cast<float>(fadeIn.count()), 0.0f, 1.0f);
+        return tokens::EaseOutCubic(static_cast<float>(elapsed.count()) /
+            static_cast<float>(fadeIn.count()));
     }
     const auto remaining = duration_ - elapsed;
     if (remaining < fadeOut) {
@@ -197,6 +251,67 @@ float ToastPresenter::Opacity(TimePoint now) const noexcept {
             static_cast<float>(fadeOut.count()), 0.0f, 1.0f);
     }
     return 1.0f;
+}
+
+// ---- Overlay text geometry ------------------------------------------------------------
+
+float ToastTextLayoutWidth(float surfaceWidth) noexcept {
+    const float body = std::min(surfaceWidth - 2.0f * kToastEdge, kToastMaxWidth);
+    if (body <= 40.0f) return 0.0f;
+    return body - 2.0f * kToastPaddingX;
+}
+
+ToastGeometry ComputeToastGeometry(float surfaceWidth, float surfaceHeight,
+    float textWidth, float textHeight) noexcept {
+    ToastGeometry geometry;
+    const float layoutWidth = ToastTextLayoutWidth(surfaceWidth);
+    if (layoutWidth <= 0.0f) return geometry;
+    const float maxBody = layoutWidth + 2.0f * kToastPaddingX;
+    const float measuredW = std::ceil(std::clamp(textWidth, 0.0f, layoutWidth));
+    const float measuredH = std::ceil(std::max(0.0f, textHeight));
+    geometry.layoutWidth = layoutWidth;
+    // +2 DIP: one device pixel of snapping slack on each side at any DPI <= 192.
+    geometry.width = std::clamp(measuredW + 2.0f * kToastPaddingX + 2.0f,
+        std::min(kToastMinWidth, maxBody), maxBody);
+    const float maxBodyHeight = std::max(kToastMinHeight, surfaceHeight - 2.0f * kToastEdge);
+    const float wanted = std::max(kToastMinHeight, measuredH + 2.0f * kToastPaddingY + 2.0f);
+    geometry.height = std::min(wanted, maxBodyHeight);
+    geometry.clipped = wanted > maxBodyHeight;
+    geometry.layoutHeight = std::max(0.0f, geometry.height - 2.0f * kToastPaddingY);
+    geometry.textTop = geometry.clipped ? kToastPaddingY
+        : std::max(kToastPaddingY, (geometry.height - measuredH) * 0.5f);
+    return geometry;
+}
+
+AlertCardGeometry ComputeAlertCardGeometry(float surfaceHeight, float titleHeight,
+    float messageHeight) noexcept {
+    AlertCardGeometry geometry;
+    const float title = std::ceil(std::max(0.0f, titleHeight));
+    const float message = std::ceil(std::max(0.0f, messageHeight));
+    const float maxCard = std::max(kAlertMinHeight, std::min(kAlertMaxHeight, surfaceHeight - 48.0f));
+    const float wanted = kAlertChromeHeight + title + message;
+    geometry.cardHeight = std::clamp(wanted, kAlertMinHeight, maxCard);
+    geometry.clipped = wanted > maxCard;
+    geometry.messageBoxHeight = std::max(0.0f, geometry.cardHeight - kAlertChromeHeight - title + 8.0f);
+    return geometry;
+}
+
+std::wstring NormalizeOverlayText(std::wstring_view text) {
+    std::wstring out;
+    out.reserve(text.size());
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        const wchar_t c = text[i];
+        if (c == L'\r') {
+            out.push_back(L'\n');
+            if (i + 1 < text.size() && text[i + 1] == L'\n') ++i;
+        } else if (c == L'\t') {
+            out.push_back(L' ');
+        } else {
+            out.push_back(c);
+        }
+    }
+    while (!out.empty() && (out.back() == L'\n' || out.back() == L' ')) out.pop_back();
+    return out;
 }
 
 } // namespace quicksift::ui::framework

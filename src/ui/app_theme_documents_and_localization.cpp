@@ -7,7 +7,9 @@ namespace quicksift::app {
 
     // All visual roles come from one design-system implementation.
     ThemePalette QuickSiftApplicationImpl::Palette() const noexcept {
-        return quicksift::ui::GetThemePalette(theme_);
+        // High contrast -> system colours; otherwise the built-in palette with the
+        // Windows accent applied (contrast-guarded). See docs/DESIGN_SYSTEM.md.
+        return quicksift::ui::ResolveThemePalette(theme_);
     }
 
 
@@ -45,15 +47,8 @@ namespace quicksift::app {
         } else {
             QS_LOG_WARNING(L"UI", L"Document theme could not allocate a replacement panel brush");
         }
-        BOOL dark = state->theme.dark ? TRUE : FALSE;
-        DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
-        DwmSetWindowAttribute(window, 35, &state->theme.windowTop, sizeof(state->theme.windowTop));
-        DwmSetWindowAttribute(window, 36, &state->theme.text, sizeof(state->theme.text));
-        DwmSetWindowAttribute(window, 34, &state->theme.border, sizeof(state->theme.border));
-        DWORD rounded = 2;
-        DWORD backdrop = 2;
-        DwmSetWindowAttribute(window, 33, &rounded, sizeof(rounded));
-        DwmSetWindowAttribute(window, 38, &backdrop, sizeof(backdrop));
+        quicksift::ui::framework::MacOsUiFramework::ApplyWindowChrome(window,
+            quicksift::ui::framework::WindowChromeKind::Document, state->theme);
         if (state->edit) {
             SetWindowTheme(state->edit, state->theme.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             SendMessageW(state->edit, EM_SETBKGNDCOLOR, 0, static_cast<LPARAM>(state->theme.panel));
@@ -74,9 +69,11 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::ShowDocumentWindow(const std::wstring& title, const std::wstring& body, DocumentKind kind) {
-        const int width = DipToPx(760);
-        const int height = DipToPx(680);
+    HWND QuickSiftApplicationImpl::ShowDocumentWindow(const std::wstring& title, const std::wstring& body, DocumentKind kind,
+        std::wstring_view titleKey) {
+        const bool missingFiles = kind == DocumentKind::MissingFiles;
+        const int width = DipToPx(missingFiles ? 640 : 760);
+        const int height = DipToPx(missingFiles ? 460 : 680);
         RECT owner{};
         if (!GetWindowRect(hwnd_, &owner)) {
             owner = { 0, 0, width, height };
@@ -89,28 +86,30 @@ namespace quicksift::app {
         const int x = static_cast<int>(centeredX);
         const int y = static_cast<int>(centeredY);
         HWND document = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT,
-            kDocumentClass, title.c_str(), WS_OVERLAPPED | WS_THICKFRAME,
+            kDocumentClass, title.c_str(), WS_OVERLAPPED | WS_THICKFRAME | WS_CLIPCHILDREN,
             x, y, width, height, hwnd_, nullptr, instance_, nullptr);
         if (!document) {
             quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Error,
                 L"UI", L"Creating a document window");
-            return;
+            return nullptr;
         }
         if (!SetPropW(document, kDocumentKindProperty,
             reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(kind)))) {
             quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Error,
                 L"UI", L"Attaching document-window type state");
             DestroyWindow(document);
-            return;
+            return nullptr;
         }
 
         auto* state = new (std::nothrow) DocumentWindowState();
         if (!state) {
             QS_LOG_ERROR(L"UI", L"Allocating document-window state failed");
             DestroyWindow(document);
-            return;
+            return nullptr;
         }
         state->framework = &uiFramework_;
+        state->titleKey.assign(titleKey);
+        state->Tr = [this](std::wstring_view english) { return Tr(english); };
         state->normalFont = uiFont_;
         state->semiboldFont = uiFontSemibold_;
         if (!SetWindowSubclass(document, DocumentWindowSubclassProc, kDocumentWindowSubclassId,
@@ -119,7 +118,7 @@ namespace quicksift::app {
                 L"UI", L"Attaching document-window behavior");
             delete state;
             DestroyWindow(document);
-            return;
+            return nullptr;
         }
 
         state->richEdit = EnsureRichEditLoaded();
@@ -162,13 +161,13 @@ namespace quicksift::app {
             (state->diagnosticLog && (!state->refresh || !state->exportButton || !state->verboseLogging))) {
             QS_LOG_ERROR(L"UI", L"One or more required document-window controls could not be created");
             DestroyWindow(document); // The subclass owns and releases state.
-            return;
+            return nullptr;
         }
         if (!SetPropW(document, kDocumentStateProperty, state)) {
             quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Error,
                 L"UI", L"Publishing document-window state");
             DestroyWindow(document); // The subclass owns and releases state.
-            return;
+            return nullptr;
         }
 
         ApplyDocumentTheme(document, state);
@@ -180,13 +179,15 @@ namespace quicksift::app {
             if (state->verboseLogging) SendMessageW(state->verboseLogging, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
             SendMessageW(state->close, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
         }
-        SetDocumentControlText(state->edit, body, kind == DocumentKind::Help, state->richEdit, state->theme);
+        if (missingFiles) SetDocumentPlainText(state->edit, body, state->richEdit, state->theme);
+        else SetDocumentControlText(state->edit, body, kind == DocumentKind::Help, state->richEdit, state->theme);
         RECT client{};
         if (GetClientRect(document, &client)) {
             SendMessageW(document, WM_SIZE, 0, MAKELPARAM(client.right, client.bottom));
         }
         ShowWindow(document, SW_SHOWNORMAL);
         UpdateWindow(document);
+        return document;
     }
 
 
@@ -207,7 +208,7 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::RefreshOpenDocumentWindows() {
-        struct RefreshContext { QuickSiftApplicationImpl* app; } context{ this };
+        struct RefreshContext { QuickSiftApplicationImpl* app; } refreshContext{ this };
         EnumThreadWindows(GetCurrentThreadId(), [](HWND window, LPARAM parameter) noexcept -> BOOL {
             try {
                 auto* context = reinterpret_cast<RefreshContext*>(parameter);
@@ -219,6 +220,27 @@ namespace quicksift::app {
                 const auto kind = static_cast<DocumentKind>(kindValue);
                 const bool help = kind == DocumentKind::Help;
                 const bool diagnosticLog = kind == DocumentKind::DiagnosticLog;
+                if (kind == DocumentKind::MissingFiles) {
+                    // Verbatim list: keep the text, re-apply title/theme/caption only.
+                    auto* missingState = reinterpret_cast<DocumentWindowState*>(
+                        GetPropW(window, kDocumentStateProperty));
+                    SetWindowTextW(window, context->app->Tr(missingState && !missingState->titleKey.empty() ?
+                        std::wstring_view(missingState->titleKey) : std::wstring_view(L"Missing files")).c_str());
+                    if (missingState) context->app->ApplyDocumentTheme(window, missingState);
+                    if (HWND edit = GetDlgItem(window, ID_DOCUMENT_TEXT)) {
+                        const int length = GetWindowTextLengthW(edit);
+                        std::wstring text(static_cast<std::size_t>(std::max(0, length)) + 1, L'\0');
+                        const int copied = GetWindowTextW(edit, text.data(), length + 1);
+                        text.resize(static_cast<std::size_t>(std::max(0, copied)));
+                        wchar_t className[32]{};
+                        GetClassNameW(edit, className, static_cast<int>(std::size(className)));
+                        SetDocumentPlainText(edit, text, lstrcmpiW(className, MSFTEDIT_CLASS) == 0,
+                            missingState ? missingState->theme : context->app->CurrentDocumentTheme());
+                    }
+                    if (HWND close = GetDlgItem(window, IDOK))
+                        SetWindowTextW(close, context->app->Tr(L"Close").c_str());
+                    return TRUE;
+                }
                 const std::wstring title = help ? context->app->Tr(L"QuickSift Help") :
                     (diagnosticLog ? context->app->Tr(L"QuickSift Diagnostic Log") :
                         context->app->Tr(L"About QuickSift"));
@@ -250,7 +272,7 @@ namespace quicksift::app {
                     L"Stopped refreshing document windows after an unexpected exception");
                 return FALSE;
             }
-        }, reinterpret_cast<LPARAM>(&context));
+        }, reinterpret_cast<LPARAM>(&refreshContext));
     }
 
 
@@ -260,7 +282,35 @@ namespace quicksift::app {
 
 
     std::wstring QuickSiftApplicationImpl::FaceWarningTooltipText() const {
-        return Tr(L"Red border: the largest detected face appears quite blurry or out of focus. Medium sensitivity flags only clear focus misses; treat this as a warning, not a definitive focus test.");
+        return Tr(L"Red border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.");
+    }
+
+
+    std::wstring QuickSiftApplicationImpl::FaceWarningReasonText(const PhotoItem& photo) const {
+        if (!HasFaceFocusWarning(photo) || photo.faceQualities.size() != photo.faces.size()) return {};
+        std::vector<std::pair<std::size_t, std::wstring>> parts;
+        for (std::size_t index = 0; index < photo.faceQualities.size(); ++index) {
+            const auto& quality = photo.faceQualities[index];
+            if (!quicksift::core::FaceQualityFlagged(quality)) continue;
+            std::wstring causes;
+            const auto addCause = [&](const wchar_t* cause) {
+                if (!causes.empty()) causes += L", ";
+                causes += Tr(cause);
+            };
+            if ((quality.flags & quicksift::FaceQualityFlag::Blurry) != 0) addCause(L"out of focus");
+            if ((quality.flags & quicksift::FaceQualityFlag::MotionBlur) != 0) addCause(L"motion blur");
+            if ((quality.flags & quicksift::FaceQualityFlag::EyesClosed) != 0) addCause(L"eyes closed");
+            const std::size_t number = quicksift::core::SpatialFaceNumber(photo.faces, index);
+            parts.emplace_back(number, Tr(L"Face") + L" " + std::to_wstring(number) + L": " + causes);
+        }
+        std::sort(parts.begin(), parts.end(),
+            [](const auto& left, const auto& right) { return left.first < right.first; });
+        std::wstring text;
+        for (const auto& part : parts) {
+            if (!text.empty()) text += L"; ";
+            text += part.second;
+        }
+        return text;
     }
 
 
@@ -330,7 +380,12 @@ namespace quicksift::app {
             static_cast<LONG>(std::ceil(hoveredRect.right * scale)),
             static_cast<LONG>(std::ceil(hoveredRect.bottom * scale))
         };
-        if (EqualRect(&next, &faceWarningTooltipRect_)) return;
+        // Per-photo reason ("Face 2: eyes closed; ...") under the general explanation.
+        const std::wstring reason = FaceWarningReasonText(VisiblePhoto(*hovered));
+        std::wstring nextText = FaceWarningTooltipText();
+        if (!reason.empty()) nextText += L"\n\n" + reason;
+        const bool textChanged = nextText != faceWarningTooltipText_;
+        if (EqualRect(&next, &faceWarningTooltipRect_) && !textChanged) return;
         faceWarningTooltipRect_ = next;
         TOOLINFOW tool{ sizeof(TOOLINFOW) };
         tool.hwnd = canvas_;
@@ -338,6 +393,12 @@ namespace quicksift::app {
         tool.rect = faceWarningTooltipRect_;
         SendMessageW(faceWarningTooltip_, TTM_NEWTOOLRECTW, 0,
             reinterpret_cast<LPARAM>(&tool));
+        if (textChanged) {
+            faceWarningTooltipText_ = std::move(nextText);
+            tool.lpszText = faceWarningTooltipText_.data();
+            SendMessageW(faceWarningTooltip_, TTM_UPDATETIPTEXTW, 0,
+                reinterpret_cast<LPARAM>(&tool));
+        }
     }
 
 
@@ -348,6 +409,11 @@ namespace quicksift::app {
             if (found != controls_.end()) SetWindowTextW(found->second, Tr(key).c_str());
         }
         if (filterLabel_) SetWindowTextW(filterLabel_, Tr(L"Filter by:").c_str());
+        if (searchInput_) {
+            uiFramework_.SetTextInputPlaceholder(searchInput_,
+                Tr(L"Search names, 8AM, date:12, 5 stars, red, picked\u2026"));
+            InvalidateCanvas(); // count text ("of" / "/") and grouping separator
+        }
         if (exif_ && ActiveInfoPath().empty())
             SetWindowTextW(exif_, Tr(L"Select a photo to inspect its EXIF information.").c_str());
         if (status_ && currentFolder_.empty())
@@ -413,15 +479,16 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::ApplyTheme() {
         const ThemePalette palette = Palette();
-        BOOL dark = theme_ == AppTheme::Dark ? TRUE : FALSE;
-        DwmSetWindowAttribute(hwnd_, 20, &dark, sizeof(dark));
-        // Do not let Windows 11 add its own colored frame around the custom
-        // chrome. 0xFFFFFFFE is DWMWA_COLOR_NONE on supported systems and is
-        // safely ignored by older Windows versions.
-        const COLORREF noSystemBorder = static_cast<COLORREF>(0xFFFFFFFEu);
-        DwmSetWindowAttribute(hwnd_, 34, &noSystemBorder, sizeof(noSystemBorder));
+        // Central DWM chrome: dark title, no coloured system frame around the custom
+        // chrome (DWMWA_COLOR_NONE; system colours in high contrast), rounded corners
+        // (square while fullscreen) and no system backdrop behind the opaque canvas.
+        quicksift::ui::framework::MacOsUiFramework::ApplyWindowChrome(hwnd_,
+            fullscreen_ ? quicksift::ui::framework::WindowChromeKind::Fullscreen
+                        : quicksift::ui::framework::WindowChromeKind::Main, palette);
 
+        uiFramework_.Toasts().SetAnimationsEnabled(quicksift::ui::CurrentVisualEffects().Animate());
         if (userCommentEdit_) uiFramework_.SetD2DTextInputPalette(userCommentEdit_, palette, currentDpi_);
+        UpdateSearchFieldTheme();
         // Theme changes are presentation-only. Do NOT discard the decoded bitmap/WIC
         // caches here: doing so turns a light/dark toggle into a full thumbnail reload.
         // Recreate only the theme-dependent brushes/background and repaint the existing
@@ -438,27 +505,30 @@ namespace quicksift::app {
         backgroundPixels_.clear();
         backgroundCacheWidth_ = 0;
         backgroundCacheHeight_ = 0;
+        badgeTextWidthCache_.clear();
         InvalidateRect(hwnd_, nullptr, TRUE);
         UpdateWindow(hwnd_);
-        if (titleOverlay_ && IsWindowVisible(titleOverlay_)) {
-            RedrawWindow(titleOverlay_, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
-        }
+        // Invalidate everything first, then flush ONCE. Per-control RDW_UPDATENOW
+        // painted each control synchronously in turn (a visible top-to-bottom
+        // "wave" on every theme switch) and repainted the tabs twice.
+        const auto invalidate = [](HWND window) {
+            if (window && IsWindowVisible(window))
+                RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
+        };
+        invalidate(titleOverlay_);
         InvalidateCanvas();
         for (const auto& [id, control] : controls_) {
             (void)id;
-            if (IsWindowVisible(control)) RedrawWindow(control, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+            invalidate(control);
         }
-        if (exif_ && IsWindowVisible(exif_)) RedrawWindow(exif_, nullptr, nullptr,
-            RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
-        if (status_) RedrawWindow(status_, nullptr, nullptr,
-            RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
+        invalidate(exif_);
+        invalidate(status_);
+        for (HWND tab : flyoutTabs_) invalidate(tab);
+        // The left pane keeps its own ordered compose (backdrop, then content).
         RedrawActiveFlyoutContents();
-        for (HWND tab : flyoutTabs_) {
-            if (tab) RedrawWindow(tab, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_NOERASE | RDW_UPDATENOW);
-        }
+        // Single synchronous flush of whatever is still invalid (no RDW_INVALIDATE:
+        // nothing is newly dirtied here, already-painted pane windows are skipped).
+        RedrawWindow(hwnd_, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
         RefreshOpenDocumentWindows();
     }
 

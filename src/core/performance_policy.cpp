@@ -3,10 +3,12 @@
 
 #include "core/performance_policy.h"
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 #include <algorithm>
 
 namespace quicksift::core {
@@ -36,11 +38,13 @@ PerformancePolicy FixedPerformancePolicy::Update(const PerformanceInputs& inputs
     // Stable governor: half of physical RAM is the nominal decoded-image budget.
     // Only collapse it when the machine is genuinely close to running out of RAM.
     std::uint64_t targetMemory = baseline_.totalPhysicalBytes / 2;
+#if defined(_WIN32)
     MEMORYSTATUSEX memory{ sizeof(memory) };
     if (GlobalMemoryStatusEx(&memory) && memory.ullAvailPhys < 1024ull * 1024ull * 1024ull) {
         targetMemory = std::min(targetMemory,
             static_cast<std::uint64_t>(static_cast<long double>(memory.ullAvailPhys) * 0.70L));
     }
+#endif
     const std::uint64_t minMemory = 256ull * 1024ull * 1024ull;
     const std::uint64_t maxMemory = baseline_.totalPhysicalBytes * 9 / 10;
     targetMemory = std::clamp(targetMemory, minMemory, maxMemory);
@@ -96,8 +100,11 @@ PerformancePolicy FixedPerformancePolicy::BuildPolicy(const PerformanceInputs& i
     policy.prefetchDecodeTarget = 4096;
     policy.thumbnailPredictionHorizonSeconds = 1.20f;
 
-    policy.uiCompletionItemBudget = 256;
-    policy.uiCompletionTimeBudget = std::chrono::milliseconds(12);
+    // 0.9.4.0: a completion slice must leave the rest of a 60 Hz frame for input and
+    // paint. 12 ms / 256 items per slice (re-posted ahead of WM_PAINT) was the main
+    // source of thumbnail-load stutter; the UI drain also hard-caps at 4 ms / 48.
+    policy.uiCompletionItemBudget = 48;
+    policy.uiCompletionTimeBudget = std::chrono::milliseconds(4);
     return policy;
 }
 

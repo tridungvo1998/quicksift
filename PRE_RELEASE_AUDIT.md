@@ -2,7 +2,7 @@
 
 ## RC1 source-readiness update — 2026-08-07
 
-The 0.9.3.0 RC source baseline now has runtime package-aware persistence. Portable/unpackaged execution uses executable-adjacent `QuickSiftData`; MSIX execution uses the package family `LocalState`. Session, cache, logs, and crash reports are all children of that single active root. Packaged execution has no writable-executable fallback. Pre-rename product migration/XMP compatibility and older SQLite schema migration have been removed at the public-release boundary.
+The 0.9.4.0 RC source baseline now has runtime package-aware persistence. Portable/unpackaged execution uses executable-adjacent `QuickSiftData`; MSIX execution uses the package family `LocalState`. Session, cache, logs, and crash reports are all children of that single active root. Packaged execution has no writable-executable fallback. Pre-rename product migration/XMP compatibility and older SQLite schema migration have been removed at the public-release boundary.
 
 Source-side RC gates completed in this environment: strict warnings-as-errors portable build and source verification. The RC is **not yet a releasable Windows binary** until the unchecked native gates in `PRE_RELEASE_CHECKLIST.md` are completed, especially MSVC `build-release.cmd -RequireSignature`, Windows diagnostics/data migration tests, clean-machine Win10/Win11 checks, PE mitigation/signature verification, Defender/reputation checks, and destructive-operation testing on expendable media.
 

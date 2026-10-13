@@ -15,6 +15,7 @@
 #endif
 
 #include "embedded_metadata.h"
+#include "core/metadata_vocabulary.h"
 #include "metadata/metadata_value_parser.h"
 #include "platform/locked_file_publication_windows.h"
 
@@ -164,8 +165,10 @@ void RegisterQuickSiftNamespace() {
 }
 
 const char* LabelName(int label) {
-    static constexpr const char* names[] = { "", "Red", "Yellow", "Green", "Blue", "Purple" };
-    return names[std::clamp(label, 0, 5)];
+    // xmp:Label text from the canonical vocabulary ("" for no label). The export tokens
+    // are string literals, so data() is NUL-terminated.
+    const int value = std::clamp(label, 0, quicksift::core::vocabulary::kMaxColor);
+    return value == 0 ? "" : quicksift::core::vocabulary::ColorExportToken(value).data();
 }
 
 quicksift::core::MetadataFieldValue ReadIntegerField(const Exiv2::XmpData& data,
@@ -536,6 +539,7 @@ EmbeddedMetadataWriteResult Failure(EmbeddedMetadataFailure failure, std::wstrin
     std::uint64_t required = 0, std::uint64_t available = 0) {
     EmbeddedMetadataWriteResult result;
     result.failure = failure;
+    result.win32Error = 0;
     result.requiredBytes = required;
     result.availableBytes = available;
     result.detail = std::move(detail);
@@ -553,6 +557,16 @@ std::optional<EmbeddedMetadataValues> ReadEmbeddedMetadata(const fs::path& image
     }
 }
 
+// A pre-publication failure that may be transient (another handle on the file).
+EmbeddedMetadataWriteResult RetryableFailure(EmbeddedMetadataFailure failure,
+    std::wstring detail, DWORD win32Error) {
+    EmbeddedMetadataWriteResult result = Failure(failure, std::move(detail));
+    result.win32Error = static_cast<std::uint32_t>(win32Error);
+    return result;
+}
+
+constexpr DWORD kReadOnlyAttributeError = 6009; // ERROR_FILE_READ_ONLY
+
 EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
     const quicksift::core::MetadataPatch& patch) noexcept {
     if (patch.Empty() || !MetadataPatchValuesValid(patch)) {
@@ -568,16 +582,20 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
         ScopedWin32Handle sourceGuard(CreateFileW(image.c_str(),
             GENERIC_READ | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_DELETE,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const DWORD sourceOpenError = sourceGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
         FileIdentity originalIdentity{};
         if (!FingerprintHandle(sourceGuard.get(), originalIdentity)) {
-            return Failure(EmbeddedMetadataFailure::UnsafePath,
-                L"The image is missing, inaccessible, symbolic, or not a normal file.");
+            // A writer holding the file (editor, sync client) refuses our
+            // deny-write open with a sharing violation: retryable.
+            return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
+                L"The image is missing, inaccessible, symbolic, or not a normal file.", sourceOpenError);
         }
         const DWORD originalAttributes = GetFileAttributesW(image.c_str());
         if (originalAttributes == INVALID_FILE_ATTRIBUTES ||
             (originalAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
-            return Failure(EmbeddedMetadataFailure::UnsafePath,
-                L"The image is read-only or its file attributes could not be verified.");
+            return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
+                L"The image is read-only or its file attributes could not be verified.",
+                originalAttributes == INVALID_FILE_ATTRIBUTES ? 0 : kReadOnlyAttributeError);
         }
         const std::uint64_t required = SaturatingAdd64(
             static_cast<std::uint64_t>(originalIdentity.size), kMetadataGrowthAllowance);
@@ -667,17 +685,30 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
         ScopedWin32Handle temporaryPublicationGuard(CreateFileW(temporary.c_str(),
             GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const DWORD temporaryOpenError =
+            temporaryPublicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
         FileIdentity temporaryIdentity{};
         if (!FingerprintHandle(temporaryPublicationGuard.get(), temporaryIdentity)) {
-            return Failure(EmbeddedMetadataFailure::WriteFailed,
-                L"The verified temporary image could not be locked for publication.");
+            // Usually an antivirus / indexer scanning the fresh temporary copy.
+            return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+                L"The verified temporary image could not be locked for publication.", temporaryOpenError);
         }
 
         sourceGuard.reset();
         ScopedWin32Handle publicationGuard(CreateFileW(image.c_str(),
             GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        const DWORD publicationOpenError =
+            publicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
         FileIdentity currentIdentity{};
+        if (publicationGuard.get() == INVALID_HANDLE_VALUE) {
+            // Not an identity change: another handle (viewer without
+            // FILE_SHARE_DELETE, sync client, scanner) refused DELETE access.
+            // Nothing has been touched; the write lane retries with backoff.
+            return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+                L"Another app is using the image, so it could not be locked for publication.",
+                publicationOpenError);
+        }
         if (!FingerprintHandle(publicationGuard.get(), currentIdentity) ||
             !SameIdentity(currentIdentity, originalIdentity)) {
             return Failure(EmbeddedMetadataFailure::SourceChanged,
@@ -701,13 +732,18 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
         }
 
         if (!moveOriginalToBackup.Apply(publicationGuard.get())) {
-            return Failure(EmbeddedMetadataFailure::WriteFailed,
-                L"Windows could not move the locked original to a private recovery path.");
+            return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+                L"Windows could not move the locked original to a private recovery path.",
+                GetLastError());
         }
         if (!publishTemporary.Apply(temporaryPublicationGuard.get())) {
+            const DWORD publishError = GetLastError();
             const bool restored = restoreOriginal.Apply(publicationGuard.get());
-            return Failure(EmbeddedMetadataFailure::WriteFailed, restored ?
-                std::wstring(L"Windows could not publish the verified metadata copy; the original was restored.") :
+            // Retry only when the original is back in place (no corruption risk).
+            return restored ? RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+                L"Windows could not publish the verified metadata copy; the original was restored.",
+                publishError) :
+                Failure(EmbeddedMetadataFailure::WriteFailed,
                 std::wstring(L"Windows could not publish the verified metadata copy or restore its pathname. The unchanged original remains at: ") + backup.wstring());
         }
         cleanup.release();
@@ -784,8 +820,9 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataInPlace(const fs::path& image,
         const DWORD originalAttributes = GetFileAttributesW(image.wstring().c_str());
         if (originalAttributes == INVALID_FILE_ATTRIBUTES ||
             (originalAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
-            return Failure(EmbeddedMetadataFailure::UnsafePath,
-                L"The image is read-only or its file attributes could not be verified.");
+            return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
+                L"The image is read-only or its file attributes could not be verified.",
+                originalAttributes == INVALID_FILE_ATTRIBUTES ? 0 : kReadOnlyAttributeError);
         }
         const auto originalSignature = ReadContainerSignature(image);
         const auto originalEssence = PixelEssenceHash(image);

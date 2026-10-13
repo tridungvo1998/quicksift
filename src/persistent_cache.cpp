@@ -3,8 +3,12 @@
 
 #include "persistent_cache.h"
 #include "core/image_formats.h"
+#include "core/face_quality_policy.h"
 #include "platform/application_data_paths.h"
 #include "diagnostics/diagnostic_log.h"
+#include "diagnostics/log_categories.h"
+#include "core/log_rate_limiter.h"
+#include "core/lock_order.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -46,7 +50,11 @@ namespace {
 
 constexpr std::array<char, 8> kBitmapMagic{ 'Q', 'P', 'S', 'B', 'G', 'R', 'A', '7' };
 constexpr std::uint32_t kBitmapVersion = 7;
-constexpr int kDatabaseSchemaVersion = 1;
+// v1: 0.9.x baseline. v2 (0.9.4.0): face_quality BLOB (FaceQualityRecord[] parallel
+// to faces), face_quality_version, face_selection BLOB (one NormalizedFaceRect).
+// v1 databases are migrated in place (MigrateSchema); older/unknown versions are
+// rebuilt because the cache is disposable.
+constexpr int kDatabaseSchemaVersion = 3;
 constexpr std::uint64_t kMebibyte = 1024ull * 1024ull;
 constexpr std::uint64_t kGibibyte = 1024ull * 1024ull * 1024ull;
 constexpr std::uint64_t kMaximumBitmapBytes = 1024ull * 1024ull * 1024ull;
@@ -59,6 +67,13 @@ constexpr std::int64_t kRecordMaximumAgeSeconds = 180ll * 24ll * 60ll * 60ll;
 constexpr std::size_t kMaintenanceDeleteBatch = 4096;
 constexpr std::uint32_t kMaximumExifCharacters = 65'536;
 constexpr std::uint32_t kMaximumFacesPerRecord = 512;
+
+bool IsValidFaceQualityRecord(const FaceQualityRecord& quality) noexcept {
+    return std::isfinite(quality.sharpness) && quality.sharpness >= 0.0f &&
+        std::isfinite(quality.motionAnisotropy) && quality.motionAnisotropy >= 0.0f &&
+        quality.motionAnisotropy <= 1.0f && std::isfinite(quality.eyeOpenness) &&
+        quality.eyeOpenness >= 0.0f && (quality.flags & ~FaceQualityFlag::KnownMask) == 0;
+}
 
 bool IsValidNormalizedFaceRect(const NormalizedFaceRect& face) noexcept {
     const bool finite = std::isfinite(face.x) && std::isfinite(face.y) &&
@@ -319,8 +334,11 @@ int OpenSqlitePath(const fs::path& path, sqlite3** database) {
 constexpr char kUpsertRecordSql[] =
     "INSERT INTO image_records(path,file_size,modified_stamp,sidecar_stamp,rating,color_label,pick_state,"
     "source_width,source_height,exif_text,faces,faces_scanned,face_blur_scanned,face_blurry,face_sharpness,last_access,"
-    "rating_knowledge,color_label_knowledge,pick_state_knowledge,raw_rating,raw_color_label,raw_pick_state)"
-    " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"
+    "rating_knowledge,color_label_knowledge,pick_state_knowledge,raw_rating,raw_color_label,raw_pick_state,"
+    "face_quality,face_quality_version,face_selection,"
+    "iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known)"
+    " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,"
+    "?27,?28,?29,?30,?31,?32,?33)"
     " ON CONFLICT(path) DO UPDATE SET file_size=excluded.file_size,modified_stamp=excluded.modified_stamp,"
     "sidecar_stamp=excluded.sidecar_stamp,rating=excluded.rating,color_label=excluded.color_label,"
     "pick_state=excluded.pick_state,rating_knowledge=excluded.rating_knowledge,"
@@ -345,6 +363,18 @@ constexpr char kUpsertRecordSql[] =
     "face_sharpness=CASE WHEN image_records.file_size=excluded.file_size AND "
     "image_records.modified_stamp=excluded.modified_stamp AND image_records.sidecar_stamp=excluded.sidecar_stamp "
     "AND excluded.faces_scanned=0 THEN image_records.face_sharpness ELSE excluded.face_sharpness END,"
+    "face_quality=CASE WHEN image_records.file_size=excluded.file_size AND "
+    "image_records.modified_stamp=excluded.modified_stamp AND image_records.sidecar_stamp=excluded.sidecar_stamp "
+    "AND excluded.faces_scanned=0 THEN image_records.face_quality ELSE excluded.face_quality END,"
+    "face_quality_version=CASE WHEN image_records.file_size=excluded.file_size AND "
+    "image_records.modified_stamp=excluded.modified_stamp AND image_records.sidecar_stamp=excluded.sidecar_stamp "
+    "AND excluded.faces_scanned=0 THEN image_records.face_quality_version ELSE excluded.face_quality_version END,"
+    "face_selection=CASE WHEN image_records.file_size=excluded.file_size AND "
+    "image_records.modified_stamp=excluded.modified_stamp AND image_records.sidecar_stamp=excluded.sidecar_stamp "
+    "AND ?26=0 THEN image_records.face_selection ELSE excluded.face_selection END,"
+    "iso=excluded.iso, aperture=excluded.aperture, focal_length=excluded.focal_length, "
+    "shutter_speed=excluded.shutter_speed, camera=excluded.camera, lens=excluded.lens, "
+    "camera_settings_known=excluded.camera_settings_known,"
     "last_access=excluded.last_access;";
 
 void BindRecord(sqlite3_stmt* statement, const std::wstring& key, const CachedImageRecord& record) {
@@ -372,6 +402,24 @@ void BindRecord(sqlite3_stmt* statement, const std::wstring& key, const CachedIm
     BindText16(statement, 20, record.rawRating);
     BindText16(statement, 21, record.rawColorLabel);
     BindText16(statement, 22, record.rawPickState);
+    if (record.faceQualities.empty()) sqlite3_bind_null(statement, 23);
+    else sqlite3_bind_blob(statement, 23, record.faceQualities.data(),
+        static_cast<int>(record.faceQualities.size() * sizeof(FaceQualityRecord)), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 24, static_cast<sqlite3_int64>(record.faceQualityVersion));
+    if (record.faceSelectionKnown && record.hasFaceSelection) {
+        sqlite3_bind_blob(statement, 25, &record.faceSelection,
+            static_cast<int>(sizeof(NormalizedFaceRect)), SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(statement, 25);
+    }
+    sqlite3_bind_int(statement, 26, record.faceSelectionKnown ? 1 : 0);
+    sqlite3_bind_int(statement, 27, record.iso);
+    sqlite3_bind_double(statement, 28, record.aperture);
+    sqlite3_bind_double(statement, 29, record.focalLength);
+    sqlite3_bind_double(statement, 30, record.shutterSpeed);
+    BindText16(statement, 31, record.camera);
+    BindText16(statement, 32, record.lens);
+    sqlite3_bind_int(statement, 33, record.cameraSettingsKnown ? 1 : 0);
 }
 
 } // namespace
@@ -535,10 +583,18 @@ bool PersistentCache::OpenDatabase() {
         sqlite3_busy_timeout(database_, 2500);
 
         if (requireCurrentSchema) {
-            SqlStatement versionQuery;
-            if (!Prepare(database_, "PRAGMA user_version;", versionQuery) ||
-                sqlite3_step(versionQuery.value) != SQLITE_ROW ||
-                sqlite3_column_int(versionQuery.value, 0) != kDatabaseSchemaVersion) {
+            int storedVersion = -1;
+            {
+                SqlStatement versionQuery;
+                if (Prepare(database_, "PRAGMA user_version;", versionQuery) &&
+                    sqlite3_step(versionQuery.value) == SQLITE_ROW) {
+                    storedVersion = sqlite3_column_int(versionQuery.value, 0);
+                }
+            }
+            const bool current = storedVersion == kDatabaseSchemaVersion;
+            const bool migrated = !current && storedVersion >= 1 &&
+                storedVersion < kDatabaseSchemaVersion && MigrateSchema(storedVersion);
+            if (!current && !migrated) {
                 sqlite3_close_v2(database_);
                 database_ = nullptr;
                 return { false, SQLITE_SCHEMA };
@@ -556,17 +612,29 @@ bool PersistentCache::OpenDatabase() {
     const bool databaseExisted = fs::is_regular_file(databasePath_, ec) && !ec;
     auto [opened, error] = openOnce(databaseExisted);
     if (opened) return true;
-    if (error != SQLITE_SCHEMA && error != SQLITE_CORRUPT && error != SQLITE_NOTADB) return false;
+    if (error != SQLITE_SCHEMA && error != SQLITE_CORRUPT && error != SQLITE_NOTADB) {
+        // SQLITE_BUSY/LOCKED here means another process kept the database locked past
+        // the 2.5 s busy timeout; QuickSift continues without the disk cache.
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kDbMigration,
+            L"cache_open_failed",
+            { L"error_code", (error == SQLITE_BUSY || error == SQLITE_LOCKED) ? L"cache.db.busy" : L"cache.db.open_failed" },
+            { L"sqlite", std::to_wstring(error) });
+        return false;
+    }
+    QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kDbMigration,
+        L"cache_rebuild", { L"error_code", L"cache.db.migration_failed" }, { L"sqlite", std::to_wstring(error) });
 
-    // The cache database is disposable. Older/unversioned schemas are deliberately
-    // unsupported at the public-release boundary: rebuild rather than carrying
-    // migration code forward indefinitely. Corrupt databases use the same path.
+    // The cache database is disposable. The only in-place upgrade is the explicit,
+    // versioned v1 -> v2 step (MigrateSchema, run inside openOnce); unversioned,
+    // unknown, newer, or failed-to-migrate schemas are rebuilt rather than carrying
+    // open-ended compatibility code. Corrupt databases use the same path.
     removeDatabaseFiles();
     return openOnce(false).first;
 }
 
 void PersistentCache::CloseDatabase() {
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked(); // queued UI writes (comments, library) are not lost
     if (!database_) return;
     // Never checkpoint as part of generic handle closure. Explicit Flush() remains
     // available for user-requested cache synchronization; shutdown needs fast handle
@@ -577,6 +645,59 @@ void PersistentCache::CloseDatabase() {
 
 void PersistentCache::CloseForShutdown() noexcept {
     try { CloseDatabase(); } catch (...) {}
+}
+
+bool PersistentCache::MigrateSchema(int fromVersion) {
+    if (!database_ || fromVersion < 1 || fromVersion >= kDatabaseSchemaVersion) return false;
+    // Collect existing columns so a partially applied migration is completed rather than failing.
+    std::vector<std::string> columns;
+    {
+        SqlStatement info;
+        if (!Prepare(database_, "PRAGMA table_info(image_records);", info)) return false;
+        while (sqlite3_step(info.value) == SQLITE_ROW) {
+            const auto* name = reinterpret_cast<const char*>(sqlite3_column_text(info.value, 1));
+            if (name) columns.emplace_back(name);
+        }
+    }
+    if (columns.empty()) return false;
+    const auto has = [&](const char* name) {
+        return std::find(columns.begin(), columns.end(), std::string(name)) != columns.end();
+    };
+    if (sqlite3_exec(database_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) return false;
+    bool success = true;
+    const auto exec = [&](const char* sql) {
+        if (success && sqlite3_exec(database_, sql, nullptr, nullptr, nullptr) != SQLITE_OK) success = false;
+    };
+    // v1 -> v2
+    if (fromVersion < 2) {
+        if (!has("face_quality")) exec("ALTER TABLE image_records ADD COLUMN face_quality BLOB;");
+        if (!has("face_quality_version"))
+            exec("ALTER TABLE image_records ADD COLUMN face_quality_version INTEGER NOT NULL DEFAULT 0;");
+        if (!has("face_selection")) exec("ALTER TABLE image_records ADD COLUMN face_selection BLOB;");
+    }
+    // v2 -> v3: camera settings for indexed search
+    if (fromVersion < 3) {
+        if (!has("iso")) exec("ALTER TABLE image_records ADD COLUMN iso INTEGER NOT NULL DEFAULT -1;");
+        if (!has("aperture")) exec("ALTER TABLE image_records ADD COLUMN aperture REAL NOT NULL DEFAULT 0;");
+        if (!has("focal_length")) exec("ALTER TABLE image_records ADD COLUMN focal_length REAL NOT NULL DEFAULT 0;");
+        if (!has("shutter_speed")) exec("ALTER TABLE image_records ADD COLUMN shutter_speed REAL NOT NULL DEFAULT 0;");
+        if (!has("camera")) exec("ALTER TABLE image_records ADD COLUMN camera TEXT NOT NULL DEFAULT '';");
+        if (!has("lens")) exec("ALTER TABLE image_records ADD COLUMN lens TEXT NOT NULL DEFAULT '';");
+        if (!has("camera_settings_known")) exec("ALTER TABLE image_records ADD COLUMN camera_settings_known INTEGER NOT NULL DEFAULT 0;");
+    }
+    exec(("PRAGMA user_version=" + std::to_string(kDatabaseSchemaVersion) + ";").c_str());
+    if (success && sqlite3_exec(database_, "COMMIT;", nullptr, nullptr, nullptr) == SQLITE_OK) {
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Info, quicksift::diagnostics::category::kDbMigration,
+            L"schema_migrated", { L"from", std::to_wstring(fromVersion) }, { L"to", std::to_wstring(kDatabaseSchemaVersion) });
+        return true;
+    }
+    sqlite3_exec(database_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kDbMigration,
+        L"schema_migration_failed", { L"error_code", L"cache.db.migration_failed" },
+        { L"from", std::to_wstring(fromVersion) }, { L"to", std::to_wstring(kDatabaseSchemaVersion) },
+        { L"sqlite", std::to_wstring(sqlite3_extended_errcode(database_)) },
+        { L"action", L"rebuild" });
+    return false;
 }
 
 bool PersistentCache::InitializeSchema() {
@@ -601,7 +722,16 @@ bool PersistentCache::InitializeSchema() {
         " color_label_knowledge INTEGER NOT NULL DEFAULT 1,"
         " pick_state_knowledge INTEGER NOT NULL DEFAULT 1,"
         " raw_rating TEXT NOT NULL DEFAULT '', raw_color_label TEXT NOT NULL DEFAULT '',"
-        " raw_pick_state TEXT NOT NULL DEFAULT '');"
+        " raw_pick_state TEXT NOT NULL DEFAULT '',"
+        " face_quality BLOB, face_quality_version INTEGER NOT NULL DEFAULT 0,"
+        " face_selection BLOB,"
+        " iso INTEGER NOT NULL DEFAULT -1,"
+        " aperture REAL NOT NULL DEFAULT 0,"
+        " focal_length REAL NOT NULL DEFAULT 0,"
+        " shutter_speed REAL NOT NULL DEFAULT 0,"
+        " camera TEXT NOT NULL DEFAULT '',"
+        " lens TEXT NOT NULL DEFAULT '',"
+        " camera_settings_known INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS image_records_access ON image_records(last_access);"
         "CREATE TABLE IF NOT EXISTS library_folders("
         " path TEXT PRIMARY KEY NOT NULL,"
@@ -623,22 +753,80 @@ bool PersistentCache::InitializeSchema() {
 }
 
 
+void PersistentCache::DeferWrite(std::function<void()> write) {
+    std::lock_guard lock(deferredMutex_);
+    QS_LOCK_ORDER(quicksift::core::lock_order::Rank::CacheDeferred);
+    deferredWrites_.push_back(std::move(write));
+    deferredPending_.store(true, std::memory_order_release);
+    static quicksift::core::LogRateLimiter limiter(4, std::chrono::seconds(30));
+    std::uint64_t suppressed = 0;
+    if (limiter.Allow(&suppressed)) {
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Info, quicksift::diagnostics::category::kMetadataStore,
+            L"cache_db_busy_write_deferred",
+            { L"queued", std::to_wstring(deferredWrites_.size()) },
+            { L"wait_ms", std::to_wstring(kUiDatabaseWait.count()) },
+            { L"suppressed", std::to_wstring(suppressed) });
+    }
+}
+
+void PersistentCache::DrainDeferredWritesLocked() noexcept {
+    if (!deferredPending_.load(std::memory_order_acquire)) return;
+    std::vector<std::function<void()>> writes;
+    try {
+        std::lock_guard lock(deferredMutex_);
+        QS_LOCK_ORDER(quicksift::core::lock_order::Rank::CacheDeferred);
+        writes.swap(deferredWrites_);
+        deferredPending_.store(false, std::memory_order_release);
+    } catch (...) {
+        return;
+    }
+    if (!database_) return; // cache unavailable: the writes are best-effort, like the cache
+    for (auto& write : writes) {
+        try { write(); } catch (...) {}
+    }
+}
+
 void PersistentCache::AddLibraryFolder(const fs::path& path, std::int64_t timestamp) {
     const std::wstring key = NormalizeKey(path);
     const std::wstring display = path.wstring();
-    std::lock_guard lock(databaseMutex_);
+    auto write = [this, key, display, timestamp] {
+        SqlStatement stmt;
+        if (!Prepare(database_, "INSERT OR REPLACE INTO library_folders(path,last_opened,display_path) VALUES(?1,?2,?3);", stmt)) return;
+        BindText16(stmt.value, 1, key);
+        sqlite3_bind_int64(stmt.value, 2, timestamp);
+        BindText16(stmt.value, 3, display);
+        sqlite3_step(stmt.value);
+    };
+    std::unique_lock lock(databaseMutex_, std::defer_lock);
+    if (!lock.try_lock_for(kUiDatabaseWait)) {
+        DeferWrite(std::move(write));
+        return;
+    }
+    DrainDeferredWritesLocked();
     if (!database_) return;
-    SqlStatement stmt;
-    if (!Prepare(database_, "INSERT OR REPLACE INTO library_folders(path,last_opened,display_path) VALUES(?1,?2,?3);", stmt)) return;
-    BindText16(stmt.value, 1, key);
-    sqlite3_bind_int64(stmt.value, 2, timestamp);
-    BindText16(stmt.value, 3, display);
-    sqlite3_step(stmt.value);
+    write();
 }
 
 std::vector<std::pair<std::wstring, std::int64_t>> PersistentCache::GetLibraryFolders() {
     std::vector<std::pair<std::wstring, std::int64_t>> result;
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked();
+    if (!database_) return result;
+    SqlStatement stmt;
+    if (!Prepare(database_, "SELECT COALESCE(display_path,path),last_opened FROM library_folders ORDER BY last_opened DESC;", stmt)) return result;
+    while (sqlite3_step(stmt.value) == SQLITE_ROW) {
+        const std::wstring path = ColumnText16(stmt.value, 0);
+        const std::int64_t time = sqlite3_column_int64(stmt.value, 1);
+        if (!path.empty()) result.emplace_back(path, time);
+    }
+    return result;
+}
+
+std::optional<std::vector<std::pair<std::wstring, std::int64_t>>> PersistentCache::TryGetLibraryFolders() {
+    std::vector<std::pair<std::wstring, std::int64_t>> result;
+    std::unique_lock lock(databaseMutex_, std::defer_lock);
+    if (!lock.try_lock_for(kUiDatabaseWait)) return std::nullopt;
+    DrainDeferredWritesLocked();
     if (!database_) return result;
     SqlStatement stmt;
     if (!Prepare(database_, "SELECT COALESCE(display_path,path),last_opened FROM library_folders ORDER BY last_opened DESC;", stmt)) return result;
@@ -653,6 +841,7 @@ std::vector<std::pair<std::wstring, std::int64_t>> PersistentCache::GetLibraryFo
 void PersistentCache::RemoveLibraryFolder(const fs::path& path) {
     const std::wstring key = NormalizeKey(path);
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked(); // a deferred add must not resurrect the folder later
     if (!database_) return;
     SqlStatement stmt;
     if (!Prepare(database_, "DELETE FROM library_folders WHERE path=?1;", stmt)) return;
@@ -693,7 +882,9 @@ std::optional<CachedImageRecord> PersistentCache::LookupRecord(
     if (!Prepare(database_,
         "SELECT file_size,modified_stamp,sidecar_stamp,rating,color_label,pick_state,"
         "source_width,source_height,exif_text,faces,faces_scanned,face_blur_scanned,face_blurry,face_sharpness,last_access,"
-        "rating_knowledge,color_label_knowledge,pick_state_knowledge,raw_rating,raw_color_label,raw_pick_state "
+        "rating_knowledge,color_label_knowledge,pick_state_knowledge,raw_rating,raw_color_label,raw_pick_state,"
+        "face_quality,face_quality_version,face_selection,"
+        "iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known "
         "FROM image_records WHERE path=?1;", query)) return std::nullopt;
     BindText16(query.value, 1, key);
     if (sqlite3_step(query.value) != SQLITE_ROW) return std::nullopt;
@@ -774,6 +965,55 @@ std::optional<CachedImageRecord> PersistentCache::LookupRecord(
     }
     record.faceSharpness = static_cast<float>(storedSharpness);
     record.lastAccessStamp = sqlite3_column_int64(query.value, 14);
+    if (includeFaces) {
+        // Per-face quality is only trusted when it was produced by the current
+        // analysis version and lines up 1:1 with the stored faces. Anything else is
+        // reported as "quality not scanned" so the worker re-analyzes lazily.
+        const sqlite3_int64 storedQualityVersion = sqlite3_column_int64(query.value, 22);
+        const void* qualityBlob = sqlite3_column_blob(query.value, 21);
+        const int qualityBytes = sqlite3_column_bytes(query.value, 21);
+        bool qualityValid = storedQualityVersion ==
+            static_cast<sqlite3_int64>(core::kFaceQualityAnalysisVersion) &&
+            qualityBytes >= 0 && qualityBytes % static_cast<int>(sizeof(FaceQualityRecord)) == 0 &&
+            static_cast<std::size_t>(qualityBytes) / sizeof(FaceQualityRecord) == record.faces.size() &&
+            (qualityBytes == 0 || qualityBlob);
+        if (qualityValid && qualityBytes > 0) {
+            record.faceQualities.resize(static_cast<std::size_t>(qualityBytes) / sizeof(FaceQualityRecord));
+            std::memcpy(record.faceQualities.data(), qualityBlob, static_cast<std::size_t>(qualityBytes));
+            qualityValid = std::all_of(record.faceQualities.begin(), record.faceQualities.end(),
+                [](const FaceQualityRecord& quality) { return IsValidFaceQualityRecord(quality); });
+        }
+        if (qualityValid) {
+            record.faceQualityVersion = core::kFaceQualityAnalysisVersion;
+        } else {
+            record.faceQualities.clear();
+            record.faceQualityVersion = 0;
+            record.faceBlurScanned = false;
+            record.faceBlurry = false;
+            record.faceSharpness = 0.0f;
+        }
+
+        record.faceSelectionKnown = true;
+        const void* selectionBlob = sqlite3_column_blob(query.value, 23);
+        const int selectionBytes = sqlite3_column_bytes(query.value, 23);
+        if (selectionBlob && selectionBytes == static_cast<int>(sizeof(NormalizedFaceRect))) {
+            NormalizedFaceRect selection{};
+            std::memcpy(&selection, selectionBlob, sizeof(NormalizedFaceRect));
+            if (IsValidNormalizedFaceRect(selection)) {
+                record.hasFaceSelection = true;
+                record.faceSelection = selection;
+            }
+        }
+    }
+
+    // Camera settings (always read; independent of face inclusion)
+    record.iso = sqlite3_column_int(query.value, 24);
+    record.aperture = sqlite3_column_double(query.value, 25);
+    record.focalLength = sqlite3_column_double(query.value, 26);
+    record.shutterSpeed = sqlite3_column_double(query.value, 27);
+    record.camera = ColumnText16(query.value, 28);
+    record.lens = ColumnText16(query.value, 29);
+    record.cameraSettingsKnown = sqlite3_column_int(query.value, 30) != 0;
 
     constexpr std::int64_t kTouchSeconds = 24ll * 60ll * 60ll;
     const std::int64_t now = CurrentAccessStamp();
@@ -787,6 +1027,69 @@ std::optional<CachedImageRecord> PersistentCache::LookupRecord(
         record.lastAccessStamp = now;
     }
     return record;
+}
+
+std::optional<CachedImageRecord> PersistentCache::LookupCameraSettings(const fs::path& path) {
+    const std::wstring key = NormalizeKey(path);
+    std::lock_guard lock(databaseMutex_);
+    if (!database_) return std::nullopt;
+    SqlStatement query;
+    if (!Prepare(database_,
+        "SELECT iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known "
+        "FROM image_records WHERE path=?1;", query)) return std::nullopt;
+    BindText16(query.value, 1, key);
+    if (sqlite3_step(query.value) != SQLITE_ROW) return std::nullopt;
+    if (sqlite3_column_int(query.value, 6) == 0) return std::nullopt;
+    CachedImageRecord record;
+    record.iso = sqlite3_column_int(query.value, 0);
+    record.aperture = sqlite3_column_double(query.value, 1);
+    record.focalLength = sqlite3_column_double(query.value, 2);
+    record.shutterSpeed = sqlite3_column_double(query.value, 3);
+    record.camera = ColumnText16(query.value, 4);
+    record.lens = ColumnText16(query.value, 5);
+    record.cameraSettingsKnown = true;
+    return record;
+}
+
+void PersistentCache::UpdateCameraSettings(const fs::path& path, const CachedImageRecord& settings) {
+    const std::wstring key = NormalizeKey(path);
+    std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked();
+    if (!database_) return;
+    // Only touch camera columns. Existing rating/faces/dimensions are preserved.
+    // If the row does not exist yet, insert a minimal stub so the next full upsert merges.
+    SqlStatement update;
+    if (!Prepare(database_,
+        "UPDATE image_records SET iso=?1, aperture=?2, focal_length=?3, shutter_speed=?4, "
+        "camera=?5, lens=?6, camera_settings_known=?7 WHERE path=?8;", update)) return;
+    sqlite3_bind_int(update.value, 1, settings.iso);
+    sqlite3_bind_double(update.value, 2, settings.aperture);
+    sqlite3_bind_double(update.value, 3, settings.focalLength);
+    sqlite3_bind_double(update.value, 4, settings.shutterSpeed);
+    BindText16(update.value, 5, settings.camera);
+    BindText16(update.value, 6, settings.lens);
+    sqlite3_bind_int(update.value, 7, settings.cameraSettingsKnown ? 1 : 0);
+    BindText16(update.value, 8, key);
+    if (sqlite3_step(update.value) == SQLITE_DONE && sqlite3_changes(database_) == 0) {
+        // No existing row: insert a stub that only carries camera settings.
+        SqlStatement insert;
+        if (Prepare(database_,
+            "INSERT INTO image_records(path,file_size,modified_stamp,sidecar_stamp,rating,"
+            "color_label,pick_state,source_width,source_height,faces_scanned,last_access,"
+            "iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known) "
+            "VALUES(?1,0,0,0,0,0,0,0,0,0,?2,?3,?4,?5,?6,?7,?8,?9);", insert)) {
+            BindText16(insert.value, 1, key);
+            sqlite3_bind_int64(insert.value, 2, CurrentAccessStamp());
+            sqlite3_bind_int(insert.value, 3, settings.iso);
+            sqlite3_bind_double(insert.value, 4, settings.aperture);
+            sqlite3_bind_double(insert.value, 5, settings.focalLength);
+            sqlite3_bind_double(insert.value, 6, settings.shutterSpeed);
+            BindText16(insert.value, 7, settings.camera);
+            BindText16(insert.value, 8, settings.lens);
+            sqlite3_bind_int(insert.value, 9, settings.cameraSettingsKnown ? 1 : 0);
+            sqlite3_step(insert.value);
+        }
+    }
 }
 
 void PersistentCache::UpsertRecord(const fs::path& path, CachedImageRecord record) {
@@ -839,11 +1142,28 @@ void PersistentCache::UpsertRecords(
             record.faceBlurry = false;
             record.faceSharpness = 0.0f;
         }
+        const bool qualitiesValid = record.faceQualities.size() == record.faces.size() &&
+            std::all_of(record.faceQualities.begin(), record.faceQualities.end(),
+                [](const FaceQualityRecord& quality) { return IsValidFaceQualityRecord(quality); });
+        if (!qualitiesValid || record.faceQualityVersion != core::kFaceQualityAnalysisVersion) {
+            // Never persist verdicts that do not line up with the boxes; the reader
+            // then reports quality as not scanned and the worker re-analyzes.
+            record.faceQualities.clear();
+            record.faceQualityVersion = 0;
+            if (!record.faces.empty()) {
+                record.faceBlurScanned = false;
+                record.faceBlurry = false;
+                record.faceSharpness = 0.0f;
+            }
+        }
+        if (record.hasFaceSelection && !IsValidNormalizedFaceRect(record.faceSelection))
+            record.hasFaceSelection = false;
         record.lastAccessStamp = accessStamp;
         prepared.push_back({ NormalizeKey(path), std::move(record) });
     }
 
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked();
     if (!database_) return;
     if (sqlite3_exec(database_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) return;
     bool success = true;
@@ -865,9 +1185,22 @@ void PersistentCache::UpsertRecords(
     sqlite3_exec(database_, "ROLLBACK;", nullptr, nullptr, nullptr);
 }
 
+std::optional<std::wstring> PersistentCache::TryGetPhotoComment(const fs::path& path) {
+    const std::wstring key = NormalizeKey(path);
+    std::unique_lock lock(databaseMutex_, std::defer_lock);
+    if (!lock.try_lock_for(kUiDatabaseWait)) return std::nullopt;
+    DrainDeferredWritesLocked();
+    if (!database_) return std::wstring{};
+    SqlStatement stmt;
+    if (!Prepare(database_, "SELECT comment FROM photo_comments WHERE path=?1;", stmt)) return std::wstring{};
+    BindText16(stmt.value, 1, key);
+    return sqlite3_step(stmt.value) == SQLITE_ROW ? ColumnText16(stmt.value, 0) : std::wstring{};
+}
+
 std::wstring PersistentCache::GetPhotoComment(const fs::path& path) {
     const std::wstring key = NormalizeKey(path);
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked();
     if (!database_) return {};
     SqlStatement stmt;
     if (!Prepare(database_, "SELECT comment FROM photo_comments WHERE path=?1;", stmt)) return {};
@@ -875,19 +1208,50 @@ std::wstring PersistentCache::GetPhotoComment(const fs::path& path) {
     return sqlite3_step(stmt.value) == SQLITE_ROW ? ColumnText16(stmt.value, 0) : std::wstring{};
 }
 
+std::vector<std::wstring> PersistentCache::GetPhotoComments(const std::vector<fs::path>& paths) {
+    std::vector<std::wstring> comments(paths.size());
+    constexpr std::size_t kChunk = 256;
+    for (std::size_t begin = 0; begin < paths.size(); begin += kChunk) {
+        const std::size_t end = std::min(paths.size(), begin + kChunk);
+        std::vector<std::wstring> keys;
+        keys.reserve(end - begin);
+        for (std::size_t index = begin; index < end; ++index) keys.push_back(NormalizeKey(paths[index]));
+        std::lock_guard lock(databaseMutex_);
+        DrainDeferredWritesLocked();
+        if (!database_) return comments;
+        SqlStatement stmt;
+        if (!Prepare(database_, "SELECT comment FROM photo_comments WHERE path=?1;", stmt)) return comments;
+        for (std::size_t index = begin; index < end; ++index) {
+            sqlite3_reset(stmt.value);
+            sqlite3_clear_bindings(stmt.value);
+            BindText16(stmt.value, 1, keys[index - begin]);
+            if (sqlite3_step(stmt.value) == SQLITE_ROW) comments[index] = ColumnText16(stmt.value, 0);
+        }
+    }
+    return comments;
+}
+
 void PersistentCache::SetPhotoComment(const fs::path& path, std::wstring comment) {
     const std::wstring key = NormalizeKey(path);
-    std::lock_guard lock(databaseMutex_);
-    if (!database_) return;
-    SqlStatement stmt;
-    if (comment.empty()) {
-        if (!Prepare(database_, "DELETE FROM photo_comments WHERE path=?1;", stmt)) return;
-        BindText16(stmt.value, 1, key);
-    } else {
-        if (!Prepare(database_, "INSERT INTO photo_comments(path,comment) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET comment=excluded.comment;", stmt)) return;
-        BindText16(stmt.value, 1, key); BindText16(stmt.value, 2, comment);
+    auto write = [this, key, comment = std::move(comment)] {
+        SqlStatement stmt;
+        if (comment.empty()) {
+            if (!Prepare(database_, "DELETE FROM photo_comments WHERE path=?1;", stmt)) return;
+            BindText16(stmt.value, 1, key);
+        } else {
+            if (!Prepare(database_, "INSERT INTO photo_comments(path,comment) VALUES(?1,?2) ON CONFLICT(path) DO UPDATE SET comment=excluded.comment;", stmt)) return;
+            BindText16(stmt.value, 1, key); BindText16(stmt.value, 2, comment);
+        }
+        sqlite3_step(stmt.value);
+    };
+    std::unique_lock lock(databaseMutex_, std::defer_lock);
+    if (!lock.try_lock_for(kUiDatabaseWait)) {
+        DeferWrite(std::move(write)); // applied in order by the next lock holder
+        return;
     }
-    sqlite3_step(stmt.value);
+    DrainDeferredWritesLocked();
+    if (!database_) return;
+    write();
 }
 
 fs::path PersistentCache::BitmapPathFor(const fs::path& path, std::uint64_t fileSize,
@@ -1301,6 +1665,7 @@ void PersistentCache::PerformMaintenance(bool force) {
     PruneDiskFiles(force);
     {
         std::lock_guard lock(databaseMutex_);
+        DrainDeferredWritesLocked();
         if (database_) {
             sqlite3_wal_checkpoint_v2(database_, nullptr,
                 force ? SQLITE_CHECKPOINT_RESTART : SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
@@ -1312,13 +1677,18 @@ void PersistentCache::PerformMaintenance(bool force) {
 
 void PersistentCache::Flush(bool force) {
     std::lock_guard lock(databaseMutex_);
+    DrainDeferredWritesLocked();
     if (!database_) return;
     sqlite3_wal_checkpoint_v2(database_, nullptr,
         force ? SQLITE_CHECKPOINT_RESTART : SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
 }
 
 void PersistentCache::TrimMemory(bool critical) {
-    std::lock_guard lock(databaseMutex_);
+    // Called on the UI thread under memory pressure; best-effort, so never wait
+    // behind a long cache transaction.
+    std::unique_lock lock(databaseMutex_, std::defer_lock);
+    if (!lock.try_lock_for(kUiDatabaseWait)) return;
+    DrainDeferredWritesLocked();
     if (!database_) return;
     sqlite3_db_release_memory(database_);
     if (critical) sqlite3_wal_checkpoint_v2(database_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);

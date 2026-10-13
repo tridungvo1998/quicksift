@@ -1,6 +1,11 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
 #include "transactions/verified_file_operations_windows.h"
+#include "ui/metadata_photo_values.h"
+#include "core/priority_policy.h"
+#include "core/log_rate_limiter.h"
+#include "core/write_retry_policy.h"
+#include "diagnostics/log_categories.h"
 
 namespace quicksift::app {
 
@@ -10,29 +15,8 @@ namespace quicksift::app {
 // Metadata/history safety: snapshots, storage preflight, transactional metadata
 // updates, verified copy/move primitives, and bounded undo/redo history.
 
-namespace {
-
-PhotoMetadataValues ValuesFromPhoto(const PhotoItem& item) {
-    return {
-        { item.ratingKnowledge, item.rating, item.rawRating },
-        { item.colorLabelKnowledge, item.colorLabel, item.rawColorLabel },
-        { item.pickStateKnowledge, item.pickState, item.rawPickState }
-    };
-}
-
-void ApplyValuesToPhoto(PhotoItem& item, const PhotoMetadataValues& values) {
-    item.rating = values.rating.value;
-    item.colorLabel = values.colorLabel.value;
-    item.pickState = values.pickState.value;
-    item.ratingKnowledge = values.rating.knowledge;
-    item.colorLabelKnowledge = values.colorLabel.knowledge;
-    item.pickStateKnowledge = values.pickState.knowledge;
-    item.rawRating = values.rating.rawValue;
-    item.rawColorLabel = values.colorLabel.rawValue;
-    item.rawPickState = values.pickState.rawValue;
-}
-
-} // namespace
+using metadata_values::ValuesFromPhoto;
+using metadata_values::ApplyValuesToPhoto;
 
 std::vector<fs::path> QuickSiftApplicationImpl::ActivePaths() const {
     std::vector<fs::path> paths;
@@ -103,8 +87,10 @@ void QuickSiftApplicationImpl::PushHistory(HistoryEntry entry) {
     UpdateHistoryButtons();
 }
 
-bool QuickSiftApplicationImpl::PreflightMetadataStorage(
-    const std::vector<MetadataSnapshot>& targets, const std::wstring& operation) {
+// Runs on the metadata transaction thread (callbacks.preflight): stats and free-space
+// queries never touch the UI thread. Pure: no UI, no members.
+std::optional<quicksift::transactions::MetadataStorageShortfall>
+QuickSiftApplicationImpl::MetadataStorageShortfallFor(const std::vector<MetadataSnapshot>& targets) {
     struct Requirement {
         fs::path probe;
         std::uint64_t permanentBytes = 0;
@@ -140,10 +126,9 @@ bool QuickSiftApplicationImpl::PreflightMetadataStorage(
             std::error_code ec;
             const std::uintmax_t size = fs::file_size(target.path, ec);
             if (ec) {
-                ShowGlassAlert(L"Metadata update stopped",
-                    L"QuickSift could not determine an image size before preparing a verified metadata update. Nothing was changed.",
-                    GlassAlertKind::Warning);
-                return false;
+                quicksift::transactions::MetadataStorageShortfall shortfall;
+                shortfall.sizeUnknown = true;
+                return shortfall;
             }
             requirement.temporaryBytes = std::max(requirement.temporaryBytes,
                 SaturatingAdd(static_cast<std::uint64_t>(size), kDirectGrowthAllowance));
@@ -155,16 +140,33 @@ bool QuickSiftApplicationImpl::PreflightMetadataStorage(
             SaturatingAdd(requirement.permanentBytes, requirement.temporaryBytes), kReserve);
         const auto freeBytes = FreeBytesForPath(requirement.probe);
         if (!freeBytes || *freeBytes < needed) {
-            std::wstringstream message;
-            message << operation << L" needs cumulative free space for the complete batch.\n\nVolume: "
-                << volume << L"\nRequired: " << FormatFileSize(needed);
-            if (freeBytes) message << L"\nAvailable: " << FormatFileSize(*freeBytes);
-            message << L"\n\nNothing was changed.";
-            ShowGlassAlert(L"Low storage — nothing changed", message.str(), GlassAlertKind::Warning);
-            return false;
+            quicksift::transactions::MetadataStorageShortfall shortfall;
+            shortfall.volume = volume;
+            shortfall.requiredBytes = needed;
+            shortfall.availableBytes = freeBytes;
+            return shortfall;
         }
     }
-    return true;
+    return std::nullopt;
+}
+
+void QuickSiftApplicationImpl::ShowMetadataStorageShortfall(
+    const quicksift::transactions::MetadataStorageShortfall& shortfall,
+    const std::wstring& operation) {
+    if (shortfall.sizeUnknown) {
+        ShowGlassAlert(L"Metadata update stopped",
+            L"QuickSift could not determine an image size before preparing a verified metadata update. Nothing was changed.",
+            GlassAlertKind::Warning);
+        return;
+    }
+    std::wstring message = FillToken(Tr(L"{operation} needs cumulative free space for the complete batch."),
+        L"{operation}", operation);
+    message += L"\n\n" + Tr(L"Volume:") + L" " + shortfall.volume;
+    message += L"\n" + Tr(L"Required:") + L" " + FormatFileSize(shortfall.requiredBytes);
+    if (shortfall.availableBytes)
+        message += L"\n" + Tr(L"Available:") + L" " + FormatFileSize(*shortfall.availableBytes);
+    message += L"\n\n" + Tr(L"Nothing was changed.");
+    ShowGlassAlertText(Tr(L"Low storage — nothing changed"), message, GlassAlertKind::Warning);
 }
 
 quicksift::transactions::MetadataWriteOutcome
@@ -179,6 +181,15 @@ QuickSiftApplicationImpl::WriteMetadataPatchFile(const fs::path& path,
         outcome.before = sidecar.before;
         outcome.after = sidecar.after;
         outcome.detail = sidecar.detail;
+        outcome.win32Error = sidecar.win32Error;
+        if (!sidecar.ok) {
+            using quicksift::core::write_lane::WriteFailureKind;
+            outcome.failureKind = sidecar.conflict ? WriteFailureKind::Conflict :
+                (sidecar.lowStorage ? WriteFailureKind::LowStorage :
+                (sidecar.win32Error != 0 ?
+                    quicksift::core::write_lane::ClassifyWin32Error(sidecar.win32Error) :
+                    WriteFailureKind::Other));
+        }
         return outcome;
     }
 
@@ -196,6 +207,26 @@ QuickSiftApplicationImpl::WriteMetadataPatchFile(const fs::path& path,
     outcome.before = result.before;
     outcome.after = result.after;
     outcome.detail = result.detail;
+    outcome.win32Error = result.win32Error;
+    if (!result.ok) {
+        using quicksift::core::write_lane::WriteFailureKind;
+        switch (result.failure) {
+        case EmbeddedMetadataFailure::InvalidValue: outcome.failureKind = WriteFailureKind::InvalidValue; break;
+        case EmbeddedMetadataFailure::LowStorage: outcome.failureKind = WriteFailureKind::LowStorage; break;
+        case EmbeddedMetadataFailure::UnsupportedFormat: outcome.failureKind = WriteFailureKind::Unsupported; break;
+        case EmbeddedMetadataFailure::SourceChanged: outcome.failureKind = WriteFailureKind::Conflict; break;
+        case EmbeddedMetadataFailure::VerificationFailed: outcome.failureKind = WriteFailureKind::Verification; break;
+        case EmbeddedMetadataFailure::UnsafePath:
+        case EmbeddedMetadataFailure::WriteFailed:
+        case EmbeddedMetadataFailure::None:
+        default:
+            // Only pre-publication refusals carry a Win32 code (see embedded_metadata.h).
+            outcome.failureKind = result.win32Error != 0 ?
+                quicksift::core::write_lane::ClassifyWin32Error(result.win32Error) :
+                WriteFailureKind::Other;
+            break;
+        }
+    }
     if (!result.ok && outcome.detail.empty()) {
         outcome.detail = L"The embedded metadata container could not be updated safely.";
     }
@@ -210,6 +241,15 @@ void QuickSiftApplicationImpl::ConfigureMetadataTransactions() {
     quicksift::transactions::MetadataTransactionCallbacks callbacks;
     callbacks.beginExclusive = [this](const std::vector<fs::path>& paths,
         std::wstring& detail) {
+        // P1 OS hint (runs on the metadata service thread at the start of every
+        // plan): NORMAL, i.e. above every background/below-normal worker (P3-P5 and
+        // the ratings/batch workers), but never above the UI thread (P0), which also
+        // gets Windows' foreground boost. Readers yield to writes cooperatively.
+        static thread_local bool hinted = false;
+        if (!hinted) {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+            hinted = true;
+        }
         if (paths.empty() || worker_.BeginExclusivePathWrites(paths)) return true;
         detail = L"QuickSift could not release an active image decoder for this metadata batch in time. Metadata reads no longer block rating or pick updates; wait for the current preview decode to finish and try again.";
         QS_LOG_WARNING(L"Metadata", L"Exclusive metadata batch handoff timed out");
@@ -222,6 +262,31 @@ void QuickSiftApplicationImpl::ConfigureMetadataTransactions() {
         MetadataStorageKind storage, bool jpeg, bool safeJpegWrites) {
         return WriteMetadataPatchFile(path, patch, storage, jpeg, safeJpegWrites);
     };
+    // Off-UI-thread I/O: post-write stamps and the cumulative free-space preflight.
+    callbacks.stamps = [](const fs::path& path) { return MetadataFileStampsFor(path); };
+    callbacks.preflight = [](const std::vector<MetadataSnapshot>& targets) {
+        return MetadataStorageShortfallFor(targets);
+    };
+    callbacks.onRetry = [](const fs::path& path, unsigned attempt,
+        quicksift::core::write_lane::WriteFailureKind kind, std::uint32_t win32Error,
+        std::chrono::milliseconds elapsed, bool external) {
+        // Rate-limited: a file locked for 30 s produces ~35 attempts.
+        static quicksift::core::LogRateLimiter limiter(12, std::chrono::seconds(10));
+        std::uint64_t suppressed = 0;
+        const bool terminal = quicksift::core::write_lane::IsTransient(kind) == false;
+        if (!terminal && !limiter.Allow(&suppressed)) return;
+        QS_LOG_EVENT(terminal || external ? quicksift::diagnostics::Level::Warning :
+                quicksift::diagnostics::Level::Info,
+            quicksift::diagnostics::category::kWriteLane,
+            terminal ? L"write_abort" : (external ? L"write_waiting_external" : L"write_retry"),
+            { L"file", quicksift::diagnostics::LogFileName(path) },
+            { L"path_id", quicksift::diagnostics::LogPathId(path) },
+            { L"attempt", std::to_wstring(attempt) },
+            { L"kind", std::wstring(quicksift::core::write_lane::FailureKindName(kind)) },
+            { L"win32", std::to_wstring(win32Error) },
+            { L"elapsed_ms", std::to_wstring(elapsed.count()) },
+            { L"suppressed", std::to_wstring(suppressed) });
+    };
     transactions_.ConfigureMetadata(std::move(callbacks));
 }
 
@@ -232,26 +297,32 @@ void QuickSiftApplicationImpl::SubmitMetadataEdit(MetadataEditField field, int v
     else targets = ActivePaths();
     if (targets.empty() && !reviewState_.ThumbnailFocusPath().empty()) targets.emplace_back(reviewState_.ThumbnailFocusPath());
     if (targets.empty()) return;
-    if (transactions_.Busy()) {
+    // File transactions (move/copy/delete) and history replay are never raced.
+    if (transactions_.FileBusy() || replayingHistory_) {
         ShowGlassAlert(L"Metadata update is waiting",
             L"QuickSift serializes verified file and metadata transactions so they cannot race over the same media.",
             GlassAlertKind::Warning);
         return;
     }
 
-    const std::wstring label = field == MetadataEditField::Rating ? L"Rating" :
-        (field == MetadataEditField::Pick ? L"Pick state" : L"Color label");
     const MetadataFieldId fieldId = field == MetadataEditField::Rating ?
         MetadataFieldId::Rating : (field == MetadataEditField::Pick ?
             MetadataFieldId::PickState : MetadataFieldId::ColorLabel);
+    const std::wstring label = MetadataFieldLabel(fieldId);
+
+    // P1 write lane: while another metadata write runs (or edits are already queued),
+    // the edit shows immediately and is coalesced (last value wins per file), then
+    // written on the urgent lane / right after the running plan. No modal refusal.
+    if (transactions_.MetadataBusy() || !pendingMetadataEdits_.Empty()) {
+        QueueMetadataEdit(targets, fieldId, value, label);
+        return;
+    }
 
     quicksift::transactions::MetadataTransactionPlan plan;
     plan.label = label;
     plan.recordHistory = HistoryStore::EstimateMetadataBytesForTargets(targets, label) <=
         historyStore_.MemoryLimit();
     plan.changes.reserve(targets.size());
-    std::vector<MetadataSnapshot> storageTargets;
-    storageTargets.reserve(targets.size());
 
     for (const fs::path& path : targets) {
         const auto index = CatalogIndexForPath(path.wstring());
@@ -282,28 +353,44 @@ void QuickSiftApplicationImpl::SubmitMetadataEdit(MetadataEditField field, int v
             change.before.revision = item.metadataRevision;
             change.after.revision = item.metadataRevision;
         });
-        storageTargets.push_back(change.after);
         plan.changes.push_back(std::move(change));
     }
 
     if (plan.changes.empty()) {
         if (plan.initialFailures != 0) {
-            ShowGlassAlert(label + L" update stopped", plan.initialDetail,
-                GlassAlertKind::Warning);
+            ShowGlassAlertText(FillToken(Tr(L"{label} update stopped"), L"{label}", Tr(label)),
+                Tr(plan.initialDetail), GlassAlertKind::Warning);
         } else {
-            ShowToast(label + L" already matches the selected photos — no files were rewritten");
+            ShowToastText(FillToken(Tr(L"{label} already matches the selected photos — no files were rewritten"),
+                L"{label}", Tr(label)));
         }
         return;
     }
-    if (!PreflightMetadataStorage(storageTargets, label + L" update")) return;
+    // Free-space preflight now runs on the transaction thread (no UI-thread stats);
+    // a shortfall fails every item and FinishMetadataTransaction rolls back.
 
+    const auto restoreOptimistic = [&]() {
+        // 0.9.4.0 polish: a refused submit used to leave the optimistic value on
+        // screen although nothing would ever be written.
+        for (const auto& change : plan.changes) {
+            UpdatePhotoMetadataEverywhere(change.before.path, [&](PhotoItem& photo) {
+                ApplyValuesToPhoto(photo, change.before.values);
+            });
+        }
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    };
+    quicksift::core::priority::Demand().SetMetadataWritesPending(1);
     const std::uint64_t token = transactions_.SubmitMetadata(plan);
     if (token == 0) {
-        ShowGlassAlert(label + L" update could not start",
-            L"Another serialized transaction became active before the metadata batch could be submitted.",
+        quicksift::core::priority::Demand().SetMetadataWritesPending(transactions_.MetadataBusy() ? 1u : 0u);
+        restoreOptimistic();
+        ShowGlassAlertText(FillToken(Tr(L"{label} update could not start"), L"{label}", Tr(label)),
+            Tr(L"Another serialized transaction became active before the metadata batch could be submitted."),
             GlassAlertKind::Warning);
         return;
     }
+    EnsureMetadataWriteLaneTimer();
     UpdateColorLabelButton();
     UpdateStatus();
     for (int id : { ID_RATING_MENU, ID_PICK_STATE_MENU, ID_COLOR_LABEL }) {
@@ -312,9 +399,111 @@ void QuickSiftApplicationImpl::SubmitMetadataEdit(MetadataEditField field, int v
     InvalidateCanvas();
 }
 
+std::uint64_t QuickSiftApplicationImpl::SubmitRatingsImport(
+    const std::vector<RatingsImportItem>& items, RatingsImportCounts& counts,
+    std::wstring_view label) {
+    // Same pipeline as SubmitMetadataEdit, but one multi-field patch per file:
+    // optimistic catalog apply -> storage preflight -> serialized, verified,
+    // cancellable worker transaction with partial-completion restore.
+    // recordHistory=false: the import is confirmed as "cannot be undone"; the
+    // completion path clears Redo (like any unrecorded batch) without the
+    // "large batch" toast (FinishRatingsImportTransaction).
+    quicksift::transactions::MetadataTransactionPlan plan;
+    // Shared by Ratings Import and Batch Processing (label names the operation).
+    const std::wstring localizedLabel = Tr(label);
+    plan.label = localizedLabel;
+    plan.recordHistory = false;
+    plan.changes.reserve(items.size());
+
+    const auto addField = [](MetadataPatchField& patchField, const MetadataFieldValue& current,
+        const std::optional<int>& requested) {
+        if (!requested) return false; // field not part of this operation ("No change")
+        const int desired = *requested;
+        if (current.IsKnown() && current.value == desired) return false; // true no-op
+        // Keep an unrepresentable on-disk value rather than overwrite it with a
+        // neutral token that cannot express it.
+        if (current.knowledge == MetadataKnowledge::Unsupported && desired == 0) return false;
+        patchField.active = true;
+        patchField.desired = desired;
+        if (current.IsAuthoritative()) {
+            patchField.requireExpected = true;
+            patchField.expected = current;
+        }
+        return true;
+    };
+
+    for (const RatingsImportItem& item : items) {
+        const auto index = CatalogIndexForPath(item.path.wstring());
+        const auto before = SnapshotForPath(item.path);
+        if (!index || !before) {
+            ++counts.failed;
+            continue;
+        }
+        MetadataPatch patch;
+        bool any = false;
+        any = addField(patch.rating, before->values.rating, item.starRating) || any;
+        any = addField(patch.pickState, before->values.pickState, item.pickState) || any;
+        any = addField(patch.colorLabel, before->values.colorLabel, item.colorLabel) || any;
+        if (!any) {
+            ++counts.skipped;
+            continue;
+        }
+        quicksift::transactions::MetadataChange change;
+        change.before = *before;
+        change.patch = patch;
+        change.after = *before;
+        change.after.values = ApplyMetadataPatch(before->values, patch);
+        catalog_.EditPhoto(*index, [&](PhotoItem& photo) {
+            ApplyValuesToPhoto(photo, change.after.values);
+            ++photo.metadataRevision;
+            change.before.revision = photo.metadataRevision;
+            change.after.revision = photo.metadataRevision;
+        });
+        plan.changes.push_back(std::move(change));
+    }
+    counts.submitted = plan.changes.size();
+    if (plan.changes.empty()) return 0;
+
+    const auto restoreOptimistic = [&]() {
+        for (const auto& change : plan.changes) {
+            UpdatePhotoMetadataEverywhere(change.before.path, [&](PhotoItem& photo) {
+                ApplyValuesToPhoto(photo, change.before.values);
+            });
+        }
+        RebuildVisiblePhotos();
+        InvalidateCanvas();
+    };
+    // Cumulative free-space preflight runs on the transaction thread.
+    quicksift::core::priority::Demand().SetMetadataWritesPending(1);
+    const std::uint64_t token = transactions_.SubmitMetadata(plan);
+    if (token == 0) {
+        quicksift::core::priority::Demand().SetMetadataWritesPending(transactions_.MetadataBusy() ? 1u : 0u);
+        restoreOptimistic();
+        counts.submitted = 0;
+        ShowGlassAlert(ratingsImportIsBatch_ ? L"Batch processing could not start" : L"Ratings import could not start",
+            L"Another serialized transaction became active before the metadata batch could be submitted.",
+            GlassAlertKind::Warning);
+        return 0;
+    }
+    EnsureMetadataWriteLaneTimer();
+    UpdateColorLabelButton();
+    UpdateStatus();
+    for (int id : { ID_RATING_MENU, ID_PICK_STATE_MENU, ID_COLOR_LABEL }) {
+        if (controls_.contains(id)) InvalidateRect(controls_[id], nullptr, FALSE);
+    }
+    InvalidateCanvas();
+    return token;
+}
+
 void QuickSiftApplicationImpl::DrainMetadataTransactionResults() {
-    if (auto result = transactions_.TakeMetadataResult())
+    // Results queue (urgent-lane results can precede the outer plan's). Bounded:
+    // at most two can be outstanding (one normal + one urgent slot), plus margin.
+    for (int drained = 0; drained < 4; ++drained) {
+        auto result = transactions_.TakeMetadataResult();
+        if (!result) break;
         FinishMetadataTransaction(std::move(*result));
+        if (!IsWindow(hwnd_)) break; // FinishMetadataTransaction may close the window
+    }
 }
 
 void QuickSiftApplicationImpl::FinishMetadataTransaction(
@@ -332,6 +521,13 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
     bool changed = false;
     std::vector<fs::path> externalConflictPaths;
     externalConflictPaths.reserve(result.changes.size());
+    const bool applyMode = result.mode == quicksift::transactions::MetadataTransactionMode::Apply;
+    const bool importResult = ratingsImportToken_ != 0 && result.token == ratingsImportToken_;
+    std::size_t droppedQueuedEdits = 0;
+    std::vector<quicksift::transactions::MetadataChange> inUseChanges;
+    std::optional<quicksift::core::write_lane::WriteFailureKind> singleFailureKind;
+    bool mixedFailureKinds = false;
+    fs::path firstFailedPath;
     for (std::size_t index = 0; index < result.changes.size(); ++index) {
         const auto& change = result.changes[index];
         source.before.push_back(change.before);
@@ -339,6 +535,18 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         const bool completed = index < result.completed.size() && result.completed[index];
         if (!completed) {
             if (change.externalConflict) externalConflictPaths.push_back(change.before.path);
+            if (change.failureKind != quicksift::core::write_lane::WriteFailureKind::None) {
+                if (firstFailedPath.empty()) firstFailedPath = change.before.path;
+                if (!singleFailureKind) singleFailureKind = change.failureKind;
+                else if (*singleFailureKind != change.failureKind) mixedFailureKinds = true;
+            }
+            if (applyMode && !importResult && !result.cancelled &&
+                quicksift::core::write_lane::IsTransient(change.failureKind)) {
+                inUseChanges.push_back(change);
+            }
+            // An edit queued behind this write was based on the value we are now
+            // rolling back; it is dropped with it (reported below).
+            if (pendingMetadataEdits_.RemovePath(change.before.path)) ++droppedQueuedEdits;
             UpdatePhotoMetadataEverywhere(change.before.path, [&](PhotoItem& item) {
                 ApplyValuesToPhoto(item, change.before.values);
             });
@@ -352,9 +560,16 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         const PhotoMetadataValues values = change.hasResultingValues ? change.resultingValues :
             (result.mode == quicksift::transactions::MetadataTransactionMode::UndoHistory ?
                 change.before.values : change.after.values);
+        // A queued edit of the same file now targets the freshly written values.
+        std::optional<PhotoMetadataValues> stillQueued;
+        if (pendingMetadataEdits_.Rebase(change.before.path, values)) {
+            if (const auto* entry = pendingMetadataEdits_.Find(change.before.path))
+                stillQueued = ApplyMetadataPatch(entry->before.values, entry->patch);
+        }
         UpdatePhotoMetadataEverywhere(change.before.path, [&](PhotoItem& item) {
-            ApplyValuesToPhoto(item, values);
-            RefreshMetadataFileState(item, change.before.path);
+            ApplyValuesToPhoto(item, stillQueued ? *stillQueued : values);
+            // Stamps were captured on the transaction thread (no UI-thread stats).
+            ApplyMetadataFileStamps(item, change.stamps);
         });
     }
     PumpMetadataQueue();
@@ -363,7 +578,11 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
     if (result.mode == quicksift::transactions::MetadataTransactionMode::Apply) {
         HistoryEntry completed = MetadataHistorySubset(source, result.completed, true);
         if (result.recordHistory) PushHistory(std::move(completed));
-        else FinishUnrecordedAction(changed);
+        else if (ratingsImportToken_ != 0 && result.token == ratingsImportToken_) {
+            // Ratings import / Batch Processing: no Undo record by design (confirmed
+            // "cannot be undone").
+            if (changed) historyStore_.ClearRedo();
+        } else FinishUnrecordedAction(changed);
     } else {
         const bool undoReplay = result.mode ==
             quicksift::transactions::MetadataTransactionMode::UndoHistory;
@@ -397,25 +616,70 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         return;
     }
 
-    if (result.failed || result.cancelled || result.failureCount > 0) {
-        std::wstring message = result.detail.empty() ?
-            L"Some metadata items could not be written safely." : result.detail;
+    QS_LOG_EVENT(result.failed ? quicksift::diagnostics::Level::Warning : quicksift::diagnostics::Level::Info,
+        quicksift::diagnostics::category::kWriteLane, L"transaction_finished",
+        { L"token", std::to_wstring(result.token) },
+        { L"urgent", result.urgent ? L"1" : L"0" },
+        { L"items", std::to_wstring(result.changes.size()) },
+        { L"failed", std::to_wstring(result.failureCount) },
+        { L"conflicts", std::to_wstring(result.conflictCount) },
+        { L"in_use", std::to_wstring(result.inUseCount) },
+        { L"cancelled", result.cancelled ? L"1" : L"0" },
+        { L"dropped_queued", std::to_wstring(droppedQueuedEdits) });
+
+    if (importResult && FinishRatingsImportTransaction(result, changed)) {
+        FlushPendingMetadataEdits();
+        return;
+    }
+
+    if (result.storageShortfall) {
+        ShowMetadataStorageShortfall(*result.storageShortfall, Tr(result.label));
+    } else if (!inUseChanges.empty() && inUseChanges.size() == result.failureCount &&
+        !result.cancelled) {
+        // Every failure was a lock held by another app past the write-lane budget:
+        // values are rolled back; offer Retry (resubmit) or Skip (keep rollback).
+        inUseRetryLabel_ = result.label;
+        const std::wstring file = inUseChanges.size() == 1 ?
+            inUseChanges.front().before.path.filename().wstring() :
+            FillToken(Tr(L"{count} files"), L"{count}", std::to_wstring(inUseChanges.size()));
+        inUseRetryChanges_ = std::move(inUseChanges);
+        ShowGlassChoice(UserErrorTitle(quicksift::core::UserErrorCode::WriteInUseGaveUp),
+            UserErrorText(quicksift::core::UserErrorCode::WriteInUseGaveUp, file),
+            Tr(L"Retry"), PendingGlassAction::MetadataRetryInUse, Tr(L"Skip"),
+            GlassAlertKind::Warning);
+    } else if (result.failed || result.cancelled || result.failureCount > 0) {
+        std::wstring message;
+        if (!result.cancelled && singleFailureKind && !mixedFailureKinds &&
+            *singleFailureKind != quicksift::core::write_lane::WriteFailureKind::Other &&
+            *singleFailureKind != quicksift::core::write_lane::WriteFailureKind::Conflict) {
+            // One clear cause: the localized catalog message (detail stays in the log).
+            message = UserErrorText(quicksift::core::UserErrorForWriteFailure(*singleFailureKind),
+                firstFailedPath.filename().wstring());
+        } else {
+            message = Tr(result.detail.empty() ?
+                std::wstring(L"Some metadata items could not be written safely.") : result.detail);
+        }
         if (result.failureCount > 1)
-            message += L"\n\nTotal failed items: " + std::to_wstring(result.failureCount);
+            message += L"\n\n" + Tr(L"Total failed items:") + L" " + std::to_wstring(result.failureCount);
         if (result.conflictCount > 1)
-            message += L"\n\nExternal-change conflicts: " + std::to_wstring(result.conflictCount);
+            message += L"\n\n" + Tr(L"External-change conflicts:") + L" " + std::to_wstring(result.conflictCount);
+        if (droppedQueuedEdits > 0)
+            message += L"\n\n" + Tr(L"Edits made while this update was running were also undone:") +
+                L" " + std::to_wstring(droppedQueuedEdits);
         const bool offerReconcile = !result.cancelled && !externalConflictPaths.empty();
         if (offerReconcile) {
             OfferExternalChangeMetadataReconcile(message, std::move(externalConflictPaths),
                 conflictHistoryRelinquish);
         } else {
-            ShowGlassAlert(result.cancelled ? L"Metadata update cancelled" :
-                L"Metadata update incomplete", message,
+            ShowGlassAlertText(Tr(result.cancelled ? L"Metadata update cancelled" :
+                L"Metadata update incomplete"), message,
                 result.failed ? GlassAlertKind::Error : GlassAlertKind::Warning);
         }
-    } else {
-        ShowToast(result.label + L" update complete");
+    } else if (!result.urgent || pendingMetadataEdits_.Empty()) {
+        // Coalesced rapid edits: one toast when the lane settles, not per keystroke.
+        ShowToastText(FillToken(Tr(L"{label} update complete"), L"{label}", Tr(result.label)));
     }
+    FlushPendingMetadataEdits();
 }
 
     void QuickSiftApplicationImpl::RefreshMetadataFileState(PhotoItem& item, const fs::path& path) {
@@ -797,7 +1061,7 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
                     GlassAlertKind::Error);
                 return;
             }
-            if (!PreflightMetadataStorage(preview->before, L"Undo metadata")) return;
+            // Free-space preflight runs on the transaction thread (no UI stats).
 
             auto taken = historyStore_.TakeUndo();
             if (!taken) return;
@@ -889,7 +1153,7 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
                     GlassAlertKind::Error);
                 return;
             }
-            if (!PreflightMetadataStorage(preview->after, L"Redo metadata")) return;
+            // Free-space preflight runs on the transaction thread (no UI stats).
 
             auto taken = historyStore_.TakeRedo();
             if (!taken) return;
@@ -990,6 +1254,16 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         record.faceBlurScanned = photo.faceBlurScanned;
         record.faceBlurry = photo.faceBlurry;
         record.faceSharpness = photo.faceSharpness;
+        // In-memory qualities only ever come from the current analysis version.
+        if (photo.faceBlurScanned && photo.faceQualities.size() == photo.faces.size()) {
+            record.faceQualities = photo.faceQualities;
+            record.faceQualityVersion = quicksift::core::kFaceQualityAnalysisVersion;
+        }
+        // Selection knowledge is written only once hydrated or chosen this session;
+        // otherwise the cache keeps the stored selection (same fingerprint).
+        record.faceSelectionKnown = photo.faceSelectionKnown;
+        record.hasFaceSelection = photo.faceSelectionKnown && photo.faceSelection.has_value();
+        if (record.hasFaceSelection) record.faceSelection = *photo.faceSelection;
         record.exifText = exifText;
         // SQLite is intentionally kept off the UI thread. The worker deduplicates
         // repeated changes for the same path and preserves cached EXIF/faces when

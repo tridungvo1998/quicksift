@@ -22,7 +22,7 @@ struct ButtonDefinition {
     int minimumWidthDip = 0; // Used only by title-bar layout.
 };
 
-inline constexpr std::array<ButtonDefinition, 16> kTitleButtons{{
+inline constexpr std::array<ButtonDefinition, 16> kTitleButtons{{ // loc-keys-begin
     { command_id::ID_PICK_FOLDER, L"Open", 62 },
     { command_id::ID_MODE_THUMBS, L"Thumbnails", 92 },
     { command_id::ID_MODE_SINGLE, L"Single", 62 },
@@ -41,10 +41,12 @@ inline constexpr std::array<ButtonDefinition, 16> kTitleButtons{{
     { command_id::ID_FULLSCREEN, L"Fullscreen", 92 },
 }};
 
-inline constexpr std::array<ButtonDefinition, 3> kFileButtons{{
+inline constexpr std::array<ButtonDefinition, 5> kFileButtons{{
     { command_id::ID_COPY, L"Copy", 0 },
     { command_id::ID_MOVE, L"Move", 0 },
     { command_id::ID_DELETE, L"Delete", 0 },
+    { command_id::ID_RATINGS_EXCHANGE, L"Import / Export Ratings", 0 },
+    { command_id::ID_BATCH_PROCESSING, L"Batch Processing", 0 },
 }};
 
 inline constexpr std::array<ButtonDefinition, 3> kCullButtons{{
@@ -73,12 +75,18 @@ inline constexpr std::array<ButtonDefinition, 17> kSettingsButtons{{
     { command_id::ID_SETTING_LANGUAGE_SELECTOR, L"Language", 0 },
 }};
 
-inline constexpr std::array<ButtonDefinition, 5> kFilterButtons{{
+inline constexpr std::array<ButtonDefinition, 11> kFilterButtons{{
     { command_id::ID_STAR_FILTER, L"Stars: All", 0 },
     { command_id::ID_PICK_FILTER, L"Pick state: All", 0 },
     { command_id::ID_LABEL_FILTER, L"Labels: All", 0 },
     { command_id::ID_FORMATS, L"Format: All", 0 },
     { command_id::ID_DATE_FILTER, L"Date: Any", 0 },
+    { command_id::ID_ISO_FILTER, L"ISO: All", 0 },
+    { command_id::ID_APERTURE_FILTER, L"Aperture: All", 0 },
+    { command_id::ID_FOCAL_FILTER, L"Focal: All", 0 },
+    { command_id::ID_SHUTTER_FILTER, L"Shutter: All", 0 },
+    { command_id::ID_CAMERA_FILTER, L"Camera: All", 0 },
+    { command_id::ID_HOUR_FILTER, L"Hour: All", 0 },
 }};
 
 inline constexpr std::array<int, 6> kFlyoutTabIds{{
@@ -88,7 +96,7 @@ inline constexpr std::array<int, 6> kFlyoutTabIds{{
     command_id::ID_FLYOUT_TAB_FILTER,
     command_id::ID_FLYOUT_TAB_INFO,
     command_id::ID_FLYOUT_TAB_SETTINGS,
-}};
+}}; // loc-keys-end
 
 template <std::size_t Count>
 constexpr bool ContainsControlId(const std::array<ButtonDefinition, Count>& definitions,

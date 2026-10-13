@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "ui/ui_design_tokens.h"
+
 // Device-independent layout metrics shared by every QuickSift window and
 // custom control. Add or tune spacing here instead of scattering magic numbers
 // through drawing and layout code.
@@ -41,15 +43,21 @@ inline constexpr float kLeftPaneContentHideBlend = 0.68f;
 inline constexpr int kAutoHideRailWidthDip = kLeftPaneHitStripDip;
 
 // Shared button chrome metrics — PaintButton, width measure, and regions must agree.
-inline constexpr int kButtonRadiusDip = 10;
+inline constexpr int kButtonRadiusDip = tokens::kRadiusMedium;
 // Shared left-pane content surfaces (library list, EXIF panel, section headers).
-inline constexpr int kLeftPaneContentRadiusDip = 12;
+// Concentric with the open pane: kLeftPaneOpenRadiusDip minus the 10 DIP inset.
+inline constexpr int kLeftPaneContentRadiusDip = tokens::kRadiusMedium;
+// Left pane backdrop radius: kLeftPaneClosedRadiusDip on the hit strip, easing to
+// kLeftPaneOpenRadiusDip (the canvas radius) when fully open. Region and paint
+// both use LeftPaneBackdropRadiusDip() so the stroke always matches the HWND shape.
+inline constexpr int kLeftPaneClosedRadiusDip = tokens::kRadiusSmall;
+inline constexpr int kLeftPaneOpenRadiusDip = tokens::kRadiusXLarge;
 inline constexpr int kButtonTextPaddingDip = 12;
 inline constexpr int kTitleButtonTextPaddingDip = 14;
 inline constexpr int kButtonPopupChevronDip = 20;
 inline constexpr int kSidebarTabPadDip = 12;
-inline constexpr int kSidebarTabRadiusDip = 10;
-inline constexpr int kTextInputRadiusDip = 10;
+inline constexpr int kSidebarTabRadiusDip = tokens::kRadiusMedium;
+inline constexpr int kTextInputRadiusDip = tokens::kRadiusMedium;
 inline constexpr int kTextInputBorderInsetDip = 1;
 inline constexpr int kFolderPaneWidthDip = 306;
 inline constexpr int kInfoPaneWidthDip = 334;
@@ -57,6 +65,27 @@ inline constexpr int kFlyoutBarHeightDip = 52;
 inline constexpr float kThumbnailRailSafeInsetDip = 50.0f;
 inline constexpr int kExifPaneMinHeightDip = 190;
 inline constexpr int kOuterMarginDip = 12;
-inline constexpr int kPanelRadiusDip = 20;
+inline constexpr int kPanelRadiusDip = tokens::kRadiusXLarge;
+// Status bar: same family as the canvas so the two stacked surfaces read as one
+// window. PaintStatus and the status HWND region both use this value.
+inline constexpr int kStatusRadiusDip = tokens::kRadiusXLarge;
+// Thumbnail grid cards and Compare cards (one radius for both).
+inline constexpr int kCardRadiusDip = tokens::kRadiusLarge;
+// Document windows' content panel: small radius because it wraps a rectangular
+// rich-edit (2 DIP inset keeps the square control corners inside the curve).
+inline constexpr int kDocumentPanelRadiusDip = tokens::kRadiusSmall;
+inline constexpr int kToastRadiusDip = tokens::kRadiusLarge;
+// Alerts (in-canvas glass dialogs).
+inline constexpr int kAlertRadiusDip = tokens::kRadiusXLarge;
+// Dropdown popups when DWM cannot round them (Windows 10 region + painted border).
+inline constexpr int kPopupRadiusDip = tokens::kRadiusMedium;
+// Rounded inset selection inside menus and lists (macOS menu highlight).
+inline constexpr int kMenuSelectionRadiusDip = tokens::kRadiusSmall;
+inline constexpr int kMenuSelectionInsetDip = 4;
+// Small square controls (filmstrip toggle), compact labels.
+inline constexpr int kCompactControlRadiusDip = tokens::kRadiusMedium;
+inline constexpr int kLabelRadiusDip = tokens::kRadiusSmall;
+// HUD / overlay panels drawn on the canvas.
+inline constexpr int kOverlayPanelRadiusDip = tokens::kRadiusMedium;
 
 } // namespace quicksift::ui::layout

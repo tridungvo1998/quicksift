@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace quicksift::ui::framework {
 namespace {
@@ -23,7 +25,7 @@ void MacOsUiFramework::PaintThemeGlyph(HDC dc, const RECT& rect, COLORREF color,
     Gdiplus::Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    const float lineWidth = static_cast<float>(std::max(1, ScaleDip(1, dpi)));
+    const float lineWidth = StrokePx(tokens::kIconStroke, dpi);
     Gdiplus::Pen pen(ToGpColor(color), lineWidth);
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
@@ -58,9 +60,10 @@ void MacOsUiFramework::PaintChevron(HDC dc, const RECT& rect, COLORREF color, UI
     Gdiplus::Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    Gdiplus::Pen pen(ToGpColor(color), static_cast<float>(std::max(1, ScaleDip(1, dpi))));
+    Gdiplus::Pen pen(ToGpColor(color), StrokePx(tokens::kIconStroke, dpi));
     pen.SetStartCap(Gdiplus::LineCapRound);
     pen.SetEndCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
     const float cx = static_cast<float>((rect.left + rect.right) / 2);
     const float cy = static_cast<float>((rect.top + rect.bottom) / 2);
     graphics.DrawLine(&pen, cx - ScaleDip(3, dpi), cy - ScaleDip(1, dpi),
@@ -88,13 +91,14 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
     const float hoverEase = Smoothstep01(hoverBlend);
     const float pressEase = Smoothstep01(pressBlend);
 
-    // Light press scale: inset the chrome a couple DIPs so pressed/keyboard-armed
-    // buttons respond without per-frame bitmap effects.
+    // Subtle macOS press: ~1 DIP inset (≈0.97 scale on a 32 DIP button) plus a
+    // darken (lighten in dark mode) of the existing fill, no per-frame bitmap effects.
     if (pressEase > 0.0f && !header) {
-        const int inset = std::max(1, static_cast<int>(std::lround(
-            static_cast<float>(ScaleDip(2, dpi)) * pressEase)));
-        InflateRect(&rect, -inset, -inset);
+        const int inset = static_cast<int>(std::lround(
+            static_cast<float>(ScaleDip(1, dpi)) * pressEase));
+        if (inset > 0) InflateRect(&rect, -inset, -inset);
     }
+    const tokens::GlassMaterial material = tokens::Glass(palette.dark, CurrentVisualEffects());
 
     using quicksift::ui::layout::kButtonRadiusDip;
     using quicksift::ui::layout::kButtonTextPaddingDip;
@@ -113,16 +117,19 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
         border = BlendColor(border, BlendColor(palette.accent, palette.border, 0.42f), hoverEase);
     }
     if (pressEase > 0.0f) {
-        const COLORREF pressedFill = BlendColor(palette.accent,
-            palette.dark ? RGB(0, 0, 0) : RGB(255, 255, 255), palette.dark ? 0.08f : 0.12f);
+        const COLORREF pressedFill = BlendColor(fill,
+            palette.dark ? RGB(255, 255, 255) : RGB(0, 0, 0), palette.dark ? 0.10f : 0.08f);
         fill = BlendColor(fill, pressedFill, pressEase);
-        border = BlendColor(border, palette.accentBorder, pressEase);
-        text = BlendColor(text, RGB(255, 255, 255), pressEase);
+        border = BlendColor(border, BlendColor(palette.accent, palette.border, 0.42f), pressEase);
     }
     if (state.selected) {
         fill = palette.accent;
         border = palette.accentBorder;
-        text = RGB(255, 255, 255);
+        text = palette.accentText;
+        if (pressEase > 0.0f) {
+            fill = BlendColor(fill, palette.dark ? RGB(255, 255, 255) : RGB(0, 0, 0),
+                0.10f * pressEase);
+        }
     }
     if (danger) {
         const COLORREF dangerIdle = BlendColor(palette.danger, surface, 0.22f);
@@ -149,10 +156,18 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        // Erase with the SAME rounded shape as the chrome. A rectangular FillSolidRect
-        // previously peeked behind pill corners as a dark mismatched underlay.
-        FillRoundedRectGp(graphics, sourceRect, static_cast<float>(radius), ToGpColor(surface));
-        if (!header && !title && pressEase < 0.85f) {
+        if (presentation.parentSurface) {
+            // Parent-coloured corners: the whole item rect starts as the real parent
+            // surface, so the AA pill edge blends into it (no halo, no fringe
+            // accumulation across hover repaints). Paired with the slack region.
+            Gdiplus::SolidBrush parentBrush(ToGpColor(static_cast<COLORREF>(*presentation.parentSurface)));
+            graphics.FillRectangle(&parentBrush, ToGpRect(sourceRect));
+        } else {
+            // Erase with the SAME rounded shape as the chrome. A rectangular FillSolidRect
+            // previously peeked behind pill corners as a dark mismatched underlay.
+            FillRoundedRectGp(graphics, sourceRect, static_cast<float>(radius), ToGpColor(surface));
+        }
+        if (!header && !title && pressEase < 0.85f && !palette.highContrast) {
             RECT shadow = rect;
             // Keep shadow bounds identical to the fill (same width/height/radius); only
             // offset vertically so the underlay cannot read as a smaller-radius block.
@@ -167,19 +182,22 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
                 palette.dark ? RGB(255, 255, 255) : RGB(255, 255, 255),
                 palette.dark ? 0.06f : 0.10f);
             FillRoundedRectGp(graphics, rect, static_cast<float>(radius), ToGpColor(fill));
+            const bool glass = material.sheenAlpha > 0.0f;
             RECT highlight = rect;
             highlight.bottom = highlight.top + std::max(2, static_cast<int>((highlight.bottom - highlight.top) / 2));
             // Approximate highlight with a shorter rounded fill; clamp radius to half-height.
             const int highlightRadius = std::min(radius,
                 std::max(1, static_cast<int>((highlight.bottom - highlight.top) / 2)));
-            FillRoundedRectGp(graphics, highlight, static_cast<float>(highlightRadius),
-                ToGpColor(topFill, static_cast<BYTE>(palette.dark ? 40 : 55)));
+            if (glass) {
+                FillRoundedRectGp(graphics, highlight, static_cast<float>(highlightRadius),
+                    ToGpColor(topFill, static_cast<BYTE>(palette.dark ? 40 : 55)));
+            }
             // Outer border + subtle inner edge for depth.
             DrawRoundedRectGp(graphics, rect, static_cast<float>(radius), ToGpColor(border),
                 static_cast<float>(std::max(1, ScaleDip(1, dpi))));
             RECT inner = rect;
             InflateRect(&inner, -ScaleDip(1, dpi), -ScaleDip(1, dpi));
-            if (inner.right > inner.left && inner.bottom > inner.top) {
+            if (glass && inner.right > inner.left && inner.bottom > inner.top) {
                 const COLORREF innerEdge = BlendColor(fill,
                     palette.dark ? RGB(255, 255, 255) : RGB(255, 255, 255),
                     palette.dark ? 0.10f : 0.28f);
@@ -225,19 +243,24 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
     }
 
     if (state.focused && !state.disabled && !header) {
-        // Dual focus ring: soft outer glow + crisp inner accent.
-        RECT outer = rect;
-        InflateRect(&outer, ScaleDip(1, dpi), ScaleDip(1, dpi));
-        RECT inner = rect;
-        InflateRect(&inner, -ScaleDip(2, dpi), -ScaleDip(2, dpi));
-        {
-            Gdiplus::Graphics graphics(dc);
-            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-            const COLORREF ring = state.selected ? RGB(255, 255, 255) : palette.accent;
-            DrawRoundedRectGp(graphics, outer, static_cast<float>(radius + ScaleDip(1, dpi)),
-                ToGpColor(ring, 90), static_cast<float>(std::max(2, ScaleDip(2, dpi))));
-            DrawRoundedRectGp(graphics, inner, static_cast<float>(std::max(1, radius - ScaleDip(1, dpi))),
-                ToGpColor(ring, 220), static_cast<float>(std::max(1, ScaleDip(1, dpi))));
+        // macOS-style ring hugging the shape. A child HWND cannot draw outside its
+        // client (the old outer glow was inflated past it and clipped flat on every
+        // side), so the ring occupies the outermost kFocusRingWidth of the control,
+        // concentric with the chrome and replacing its border. On accent-filled
+        // (selected) buttons the ring sits just inside in the accent text colour.
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        const float ringWidth = StrokePx(tokens::kFocusRingWidth, dpi);
+        if (state.selected) {
+            RECT inner = rect;
+            const int inset = ScaleDip(2, dpi);
+            InflateRect(&inner, -inset, -inset);
+            DrawRoundedRectGp(graphics, inner, static_cast<float>(std::max(1, radius - inset)),
+                ToGpColor(palette.accentText, 220), StrokePx(tokens::kHairline, dpi));
+        } else {
+            DrawRoundedRectGp(graphics, rect, static_cast<float>(radius),
+                ToGpColor(palette.accent, palette.highContrast ? 255 : 210), ringWidth);
         }
     }
     SelectObject(dc, oldFont);
@@ -290,7 +313,8 @@ void MacOsUiFramework::PaintLabel(HDC dc, const RECT& rect,
     const LabelPresentation& presentation, const ThemePalette& palette,
     UINT dpi, HFONT normalFont, HFONT semiboldFont) const {
     if (!dc) return;
-    FillRoundedRect(dc, rect, ScaleDip(13, dpi), palette.panelStrong, palette.border);
+    FillRoundedRect(dc, rect, ScaleDip(quicksift::ui::layout::kLabelRadiusDip, dpi) * 2,
+        palette.panelStrong, palette.border);
     RECT textRect = rect;
     textRect.left += ScaleDip(presentation.horizontalPaddingDip, dpi);
     textRect.right -= ScaleDip(8, dpi);
@@ -309,8 +333,18 @@ void MacOsUiFramework::PaintSectionTitle(HDC dc, const RECT& rect, std::wstring_
     const int radius = ScaleDip(kButtonRadiusDip, dpi);
     // Opaque rounded chrome so section headers match photo-details / inputs / buttons
     // instead of a sharp rectangular strip behind the label text.
-    FillRoundedRect(dc, rect, radius, palette.panelStrong,
-        BlendColor(palette.border, palette.panelStrong, 0.18f));
+    {
+        // Section headers sit on the panelStrong flyout surface: paint the whole
+        // item rect with it (parent-coloured corners) and stroke an AA border at the
+        // same radius as the (slack) window region.
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::SolidBrush surface(ToGpColor(palette.panelStrong));
+        graphics.FillRectangle(&surface, ToGpRect(rect));
+        DrawRoundedRectGp(graphics, rect, static_cast<float>(radius),
+            ToGpColor(BlendColor(palette.border, palette.panelStrong, 0.18f)), 1.0f);
+    }
     RECT textRect = rect;
     textRect.left += ScaleDip(14, dpi);
     textRect.right -= ScaleDip(10, dpi);
@@ -361,33 +395,47 @@ void MacOsUiFramework::PaintStatus(HDC dc, const RECT& sourceRect,
     if (!dc) return;
 
     const auto paintContents = [&](HDC target, const RECT& rect) {
-        PaintPanel(target, rect, PanelPresentation{ false, false, 18 }, palette, dpi);
+        // Parent-coloured corners + the same radius as the HWND region's visual
+        // shape (layout uses ApplyAntialiasedControlRegion with kStatusRadiusDip).
+        // The buffer used to start black, so the region/paint radius mismatch
+        // (17 vs 18) left dark specks in the corners on the light theme.
+        PaintSolidSurface(target, rect, presentation.parentSurface == CLR_INVALID
+            ? palette.windowBottom : presentation.parentSurface);
+        PaintPanel(target, rect, PanelPresentation{ false, false, quicksift::ui::layout::kStatusRadiusDip },
+            palette, dpi);
 
         const int iconSize = ScaleDip(18, dpi);
         RECT iconRect{ rect.left + ScaleDip(13, dpi),
             rect.top + (rect.bottom - rect.top - iconSize) / 2,
             rect.left + ScaleDip(13, dpi) + iconSize,
             rect.top + (rect.bottom - rect.top + iconSize) / 2 };
-        HBRUSH iconBrush = CreateSolidBrush(BlendColor(palette.panelStrong, palette.accent, 0.10f));
-        HPEN iconPen = CreatePen(PS_SOLID, std::max(1, ScaleDip(1, dpi)), palette.accent);
-        if (iconBrush && iconPen) {
-            HGDIOBJ oldBrush = SelectObject(target, iconBrush);
-            HGDIOBJ oldPen = SelectObject(target, iconPen);
-            Ellipse(target, iconRect.left, iconRect.top, iconRect.right, iconRect.bottom);
-            SelectObject(target, oldBrush);
-            SelectObject(target, oldPen);
-        }
-        if (iconBrush) DeleteObject(iconBrush);
-        if (iconPen) DeleteObject(iconPen);
-
-        HPEN checkPen = CreatePen(PS_SOLID, std::max(1, ScaleDip(2, dpi)), palette.accent);
-        if (checkPen) {
-            HGDIOBJ oldPen = SelectObject(target, checkPen);
-            MoveToEx(target, iconRect.left + ScaleDip(4, dpi), iconRect.top + ScaleDip(9, dpi), nullptr);
-            LineTo(target, iconRect.left + ScaleDip(8, dpi), iconRect.top + ScaleDip(13, dpi));
-            LineTo(target, iconRect.left + ScaleDip(14, dpi), iconRect.top + ScaleDip(5, dpi));
-            SelectObject(target, oldPen);
-            DeleteObject(checkPen);
+        {
+            // Anti-aliased status badge (was GDI Ellipse + MoveToEx/LineTo).
+            Gdiplus::Graphics graphics(target);
+            graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+            graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+            const float penWidth = StrokePx(tokens::kHairline, dpi);
+            Gdiplus::RectF circle = ToGpRect(iconRect);
+            circle.X += penWidth * 0.5f;
+            circle.Y += penWidth * 0.5f;
+            circle.Width -= penWidth;
+            circle.Height -= penWidth;
+            Gdiplus::SolidBrush iconFill(ToGpColor(BlendColor(palette.panelStrong, palette.accent, 0.10f)));
+            graphics.FillEllipse(&iconFill, circle);
+            Gdiplus::Pen ring(ToGpColor(palette.accent), penWidth);
+            graphics.DrawEllipse(&ring, circle);
+            Gdiplus::Pen check(ToGpColor(palette.accent), StrokePx(tokens::kIconStroke, dpi));
+            check.SetStartCap(Gdiplus::LineCapRound);
+            check.SetEndCap(Gdiplus::LineCapRound);
+            check.SetLineJoin(Gdiplus::LineJoinRound);
+            const Gdiplus::PointF points[3]{
+                Gdiplus::PointF(static_cast<float>(iconRect.left + ScaleDip(4, dpi)),
+                    static_cast<float>(iconRect.top + ScaleDip(9, dpi))),
+                Gdiplus::PointF(static_cast<float>(iconRect.left + ScaleDip(8, dpi)),
+                    static_cast<float>(iconRect.top + ScaleDip(13, dpi))),
+                Gdiplus::PointF(static_cast<float>(iconRect.left + ScaleDip(14, dpi)),
+                    static_cast<float>(iconRect.top + ScaleDip(5, dpi))) };
+            graphics.DrawLines(&check, points, 3);
         }
 
         RECT textRect = rect;
@@ -461,7 +509,7 @@ int MacOsUiFramework::MeasureVerticalTabTextExtent(std::wstring_view text, UINT 
 
     Gdiplus::Graphics graphics(dc);
     graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    Gdiplus::Font font(L"Segoe UI", static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
+    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
         Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::StringFormat format;
     format.SetFormatFlags(Gdiplus::StringFormatFlagsNoClip);
@@ -487,8 +535,11 @@ void MacOsUiFramework::PaintVerticalTab(HDC dc, const RECT& rect, std::wstring_v
     const COLORREF baseBorder = BlendColor(palette.border, palette.panelStrong, 0.18f);
     const COLORREF surface = BlendColor(baseSurface, palette.accent, activeBlend);
     const COLORREF border = BlendColor(baseBorder, palette.accentBorder, activeBlend);
-    FillRoundedRectGp(graphics, rect, static_cast<float>(ScaleDip(10, dpi)), ToGpColor(surface));
-    DrawRoundedRectGp(graphics, rect, static_cast<float>(ScaleDip(10, dpi)),
+    // The tab HWND uses an aliased rounded region of the same radius; the 2 px (at
+    // 100%) border deliberately covers the region staircase, so it stays.
+    const float verticalTabRadius = static_cast<float>(ScaleDip(quicksift::ui::layout::kSidebarTabRadiusDip, dpi));
+    FillRoundedRectGp(graphics, rect, verticalTabRadius, ToGpColor(surface));
+    DrawRoundedRectGp(graphics, rect, verticalTabRadius,
         ToGpColor(border), static_cast<float>(std::max(2, ScaleDip(1, dpi))));
 
     const Gdiplus::GraphicsState state = graphics.Save();
@@ -496,9 +547,12 @@ void MacOsUiFramework::PaintVerticalTab(HDC dc, const RECT& rect, std::wstring_v
     const float cy = static_cast<float>((rect.top + rect.bottom) / 2);
     graphics.TranslateTransform(cx, cy);
     graphics.RotateTransform(-90.0f);
-    Gdiplus::Font font(L"Segoe UI", static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
+    // Grid-fitted ClearType cannot be used on rotated text; grayscale AA keeps the
+    // rotated label smooth instead of the system default (aliased on some setups).
+    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
         Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, RGB(255, 255, 255), activeBlend)));
+    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, palette.accentText, activeBlend)));
     Gdiplus::StringFormat format;
     format.SetAlignment(Gdiplus::StringAlignmentCenter);
     format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -530,9 +584,9 @@ void MacOsUiFramework::PaintSidebarTab(HDC dc, const RECT& rect, std::wstring_vi
     DrawRoundedRectGp(graphics, rect, tabRadius,
         ToGpColor(border), static_cast<float>(std::max(2, ScaleDip(1, dpi))));
 
-    Gdiplus::Font font(L"Segoe UI", static_cast<Gdiplus::REAL>(ScaleDip(10, dpi)),
+    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(10, dpi)),
         Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, RGB(255, 255, 255), activeBlend)));
+    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, palette.accentText, activeBlend)));
     Gdiplus::StringFormat format;
     format.SetAlignment(Gdiplus::StringAlignmentNear);
     format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
@@ -562,11 +616,26 @@ void MacOsUiFramework::PaintMenuItem(HDC dc, const RECT& rect, const MenuItem& i
         FillSolidRect(dc, rect, palette.menu);
         HFONT oldFont = nullptr;
         if (!SelectFontObject(dc, font, oldFont)) return;
+        // One semibold derivative per source font (was CreateFontIndirectW +
+        // DeleteObject on every header paint, i.e. every hover repaint).
+        // Keyed by the LOGFONT (not the HFONT value, which GDI may reuse after
+        // a DPI change recreates the UI fonts). UI thread only.
+        static LOGFONTW cachedKey{};
+        static HFONT cachedHeader = nullptr;
+        HFONT activeFont = font;
         LOGFONTW lf{};
-        GetObjectW(font, sizeof(lf), &lf);
-        lf.lfWeight = FW_SEMIBOLD;
-        HFONT headerFont = CreateFontIndirectW(&lf);
-        HFONT activeFont = headerFont ? headerFont : font;
+        if (font && GetObjectW(font, sizeof(lf), &lf) == sizeof(lf)) {
+            lf.lfWeight = FW_SEMIBOLD;
+            if (!cachedHeader || std::memcmp(&lf, &cachedKey, sizeof(lf)) != 0) {
+                HFONT created = CreateFontIndirectW(&lf);
+                if (created) {
+                    if (cachedHeader) DeleteObject(cachedHeader);
+                    cachedHeader = created;
+                    cachedKey = lf;
+                }
+            }
+            if (cachedHeader && std::memcmp(&lf, &cachedKey, sizeof(lf)) == 0) activeFont = cachedHeader;
+        }
         SelectObject(dc, activeFont);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, palette.muted);
@@ -576,14 +645,27 @@ void MacOsUiFramework::PaintMenuItem(HDC dc, const RECT& rect, const MenuItem& i
         DrawTextW(dc, item.text.c_str(), -1, &textRect,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(dc, oldFont);
-        if (headerFont) DeleteObject(headerFont);
         return;
     }
-    FillSolidRect(dc, rect, selected ? palette.menuSelected : palette.menu);
+    FillSolidRect(dc, rect, palette.menu);
+    if (selected) {
+        // macOS menu highlight: a rounded selection inset from the menu edges.
+        RECT highlight = rect;
+        InflateRect(&highlight, -ScaleDip(quicksift::ui::layout::kMenuSelectionInsetDip, dpi) / 2, 0);
+        highlight.top += std::max(1, ScaleDip(1, dpi));
+        highlight.bottom -= std::max(1, ScaleDip(1, dpi));
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        FillRoundedRectGp(graphics, highlight,
+            static_cast<float>(ScaleDip(quicksift::ui::layout::kMenuSelectionRadiusDip, dpi)),
+            ToGpColor(palette.menuSelected));
+    }
     HFONT oldFont = nullptr;
     if (!SelectFontObject(dc, font, oldFont)) return;
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, item.destructive ? palette.dangerBorder : palette.text);
+    SetTextColor(dc, item.destructive ? palette.dangerBorder :
+        (selected ? MenuSelectedTextColor(palette) : palette.text));
     RECT textRect = rect;
     textRect.left += ScaleDip(36, dpi);
     textRect.right -= ScaleDip(10, dpi);
@@ -592,15 +674,20 @@ void MacOsUiFramework::PaintMenuItem(HDC dc, const RECT& rect, const MenuItem& i
     if (item.checked) {
         RECT mark{ rect.left + ScaleDip(12, dpi), rect.top + ScaleDip(9, dpi),
             rect.left + ScaleDip(24, dpi), rect.bottom - ScaleDip(9, dpi) };
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, ScaleDip(2, dpi)), palette.accent);
-        if (pen) {
-            HGDIOBJ oldPen = SelectObject(dc, pen);
-            MoveToEx(dc, mark.left, (mark.top + mark.bottom) / 2, nullptr);
-            LineTo(dc, mark.left + ScaleDip(4, dpi), mark.bottom);
-            LineTo(dc, mark.right, mark.top);
-            SelectObject(dc, oldPen);
-            DeleteObject(pen);
-        }
+        // Anti-aliased check mark (was GDI MoveToEx/LineTo).
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        Gdiplus::Pen pen(ToGpColor(selected && palette.highContrast ? MenuSelectedTextColor(palette)
+            : palette.accent), StrokePx(tokens::kIconStroke, dpi));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        const Gdiplus::PointF points[3]{
+            Gdiplus::PointF(static_cast<float>(mark.left), static_cast<float>((mark.top + mark.bottom) / 2)),
+            Gdiplus::PointF(static_cast<float>(mark.left + ScaleDip(4, dpi)), static_cast<float>(mark.bottom)),
+            Gdiplus::PointF(static_cast<float>(mark.right), static_cast<float>(mark.top)) };
+        graphics.DrawLines(&pen, points, 3);
     }
     SelectObject(dc, oldFont);
 }
@@ -609,14 +696,15 @@ void MacOsUiFramework::PaintCenteredMutedText(HDC dc, const RECT& rect, std::wst
     const ThemePalette& palette, UINT dpi, HFONT font) const {
     (void)dpi;
     if (!dc || IsRectEmpty(&rect)) return;
-    FillSolidRect(dc, rect, palette.panel);
+    // Text only: the caller owns the surface (the library list's empty state used
+    // to lose its rounded border because this filled the whole rect).
     HFONT oldFont = nullptr;
     if (!SelectFontObject(dc, font, oldFont)) return;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, palette.muted);
     RECT textRect = rect;
     DrawTextW(dc, text.data(), static_cast<int>(text.size()), &textRect,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(dc, oldFont);
 }
 
@@ -638,10 +726,160 @@ void MacOsUiFramework::PaintSolidSurface(HDC dc, const RECT& rect,
     FillSolidRect(dc, rect, color);
 }
 
+MacOsUiFramework::~MacOsUiFramework() {
+    ClearPaneFrost();
+}
+
+void MacOsUiFramework::ClearPaneFrost() noexcept {
+    if (paneFrostDc_ && paneFrostPrevious_) SelectObject(paneFrostDc_, paneFrostPrevious_);
+    if (paneFrostBitmap_) DeleteObject(paneFrostBitmap_);
+    if (paneFrostDc_) DeleteDC(paneFrostDc_);
+    paneFrostDc_ = nullptr;
+    paneFrostBitmap_ = nullptr;
+    paneFrostPrevious_ = nullptr;
+    paneFrostWidth_ = 0;
+    paneFrostHeight_ = 0;
+}
+
+void MacOsUiFramework::SetPaneFrost(const frost::Image& image) {
+    if (!image.Valid()) {
+        ClearPaneFrost();
+        return;
+    }
+    if (!paneFrostBitmap_ || paneFrostWidth_ != image.width || paneFrostHeight_ != image.height) {
+        ClearPaneFrost();
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = image.width;
+        info.bmiHeader.biHeight = -image.height; // top-down, same row order as frost::Image
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HDC dc = CreateCompatibleDC(nullptr);
+        HBITMAP bitmap = dc ? CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+        HGDIOBJ previous = bitmap ? SelectObject(dc, bitmap) : nullptr;
+        if (!dc || !bitmap || !bits || !previous || previous == HGDI_ERROR) {
+            if (bitmap) DeleteObject(bitmap);
+            if (dc) DeleteDC(dc);
+            return;
+        }
+        paneFrostDc_ = dc;
+        paneFrostBitmap_ = bitmap;
+        paneFrostPrevious_ = previous;
+        paneFrostWidth_ = image.width;
+        paneFrostHeight_ = image.height;
+    }
+    DIBSECTION section{};
+    if (GetObjectW(paneFrostBitmap_, sizeof(section), &section) != sizeof(section) || !section.dsBm.bmBits) {
+        ClearPaneFrost();
+        return;
+    }
+    GdiFlush();
+    auto* rows = static_cast<std::uint8_t*>(section.dsBm.bmBits);
+    const std::size_t rowBytes = static_cast<std::size_t>(image.width) * 4u;
+    const std::size_t stride = static_cast<std::size_t>(section.dsBm.bmWidthBytes);
+    for (int y = 0; y < image.height; ++y) {
+        std::memcpy(rows + static_cast<std::size_t>(y) * stride,
+            image.pixels.data() + static_cast<std::size_t>(y) * static_cast<std::size_t>(image.width), rowBytes);
+    }
+}
+
+void MacOsUiFramework::PaintPaneFrost(HDC dc, const RECT& dest, POINT source,
+    COLORREF fallback) const {
+    if (!dc || IsRectEmpty(&dest)) return;
+    const int width = static_cast<int>(dest.right - dest.left);
+    const int height = static_cast<int>(dest.bottom - dest.top);
+    // Intersection of the requested slice with the frost image.
+    const int sx0 = std::max(0, static_cast<int>(source.x));
+    const int sy0 = std::max(0, static_cast<int>(source.y));
+    const int sx1 = std::min(paneFrostWidth_, static_cast<int>(source.x) + width);
+    const int sy1 = std::min(paneFrostHeight_, static_cast<int>(source.y) + height);
+    const bool any = paneFrostDc_ && sx1 > sx0 && sy1 > sy0;
+    const bool covers = any && sx0 == source.x && sy0 == source.y &&
+        sx1 - sx0 == width && sy1 - sy0 == height;
+    if (!covers) FillSolidRect(dc, dest, fallback);
+    if (any) {
+        BitBlt(dc, dest.left + (sx0 - source.x), dest.top + (sy0 - source.y),
+            sx1 - sx0, sy1 - sy0, paneFrostDc_, sx0, sy0, SRCCOPY);
+    }
+}
+
+void MacOsUiFramework::PaintFrostedPanelChrome(HDC dc, const RECT& rect, int radiusDip, bool wash,
+    const ThemePalette& palette, UINT dpi) const {
+    if (!dc || IsRectEmpty(&rect)) return;
+    const int radius = ScaleDip(radiusDip, dpi);
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    if (wash && !palette.highContrast) {
+        RECT highlight = rect;
+        const int height = std::max(1, static_cast<int>(rect.bottom - rect.top));
+        highlight.bottom = highlight.top + std::max(2, std::min(height / 2, ScaleDip(120, dpi)));
+        const int highlightRadius = std::min(radius,
+            std::max(1, static_cast<int>((highlight.bottom - highlight.top) / 2)));
+        const COLORREF topWash = BlendColor(palette.panelStrong, RGB(255, 255, 255),
+            palette.dark ? 0.08f : 0.14f);
+        FillRoundedRectGp(graphics, highlight, static_cast<float>(highlightRadius),
+            ToGpColor(topWash, static_cast<BYTE>(palette.dark ? 28 : 40)));
+    }
+    DrawRoundedRectGp(graphics, rect, static_cast<float>(radius),
+        ToGpColor(BlendColor(palette.border, palette.panelStrong, 0.18f)), 1.0f);
+}
+
+void MacOsUiFramework::PaintBuffered(HDC target, const RECT& rect,
+    const std::function<void(HDC, const RECT&)>& paint) const {
+    if (!target || !paint) return;
+    const int width = std::max(0, static_cast<int>(rect.right - rect.left));
+    const int height = std::max(0, static_cast<int>(rect.bottom - rect.top));
+    if (width == 0 || height == 0) return;
+    HDC buffer = CreateCompatibleDC(target);
+    HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, width, height) : nullptr;
+    HGDIOBJ previous = bitmap ? SelectObject(buffer, bitmap) : nullptr;
+    if (!buffer || !bitmap || !previous || previous == HGDI_ERROR) {
+        if (bitmap) DeleteObject(bitmap);
+        if (buffer) DeleteDC(buffer);
+        paint(target, rect); // unbuffered fallback (low memory)
+        return;
+    }
+    const RECT local{ 0, 0, width, height };
+    paint(buffer, local);
+    BitBlt(target, rect.left, rect.top, width, height, buffer, 0, 0, SRCCOPY);
+    SelectObject(buffer, previous);
+    DeleteObject(bitmap);
+    DeleteDC(buffer);
+}
+
+void MacOsUiFramework::PaintItemBuffered(const DRAWITEMSTRUCT& draw,
+    const std::function<void(HDC, const RECT&)>& background,
+    const std::function<void(const DRAWITEMSTRUCT&)>& paint) const {
+    if (!draw.hDC || !paint) return;
+    PaintBuffered(draw.hDC, draw.rcItem, [&](HDC dc, const RECT& local) {
+        if (background) background(dc, local);
+        DRAWITEMSTRUCT copy = draw;
+        copy.hDC = dc;
+        copy.rcItem = local;
+        paint(copy);
+    });
+}
+
 void MacOsUiFramework::PaintRoundedShadow(HDC dc, const RECT& rect, int radius,
     COLORREF color) const {
     if (!dc || IsRectEmpty(&rect)) return;
     FillRoundedRect(dc, rect, std::max(0, radius), color, color);
+}
+
+namespace {
+COLORREF TitleBarTopColor(const ThemePalette& palette) noexcept {
+    return BlendColor(palette.toolbar, palette.windowTop, palette.dark ? 0.12f : 0.22f);
+}
+COLORREF TitleBarBottomColor(const ThemePalette& palette) noexcept {
+    return BlendColor(TitleBarTopColor(palette), palette.windowBottom, palette.dark ? 0.06f : 0.10f);
+}
+} // namespace
+
+COLORREF MacOsUiFramework::TitleBarSurfaceColor(const ThemePalette& palette) noexcept {
+    return BlendColor(TitleBarTopColor(palette), TitleBarBottomColor(palette), 0.5f);
 }
 
 void MacOsUiFramework::PaintTitleBar(HDC dc, const RECT& client, int height,
@@ -665,10 +903,8 @@ void MacOsUiFramework::PaintTitleBar(HDC dc, const RECT& client, int height,
     }
 
     RECT titleRect{ 0, 0, width, height };
-    const COLORREF titleFill = BlendColor(palette.toolbar, palette.windowTop,
-        palette.dark ? 0.12f : 0.22f);
-    const COLORREF titleBottom = BlendColor(titleFill, palette.windowBottom,
-        palette.dark ? 0.06f : 0.10f);
+    const COLORREF titleFill = TitleBarTopColor(palette);
+    const COLORREF titleBottom = TitleBarBottomColor(palette);
     FillVerticalGradient(bufferDc, titleRect, titleFill, titleBottom);
 
     {
@@ -732,10 +968,13 @@ void MacOsUiFramework::PaintOverlayScrollbar(HDC dc, const RECT& thumb,
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
     if ((hot || dragging) && !IsRectEmpty(&track)) {
-        FillRoundedRectGp(graphics, track, static_cast<float>(ScaleDip(3, dpi)),
+        FillRoundedRectGp(graphics, track, static_cast<float>(
+            std::min(track.right - track.left, track.bottom - track.top)) * 0.5f,
             ToGpColor(BlendColor(palette.border, palette.panel, 0.55f), 90));
     }
-    FillRoundedRectGp(graphics, thumb, static_cast<float>(ScaleDip(3, dpi)),
+    (void)dpi;
+    FillRoundedRectGp(graphics, thumb, static_cast<float>(
+        std::min(thumb.right - thumb.left, thumb.bottom - thumb.top)) * 0.5f,
         ToGpColor(dragging ? palette.accent : palette.muted,
             hot || dragging ? 190 : 120));
 }

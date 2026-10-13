@@ -21,10 +21,14 @@ namespace quicksift::app {
         if (message.hwnd != hwnd_ && !IsChild(hwnd_, message.hwnd)) return false;
         const UINT key = static_cast<UINT>(message.wParam);
         if (uiFramework_.Alerts().Visible()) {
-            if (key == VK_ESCAPE) DismissGlassAlert();
-            else if (key == VK_RETURN || key == VK_SPACE) ConfirmGlassAlert();
+            HandleGlassAlertKey(key, GetKeyState(VK_SHIFT) < 0);
             return true;
         }
+        // Thumbnail search: Ctrl+F, and Esc/Enter/Tab/Down inside the field. Every other
+        // key typed in the search field stays local (no global shortcuts, not even
+        // Ctrl+Z/Y, rating digits or P/X/U).
+        if (HandleSearchKey(message)) return true;
+        if (searchInput_ && message.hwnd == searchInput_ && key != VK_F11) return false;
         if (key == VK_F11) {
             ToggleFullscreen();
             return true;
@@ -36,6 +40,10 @@ namespace quicksift::app {
         const bool globalShortcut = ctrl && (key == L'Z' || key == L'Y');
         const bool globalTag = (key >= L'0' && key <= L'9') || key == L'P' || key == L'X' || key == L'U';
         if (!globalNavigation && !globalShortcut && !globalTag) return false;
+        // Framework text inputs (the comment field) own typing, caret and Delete
+        // keys; only Esc and the Ctrl shortcuts stay global there.
+        if (!globalShortcut && key != VK_ESCAPE &&
+            quicksift::ui::framework::MacOsUiFramework::IsTextInput(message.hwnd)) return false;
         MarkInteraction();
         OnKeyDown(key, ctrl, shift);
         return true;
@@ -411,8 +419,8 @@ namespace quicksift::app {
         const LONG_PTR fullscreenStyle = preFullscreenStyle_ &
             ~static_cast<LONG_PTR>(WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
         SetWindowLongPtrW(hwnd_, GWL_STYLE, fullscreenStyle);
-        const int noRoundCorners = 1; // DWMWCP_DONOTROUND on Windows 11.
-        DwmSetWindowAttribute(hwnd_, 33, &noRoundCorners, sizeof(noRoundCorners));
+        quicksift::ui::framework::MacOsUiFramework::ApplyWindowChrome(hwnd_,
+            quicksift::ui::framework::WindowChromeKind::Fullscreen, Palette());
 
         const RECT& monitor = monitorInfo.rcMonitor;
         SetWindowPos(hwnd_, HWND_TOP, monitor.left, monitor.top,
@@ -436,8 +444,8 @@ namespace quicksift::app {
         pressedTrafficLight_ = TrafficLight::None;
         SetWindowLongPtrW(hwnd_, GWL_STYLE, preFullscreenStyle_);
         SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, preFullscreenExStyle_);
-        const int roundedCorners = 2; // DWMWCP_ROUND on Windows 11.
-        DwmSetWindowAttribute(hwnd_, 33, &roundedCorners, sizeof(roundedCorners));
+        quicksift::ui::framework::MacOsUiFramework::ApplyWindowChrome(hwnd_,
+            quicksift::ui::framework::WindowChromeKind::Main, Palette());
 
         preFullscreenPlacement_.length = sizeof(WINDOWPLACEMENT);
         SetWindowPlacement(hwnd_, &preFullscreenPlacement_);
@@ -966,6 +974,23 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
                 SetFullscreenTitleVisible(false);
             }
             InvalidateTitleBar();
+            if (LOWORD(wParam) == WA_INACTIVE) {
+                // Remember the focused child (search box, comment field, canvas...)
+                // so Alt+Tab / closing a dialog returns focus there, not to the frame.
+                HWND focused = GetFocus();
+                if (focused && IsChild(hwnd_, focused)) lastFocusedChild_ = focused;
+            } else if (!HIWORD(wParam) && lastFocusedChild_ && IsWindow(lastFocusedChild_) &&
+                IsChild(hwnd_, lastFocusedChild_) && IsWindowVisible(lastFocusedChild_) &&
+                IsWindowEnabled(lastFocusedChild_)) {
+                SetFocus(lastFocusedChild_);
+                return 0;
+            }
+            return DefWindowProc(hwnd_, message, wParam, lParam);
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+        case WM_DWMCOLORIZATIONCOLORCHANGED:
+            OnSystemVisualSettingsChanged();
             return DefWindowProc(hwnd_, message, wParam, lParam);
         case WM_MOUSEMOVE: {
             POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -1019,6 +1044,9 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             InvalidateTitleBar();
             return 0;
         case WM_SIZE:
+            // Minimized: the client is 0x0. Laying out would collapse every child,
+            // rebuild all regions and force a full re-layout + repaint on restore.
+            if (wParam == SIZE_MINIMIZED) return 0;
             LayoutControls(LOWORD(lParam), HIWORD(lParam));
             InvalidateRect(hwnd_, nullptr, FALSE);
             return 0;
@@ -1052,6 +1080,16 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         }
         case WM_DRAWITEM:
             return OnDrawItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
+        case WM_CTLCOLORLISTBOX:
+            // The library list fills any area it paints itself with the panel colour
+            // (the default COLOR_WINDOW brush was a white strip in dark theme).
+            if (reinterpret_cast<HWND>(lParam) == libraryList_) {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                SetBkColor(dc, Palette().panelStrong);
+                SetTextColor(dc, Palette().text);
+                return reinterpret_cast<LRESULT>(LibraryListBrush());
+            }
+            return DefWindowProc(hwnd_, message, wParam, lParam);
         case WM_COMMAND:
             OnCommand(LOWORD(wParam), HIWORD(wParam), reinterpret_cast<HWND>(lParam));
             return 0;
@@ -1062,6 +1100,9 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             // is intentionally deferred until the gesture ends; otherwise scan
             // batches / metadata / decode completions can steal input latency even
             // when decoding itself is entirely off-thread.
+            // While placeholders are preferred the wake claim is intentionally left
+            // held, so producers cannot flood the queue with further wakes; the
+            // scroll-frame/settle timer pump drains (and releases it) after motion.
             if (!ThumbnailScrollPrefersPlaceholders()) DrainBackgroundCompletions();
             return 0;
         case WM_APP_FILE_TRANSACTION_COMPLETION:
@@ -1076,11 +1117,24 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         case WM_APP_STARTUP_READY:
             HandleDeferredStartupReady(wParam != 0);
             return 0;
+        case WM_APP_RATINGS_WORKER_DONE:
+            OnRatingsWorkerCompleted();
+            return 0;
+        case WM_APP_BATCH_WORKER_DONE:
+            OnBatchWorkerCompleted();
+            return 0;
+        case WM_APP_SEARCH_WORKER:
+            OnSearchWorkerMessage();
+            return 0;
         case WM_TIMER:
             OnTimer(static_cast<UINT_PTR>(wParam));
             return 0;
         case WM_CLOSE:
-            if (transactions_.Busy()) {
+            // Coalesced edits not yet submitted are written (or, if the user then
+            // chooses "Close anyway", cancelled with everything else) — never lost
+            // silently.
+            FlushPendingMetadataEdits();
+            if (transactions_.Busy() || !pendingMetadataEdits_.Empty()) {
                 if (closingAfterTransactionCancellation_) {
                     ShowToast(L"Cancelling file operations at a safe boundary before closing…");
                     return 0;
@@ -1135,10 +1189,23 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             }
             const auto shutdownStartedAt = std::chrono::steady_clock::now();
             QS_LOG_INFO(L"Lifecycle", L"Shutdown sequence started after main window destruction");
+            // Non-metadata work must never block close. Signal decode stop
+            // immediately (queues cleared, budgets stopped) without joining.
+            // The later worker_.Stop() joins only after in-flight work observes
+            // the stop flag. Only metadata writes (subject to kHardTimeout)
+            // are allowed to finish.
+            worker_.RequestStop();
+            {
+                std::lock_guard lock(searchMutex_);
+                searchWorkerStop_ = true;
+                searchHydrateQueue_.clear();
+                searchEvalJob_.reset();
+            }
+            searchCv_.notify_all();
+            scanner_.Cancel();
             KillTimer(hwnd_, ID_TIMER_IDLE_QUALITY);
             KillTimer(hwnd_, ID_TIMER_CACHE_FLUSH);
             KillTimer(hwnd_, ID_TIMER_AUTOHIDE);
-            KillTimer(hwnd_, ID_TIMER_TOAST);
             KillTimer(hwnd_, ID_TIMER_METADATA_UI);
             KillTimer(hwnd_, ID_TIMER_VIEW_RESOURCE_TRIM);
             KillTimer(hwnd_, ID_TIMER_BACKGROUND_ANALYSIS);
@@ -1147,10 +1214,35 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             KillTimer(hwnd_, ID_TIMER_PERFORMANCE_HUD);
             KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
             KillTimer(hwnd_, ID_TIMER_ANIMATION);
+            // Animation teardown: no cadence switches after this point; fading
+            // dropdowns are destroyed now and pending completions are dropped.
+            uiFramework_.Motion().SetActivationHook({});
+            uiFramework_.ShutdownAnimations();
+            uiFramework_.ClearPaneFrost();
+            if (libraryListBrush_) {
+                DeleteObject(libraryListBrush_);
+                libraryListBrush_ = nullptr;
+            }
             KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
             KillTimer(hwnd_, ID_TIMER_SCROLL_FRAME);
             KillTimer(hwnd_, ID_TIMER_SCROLL_SETTLE);
             KillTimer(hwnd_, ID_TIMER_THROTTLED_SCHEDULE);
+            KillTimer(hwnd_, ID_TIMER_COMPLETION_PUMP);
+            KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RECONCILE);
+            KillTimer(hwnd_, ID_TIMER_RATINGS_PROGRESS);
+            KillTimer(hwnd_, ID_TIMER_BATCH_GLASS_WATCH);
+            KillTimer(hwnd_, ID_TIMER_SEARCH_DEBOUNCE);
+            searchDebounceArmed_ = false;
+            KillTimer(hwnd_, ID_TIMER_METADATA_WRITE_LANE);
+            metadataWriteLaneTimerActive_ = false;
+            KillTimer(hwnd_, ID_TIMER_USER_COMMENT_RETRY);
+            KillTimer(hwnd_, ID_TIMER_LIBRARY_LIST_RETRY);
+            StopRatingsWorker();
+            StopBatchWorker();
+            StopSearchWorker(); // before the persistent cache closes (it reads comments)
+            CloseBatchDialog();
+            thumbnailReconcileTimerActive_ = false;
+            completionPumpTimerActive_ = false;
 
             auto logShutdownStage = [&](std::wstring_view stage, const auto startedAt) {
                 const double ms = std::chrono::duration<double, std::milli>(
@@ -1230,6 +1322,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             SetFocus(canvas_);
             const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             if (HandleGlassAlertClick(point.x, point.y)) return 0;
+            if (HandleSearchFieldMouseDown(point.x, point.y)) return 0;
             if (reviewState_.Mode() == ViewMode::Thumbnails && thumbnailScrollbarHot_) {
                 thumbnailScrollDragging_ = true;
                 thumbnailScrollMotionActive_ = true;
@@ -1261,8 +1354,12 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
                 // Settle-debounce fills the viewport; do not dump Interactive work on release.
                 ArmThumbnailScrollSettle();
                 ScheduleViewResourceTrim();
-                if (completionQueue_.Size() != 0 && hwnd_ && IsWindow(hwnd_))
-                    PostMessageW(hwnd_, WM_APP_BACKGROUND_COMPLETION, 0, 0);
+                if (completionQueue_.Size() != 0 && hwnd_ && IsWindow(hwnd_)) {
+                    // The claim may still be held from the placeholder phase; refresh
+                    // it and post one wake so the backlog drains right after release.
+                    completionQueue_.ReleaseWake();
+                    RequestBackgroundCompletionWake();
+                }
                 InvalidateCanvas();
                 return 0;
             }
@@ -1273,6 +1370,14 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         }
         case WM_CAPTURECHANGED:
         case WM_CANCELMODE: {
+            // Losing capture mid-press (Alt+Tab, modal UI) cancels a pending face click
+            // and the click-vs-drag press (OnCanvasLeftUp evaluates the click before
+            // its own ReleaseCapture, so this never eats a genuine click).
+            pendingFaceClick_.reset();
+            canvasPress_.Cancel();
+            faceTogglePress_ = {};
+            facePanDeferred_ = false;
+            if (reinterpret_cast<HWND>(lParam) != canvas_) dragging_ = false;
             if (thumbnailScrollDragging_) {
                 thumbnailScrollDragging_ = false;
                 if (thumbnailDragRenderTimerActive_) {
@@ -1286,9 +1391,21 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             }
             break;
         }
+        case WM_RBUTTONUP: {
+            // Right-click on a photo pins/unpins the face outlines (FaceLock on,
+            // Single/Compare only). Right-click had no canvas behaviour before.
+            if (uiFramework_.Alerts().Visible()) return 0;
+            const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (ToggleFaceOutlinesPinned(point.x, point.y)) return 0;
+            break;
+        }
         case WM_LBUTTONDBLCLK: {
             if (uiFramework_.Alerts().Visible()) return 0;
             const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            if (SearchFieldContains(point.x, point.y)) {
+                HandleSearchFieldMouseDown(point.x, point.y);
+                return 0;
+            }
             OnCanvasDoubleClick(point.x, point.y);
             return 0;
         }
@@ -1340,6 +1457,12 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
                     thumbnailScrollbarHot_ = hit;
                     InvalidateCanvas();
                 }
+                UpdateSearchFieldHover(point.x, point.y);
+                if ((wParam & MK_LBUTTON) == 0 && SearchFieldContains(point.x, point.y)) {
+                    // Over the floating field: no card hover / tooltips through it.
+                    HideFaceWarningTooltip();
+                    return 0;
+                }
             }
             UpdateFaceWarningTooltip(point.x, point.y);
             if ((wParam & MK_LBUTTON) != 0) MarkInteraction();
@@ -1350,6 +1473,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             trackingCanvasMouse_ = false;
             HideFaceWarningTooltip();
             thumbnailScrollbarHot_ = false;
+            ClearSearchFieldHover();
             InvalidateCanvas();
             return 0;
         case WM_MOUSEWHEEL: {
@@ -1364,20 +1488,20 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         }
         case WM_KEYDOWN:
             if (uiFramework_.Alerts().Visible()) {
-                if (wParam == VK_ESCAPE) DismissGlassAlert();
-                else if (wParam == VK_RETURN || wParam == VK_SPACE) ConfirmGlassAlert();
+                HandleGlassAlertKey(static_cast<UINT>(wParam), GetKeyState(VK_SHIFT) < 0);
                 return 0;
             }
             MarkInteraction();
             OnKeyDown(static_cast<UINT>(wParam), GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
             return 0;
         case WM_SETCURSOR:
-            if (uiFramework_.Alerts().Visible() && (uiFramework_.Alerts().PrimaryHot() || uiFramework_.Alerts().SecondaryHot())) {
+            if (uiFramework_.Alerts().Visible() && uiFramework_.Alerts().AnyButtonHot()) {
                 SetCursor(LoadCursor(nullptr, IDC_HAND));
                 return TRUE;
             }
             if (dragging_) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZEALL));
+                // A face-outline press stays a hand until it becomes a drag (pan).
+                SetCursor(LoadCursor(nullptr, facePanDeferred_ ? IDC_HAND : IDC_SIZEALL));
                 return TRUE;
             }
             break;
@@ -1463,18 +1587,24 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
 
 
     void QuickSiftApplicationImpl::RecreateUiFonts() {
-        const int normalHeight = -MulDiv(10, static_cast<int>(currentDpi_), 72);
-        const int compactHeight = -MulDiv(9, static_cast<int>(currentDpi_), 72);
-        const int titleHeight = -MulDiv(11, static_cast<int>(currentDpi_), 72);
+        // Type scale + families from the design tokens; Segoe UI Variable resolves
+        // to Segoe UI where it is not installed (Windows 10) instead of GDI's
+        // arbitrary substitute.
+        namespace tokens = quicksift::ui::tokens;
+        using quicksift::ui::FontRole;
+        using quicksift::ui::UiFontFamily;
+        const int normalHeight = -MulDiv(tokens::kTypeBodyPt, static_cast<int>(currentDpi_), 72);
+        const int compactHeight = -MulDiv(tokens::kTypeCaptionPt, static_cast<int>(currentDpi_), 72);
+        const int titleHeight = -MulDiv(tokens::kTypeHeadlinePt, static_cast<int>(currentDpi_), 72);
         HFONT newNormal = CreateFontW(normalHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Text");
+            DEFAULT_PITCH | FF_DONTCARE, UiFontFamily(FontRole::Text));
         HFONT newSemibold = CreateFontW(compactHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            DEFAULT_PITCH | FF_DONTCARE, UiFontFamily(FontRole::Display));
         HFONT newTitle = CreateFontW(titleHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+            DEFAULT_PITCH | FF_DONTCARE, UiFontFamily(FontRole::Display));
 
         const HFONT oldNormal = uiFont_;
         const HFONT oldSemibold = uiFontSemibold_;
@@ -1493,11 +1623,22 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
     }
 
 
+    void QuickSiftApplicationImpl::OnSystemVisualSettingsChanged() {
+        // Coalesced: high contrast / animations / transparency / accent changes
+        // arrive as several broadcasts; re-theme only when something we use moved
+        // (system colours always matter in high contrast).
+        const bool changed = quicksift::ui::RefreshVisualEffects();
+        if (!changed && !quicksift::ui::CurrentVisualEffects().highContrast) return;
+        // In-flight chrome animations snap on the next tick when animations were
+        // just disabled (the central Animator lands every value on its target).
+        ApplyTheme();
+    }
+
+
     void QuickSiftApplicationImpl::ConfigureDwmGlass() {
-        const int rounded = 2; // DWMWCP_ROUND on Windows 11; ignored on Windows 10.
-        DwmSetWindowAttribute(hwnd_, 33, &rounded, sizeof(rounded));
-        const int backdrop = 1; // No transparent system backdrop: custom blobs are cheaper and deterministic.
-        DwmSetWindowAttribute(hwnd_, 38, &backdrop, sizeof(backdrop));
+        // ApplyTheme owns the DWM chrome (MacOsUiFramework::ApplyWindowChrome):
+        // rounded corners, no system backdrop (the custom blobs are cheaper and
+        // deterministic behind the opaque canvas), no coloured system border.
         ApplyTheme();
     }
 

@@ -1,6 +1,7 @@
 // OWNER: Catalog path lookup and atomic visible-order commits.
 #include "catalog_store.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -8,9 +9,53 @@ namespace quicksift::core {
 
 void CatalogStore::ClearAndRelease() {
     std::vector<PhotoItem>().swap(photos_);
+    BumpMetadataEpoch();
+    snapshot_.reset();
+    std::vector<std::shared_ptr<const CatalogSnapshot::Chunk>>().swap(snapshotChunks_);
+    std::vector<std::uint8_t>().swap(snapshotChunkDirty_);
     std::unordered_multimap<std::uint64_t, Index>().swap(pathIndex_);
     std::vector<Index>().swap(visibleIndices_);
     std::vector<Index>().swap(visiblePositions_);
+}
+
+void CatalogStore::MarkFactsChanged(Index index) noexcept {
+    BumpMetadataEpoch();
+    const std::size_t chunk = index / CatalogSnapshot::kChunkSize;
+    // Chunks past the end are new and always built; nothing to mark.
+    if (chunk < snapshotChunkDirty_.size()) snapshotChunkDirty_[chunk] = 1;
+}
+
+CatalogSnapshotPtr CatalogStore::Snapshot() const {
+    if (snapshot_ && snapshot_->epoch == metadataEpoch_) return snapshot_;
+    constexpr std::size_t kChunk = CatalogSnapshot::kChunkSize;
+    const std::size_t chunkCount = (photos_.size() + kChunk - 1) / kChunk;
+    // Build into locals first: a throwing allocation leaves the cached state intact.
+    std::vector<std::shared_ptr<const CatalogSnapshot::Chunk>> chunks(chunkCount);
+    for (std::size_t chunk = 0; chunk < chunkCount; ++chunk) {
+        const std::size_t first = chunk * kChunk;
+        const std::size_t count = std::min(kChunk, photos_.size() - first);
+        const bool reusable = chunk < snapshotChunks_.size() && snapshotChunks_[chunk] &&
+            snapshotChunks_[chunk]->size() == count &&
+            (chunk >= snapshotChunkDirty_.size() || snapshotChunkDirty_[chunk] == 0);
+        if (reusable) {
+            chunks[chunk] = snapshotChunks_[chunk];
+            continue;
+        }
+        auto built = std::make_shared<CatalogSnapshot::Chunk>();
+        built->reserve(count);
+        for (std::size_t offset = 0; offset < count; ++offset)
+            built->push_back(RecordOf(photos_[first + offset], first + offset));
+        chunks[chunk] = std::move(built);
+    }
+    auto snapshot = std::make_shared<CatalogSnapshot>();
+    snapshot->epoch = metadataEpoch_;
+    snapshot->size = photos_.size();
+    snapshot->chunks = chunks;
+    std::vector<std::uint8_t> clean(chunkCount, 0);
+    snapshotChunks_ = std::move(chunks);
+    snapshotChunkDirty_ = std::move(clean);
+    snapshot_ = std::move(snapshot);
+    return snapshot_;
 }
 
 bool CatalogStore::PathOwnedByOther(std::wstring_view path,

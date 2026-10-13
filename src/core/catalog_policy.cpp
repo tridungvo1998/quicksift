@@ -4,6 +4,14 @@
 #include "catalog_policy.h"
 
 namespace quicksift::core {
+
+static_assert(static_cast<int>(RatingFilter::Unrated) == 1 && static_cast<int>(RatingFilter::Exact1) == 2 &&
+    static_cast<int>(RatingFilter::Exact5) == 6 && static_cast<int>(RatingFilter::AtLeast4) == 7,
+    "FilterCriteria::ratingFilter mirrors RatingFilter");
+static_assert(static_cast<int>(PickFilter::Picks) == 1 && static_cast<int>(PickFilter::Rejects) == 2 &&
+    static_cast<int>(PickFilter::Unmarked) == 3, "FilterCriteria::pickFilter mirrors PickFilter");
+static_assert(static_cast<int>(ColorLabelFilter::None) == 1 && static_cast<int>(ColorLabelFilter::Red) == 2 &&
+    static_cast<int>(ColorLabelFilter::Purple) == 6, "FilterCriteria::colorFilter mirrors ColorLabelFilter");
 bool IsFormatAllowed(std::wstring_view extension, const FormatSelection& selection) noexcept {
     if (IsJpegExtension(extension) &&
         selection.IsEnabled(FormatGroup::Jpeg)) return true;
@@ -43,46 +51,26 @@ bool IsDateAllowed(std::filesystem::file_time_type modified, DateFilter filter,
 
 bool IsCullAllowed(const PhotoItem& item, RatingFilter rating, PickFilter pick,
     ColorLabelFilter label) noexcept {
-    if (pick != PickFilter::All) {
-        if (item.pickStateKnowledge != MetadataKnowledge::Known) return false;
-        switch (pick) {
-        case PickFilter::Picks: if (item.pickState <= 0) return false; break;
-        case PickFilter::Rejects: if (item.pickState >= 0) return false; break;
-        case PickFilter::Unmarked: if (item.pickState != 0) return false; break;
-        case PickFilter::All: break;
-        }
-    }
+    // The Filter tab is expressed in the shared predicate structure (the same clauses
+    // the search box produces) and evaluated by the one predicate engine. Semantics are
+    // unchanged: an active rating/pick/label filter requires Known knowledge.
+    return MatchesFilter(FactsOf(item), FilterCriteriaFor(rating, pick, label));
+}
 
-    const int expectedLabel = [&]() noexcept {
-        switch (label) {
-        case ColorLabelFilter::None: return 0;
-        case ColorLabelFilter::Red: return 1;
-        case ColorLabelFilter::Yellow: return 2;
-        case ColorLabelFilter::Green: return 3;
-        case ColorLabelFilter::Blue: return 4;
-        case ColorLabelFilter::Purple: return 5;
-        case ColorLabelFilter::All: return -1;
-        }
-        return -1;
-    }();
-    if (expectedLabel >= 0) {
-        if (item.colorLabelKnowledge != MetadataKnowledge::Known) return false;
-        if (item.colorLabel != expectedLabel) return false;
-    }
+predicate::FilterCriteria FilterCriteriaFor(RatingFilter rating, PickFilter pick,
+    ColorLabelFilter label) noexcept {
+    return { static_cast<int>(rating), static_cast<int>(pick), static_cast<int>(label) };
+}
 
-    if (rating != RatingFilter::All &&
-        item.ratingKnowledge != MetadataKnowledge::Known) return false;
-    switch (rating) {
-    case RatingFilter::Unrated: return item.rating == 0;
-    case RatingFilter::Exact1: return item.rating == 1;
-    case RatingFilter::Exact2: return item.rating == 2;
-    case RatingFilter::Exact3: return item.rating == 3;
-    case RatingFilter::Exact4: return item.rating == 4;
-    case RatingFilter::Exact5: return item.rating == 5;
-    case RatingFilter::AtLeast4: return item.rating >= 4;
-    case RatingFilter::All: return true;
+bool MatchesFilter(const predicate::MetadataFactsView& facts,
+    const predicate::FilterCriteria& criteria) noexcept {
+    if (criteria.ratingFilter == 0 && criteria.pickFilter == 0 && criteria.colorFilter == 0) return true;
+    try {
+        const predicate::FilterClauses clauses = predicate::CompileFilterCriteria(criteria);
+        return predicate::MatchesAll(clauses.View(), facts);
+    } catch (...) {
+        return false; // rating/pick/color clauses never allocate; defensive only
     }
-    return true;
 }
 
 bool PhotoSortLess(const PhotoItem& left, const PhotoItem& right, SortMode mode) noexcept {

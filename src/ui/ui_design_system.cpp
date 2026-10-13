@@ -32,7 +32,7 @@ void AddRoundedRectanglePath(Gdiplus::GraphicsPath& path, float left, float top,
 
 ThemePalette GetThemePalette(core::AppTheme theme) noexcept {
     if (theme == core::AppTheme::Light) {
-        return {
+        return ThemePalette{
             RGB(246, 249, 253), RGB(226, 235, 244),
             RGB(250, 252, 255), RGB(242, 247, 251), RGB(252, 254, 255),
             RGB(246, 249, 252), RGB(235, 242, 249), RGB(241, 245, 249),
@@ -42,7 +42,7 @@ ThemePalette GetThemePalette(core::AppTheme theme) noexcept {
             RGB(254, 255, 255), RGB(228, 240, 253), RGB(25, 39, 52), false
         };
     }
-    return {
+    return ThemePalette{
         RGB(29, 36, 47), RGB(18, 23, 31),
         RGB(36, 45, 57), RGB(29, 37, 48), RGB(42, 52, 66),
         RGB(46, 58, 72), RGB(58, 72, 90), RGB(36, 45, 57),
@@ -51,6 +51,163 @@ ThemePalette GetThemePalette(core::AppTheme theme) noexcept {
         RGB(95, 54, 71), RGB(131, 66, 84), RGB(212, 112, 136),
         RGB(36, 46, 58), RGB(47, 98, 154), RGB(245, 249, 253), true
     };
+}
+
+
+namespace {
+
+tokens::VisualEffects gVisualEffects{};
+COLORREF gSystemAccent = CLR_INVALID;
+bool gVisualEffectsLoaded = false;
+
+bool ReadUserDword(const wchar_t* key, const wchar_t* value, DWORD& out) noexcept {
+    DWORD data = 0;
+    DWORD size = sizeof(data);
+    if (RegGetValueW(HKEY_CURRENT_USER, key, value, RRF_RT_REG_DWORD, nullptr, &data, &size)
+        != ERROR_SUCCESS) return false;
+    out = data;
+    return true;
+}
+
+tokens::VisualEffects QueryVisualEffects() noexcept {
+    tokens::VisualEffects effects{};
+    HIGHCONTRASTW highContrast{ sizeof(HIGHCONTRASTW) };
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(highContrast), &highContrast, 0))
+        effects.highContrast = (highContrast.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    BOOL animations = TRUE;
+    if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0))
+        effects.animations = animations != FALSE;
+    DWORD transparency = 1;
+    if (ReadUserDword(L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"EnableTransparency", transparency))
+        effects.transparency = transparency != 0;
+    return effects;
+}
+
+COLORREF QuerySystemAccent() noexcept {
+    // DWM stores the user's accent as 0xAABBGGRR; the low 24 bits are a COLORREF.
+    DWORD accent = 0;
+    if (!ReadUserDword(L"Software\\Microsoft\\Windows\\DWM", L"AccentColor", accent))
+        return CLR_INVALID;
+    return static_cast<COLORREF>(accent & 0x00FFFFFFu);
+}
+
+void EnsureVisualEffectsLoaded() noexcept {
+    if (gVisualEffectsLoaded) return;
+    gVisualEffectsLoaded = true;
+    gVisualEffects = QueryVisualEffects();
+    gSystemAccent = QuerySystemAccent();
+}
+
+int CALLBACK FontFamilyExists(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM found) {
+    *reinterpret_cast<bool*>(found) = true;
+    return 0;
+}
+
+bool FontFamilyInstalled(const wchar_t* family) noexcept {
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    LOGFONTW query{};
+    query.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(query.lfFaceName, family, _TRUNCATE);
+    bool found = false;
+    EnumFontFamiliesExW(dc, &query, FontFamilyExists, reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
+} // namespace
+
+const tokens::VisualEffects& CurrentVisualEffects() noexcept {
+    EnsureVisualEffectsLoaded();
+    return gVisualEffects;
+}
+
+bool RefreshVisualEffects() noexcept {
+    EnsureVisualEffectsLoaded();
+    const tokens::VisualEffects effects = QueryVisualEffects();
+    const COLORREF accent = QuerySystemAccent();
+    const bool changed = effects != gVisualEffects || accent != gSystemAccent;
+    gVisualEffects = effects;
+    gSystemAccent = accent;
+    return changed;
+}
+
+ThemePalette HighContrastPalette() noexcept {
+    ThemePalette palette{};
+    const COLORREF window = GetSysColor(COLOR_WINDOW);
+    const COLORREF windowText = GetSysColor(COLOR_WINDOWTEXT);
+    const COLORREF face = GetSysColor(COLOR_BTNFACE);
+    const COLORREF highlight = GetSysColor(COLOR_HIGHLIGHT);
+    const COLORREF highlightText = GetSysColor(COLOR_HIGHLIGHTTEXT);
+    palette.windowTop = window;
+    palette.windowBottom = window;
+    palette.toolbar = face;
+    palette.panel = window;
+    palette.panelStrong = window;
+    palette.button = face;
+    palette.buttonHot = face;
+    palette.buttonDisabled = face;
+    palette.border = windowText;
+    palette.text = windowText;
+    palette.muted = GetSysColor(COLOR_GRAYTEXT);
+    palette.accent = highlight;
+    palette.accentBorder = highlight;
+    palette.danger = window;
+    palette.dangerHot = highlight;
+    palette.dangerBorder = GetSysColor(COLOR_HOTLIGHT);
+    palette.menu = window;
+    palette.menuSelected = highlight;
+    palette.title = windowText;
+    palette.dark = RelativeLuminance(window) < 0.5;
+    palette.accentText = highlightText;
+    palette.menuSelectedText = highlightText;
+    palette.highContrast = true;
+    return palette;
+}
+
+void ApplyAccentToPalette(ThemePalette& palette, COLORREF accent) noexcept {
+    if (accent == CLR_INVALID) return;
+    COLORREF adjusted = accent;
+    if (!palette.dark) {
+        // Light theme: white captions on accent fills need >= 4.5:1.
+        for (int step = 0; step < 20 && ContrastRatio(adjusted, RGB(255, 255, 255)) < 4.5; ++step)
+            adjusted = BlendColor(adjusted, RGB(0, 0, 0), 0.08f);
+        palette.accentBorder = BlendColor(adjusted, RGB(0, 0, 0), 0.12f);
+        palette.menuSelected = BlendColor(palette.menu, adjusted, 0.12f);
+    } else {
+        // Dark theme: rings/borders on the panel need >= 3:1 against panelStrong.
+        for (int step = 0; step < 20 && ContrastRatio(adjusted, palette.panelStrong) < 3.0; ++step)
+            adjusted = BlendColor(adjusted, RGB(255, 255, 255), 0.08f);
+        palette.accentBorder = BlendColor(adjusted, RGB(255, 255, 255), 0.35f);
+        palette.menuSelected = BlendColor(palette.menu, adjusted, 0.55f);
+    }
+    palette.accent = adjusted;
+    palette.accentText = BestContrastText(adjusted, RGB(25, 39, 52), RGB(255, 255, 255));
+}
+
+COLORREF MenuSelectedTextColor(const ThemePalette& palette) noexcept {
+    return palette.menuSelectedText == CLR_INVALID ? palette.text : palette.menuSelectedText;
+}
+
+ThemePalette ResolveThemePalette(core::AppTheme theme) noexcept {
+    EnsureVisualEffectsLoaded();
+    if (gVisualEffects.highContrast) return HighContrastPalette();
+    ThemePalette palette = GetThemePalette(theme);
+    ApplyAccentToPalette(palette, gSystemAccent);
+    return palette;
+}
+
+const wchar_t* UiFontFamily(FontRole role) noexcept {
+    static const bool textInstalled = FontFamilyInstalled(tokens::kFamilyText);
+    static const bool displayInstalled = FontFamilyInstalled(tokens::kFamilyDisplay);
+    if (role == FontRole::Display) return displayInstalled ? tokens::kFamilyDisplay : tokens::kFamilyFallback;
+    return textInstalled ? tokens::kFamilyText : tokens::kFamilyFallback;
+}
+
+float StrokePx(float dip, UINT dpi) noexcept {
+    const float scale = static_cast<float>(dpi ? dpi : USER_DEFAULT_SCREEN_DPI) / USER_DEFAULT_SCREEN_DPI;
+    return std::max(1.0f, std::round(dip * scale * 2.0f) / 2.0f);
 }
 
 const std::array<COLORREF, 5>& BackgroundAccentColors() noexcept {
@@ -63,8 +220,8 @@ const std::array<COLORREF, 5>& BackgroundAccentColors() noexcept {
 
 UINT GetWindowDpi(HWND window) noexcept {
     using GetDpiForWindowFn = UINT(WINAPI*)(HWND);
-    static const auto getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
-        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+    static const auto getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(reinterpret_cast<void*>(
+        GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")));
     if (getDpiForWindow && window) {
         const UINT dpi = getDpiForWindow(window);
         if (dpi) return dpi;
@@ -72,8 +229,8 @@ UINT GetWindowDpi(HWND window) noexcept {
 
     using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
     static HMODULE shcore = LoadLibraryExW(L"shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    static const auto getDpiForMonitor = shcore ? reinterpret_cast<GetDpiForMonitorFn>(
-        GetProcAddress(shcore, "GetDpiForMonitor")) : nullptr;
+    static const auto getDpiForMonitor = shcore ? reinterpret_cast<GetDpiForMonitorFn>(reinterpret_cast<void*>(
+        GetProcAddress(shcore, "GetDpiForMonitor"))) : nullptr;
     if (getDpiForMonitor && window) {
         UINT dpiX = USER_DEFAULT_SCREEN_DPI;
         UINT dpiY = USER_DEFAULT_SCREEN_DPI;
@@ -205,20 +362,17 @@ void DrawSolidLine(HDC dc, int x1, int y1, int x2, int y2, int width, COLORREF c
 }
 
 void FillRoundedRect(HDC dc, const RECT& rect, int radius, COLORREF fill, COLORREF border) {
-    HBRUSH brush = CreateSolidBrush(fill);
-    HPEN pen = CreatePen(PS_SOLID, 1, border);
-    if (!brush || !pen) {
-        if (pen) DeleteObject(pen);
-        if (brush) DeleteObject(brush);
-        return;
-    }
-    HGDIOBJ oldBrush = SelectObject(dc, brush);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
-    SelectObject(dc, oldPen);
-    SelectObject(dc, oldBrush);
-    DeleteObject(pen);
-    DeleteObject(brush);
+    // Anti-aliased replacement for the former GDI RoundRect (aliased edges). The
+    // geometry is unchanged: RoundRect's `radius` argument was the corner
+    // ellipse WIDTH, so the corner radius is radius / 2, and the 1 px pen sat
+    // inside the rectangle.
+    if (!dc || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    const float cornerRadius = static_cast<float>(std::max(0, radius)) * 0.5f;
+    FillRoundedRectGp(graphics, rect, cornerRadius, ToGpColor(fill));
+    if (border != fill) DrawRoundedRectGp(graphics, rect, cornerRadius, ToGpColor(border), 1.0f);
 }
 
 } // namespace quicksift::ui

@@ -85,6 +85,7 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::ResizeCanvasTarget(UINT width, UINT height) {
+        ClearFaceZoomToggle(); // a resize is a meaningful view change for click-to-zoom
         if (swapChain_) {
             renderTarget_.Reset();
             if (deviceContext2_) deviceContext2_->SetTarget(nullptr);
@@ -157,7 +158,7 @@ namespace quicksift::app {
             sharedResourcesReady = ensureBrush(panelBrush_, ToD2D(palette.panel,
                 theme_ == AppTheme::Dark ? 0.92f : 0.97f), L"panel") && sharedResourcesReady;
             sharedResourcesReady = ensureBrush(accentBrush_, ToD2D(palette.accent), L"accent") && sharedResourcesReady;
-            sharedResourcesReady = ensureBrush(dangerBrush_, ToD2D(RGB(235, 64, 64)), L"danger") && sharedResourcesReady;
+            sharedResourcesReady = ensureBrush(dangerBrush_, ToD2D(palette.highContrast ? palette.dangerBorder : RGB(235, 64, 64)), L"danger") && sharedResourcesReady;
             sharedResourcesReady = ensureBrush(mutedBrush_, ToD2D(palette.muted), L"muted") && sharedResourcesReady;
             sharedResourcesReady = ensureBrush(backgroundBrush_, ToD2D(palette.windowBottom), L"background") && sharedResourcesReady;
             sharedResourcesReady = ensureBrush(overlayBrush_, ToD2D(palette.panelStrong,
@@ -165,6 +166,9 @@ namespace quicksift::app {
             sharedResourcesReady = ensureBrush(glassBorderBrush_, ToD2D(palette.border, 0.78f), L"glass border") && sharedResourcesReady;
             sharedResourcesReady = ensureBrush(glassHighlightBrush_, ToD2D(RGB(255, 255, 255),
                 theme_ == AppTheme::Dark ? 0.055f : 0.28f), L"glass highlight") && sharedResourcesReady;
+            // Face outlines are optional decoration; failure never blocks rendering.
+            static_cast<void>(ensureBrush(faceOutlineBrush_, ToD2D(RGB(255, 255, 255)), L"face outline"));
+            static_cast<void>(ensureBrush(faceOutlineShadowBrush_, ToD2D(RGB(0, 0, 0)), L"face outline shadow"));
         }
         if (dwriteFactory_) {
             auto ensureTextFormat = [&](ComPtr<IDWriteTextFormat>& format, const wchar_t* family,
@@ -179,14 +183,17 @@ namespace quicksift::app {
                 }
                 return true;
             };
-            sharedResourcesReady = ensureTextFormat(smallText_, L"Segoe UI Variable Text",
+            using quicksift::ui::FontRole;
+            using quicksift::ui::UiFontFamily;
+            sharedResourcesReady = ensureTextFormat(smallText_, UiFontFamily(FontRole::Text),
                 DWRITE_FONT_WEIGHT_NORMAL, 12.0f, L"small") && sharedResourcesReady;
-            sharedResourcesReady = ensureTextFormat(mediumText_, L"Segoe UI Variable Display",
+            sharedResourcesReady = ensureTextFormat(mediumText_, UiFontFamily(FontRole::Display),
                 DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0f, L"medium") && sharedResourcesReady;
-            sharedResourcesReady = ensureTextFormat(largeText_, L"Segoe UI Variable Display",
+            sharedResourcesReady = ensureTextFormat(largeText_, UiFontFamily(FontRole::Display),
                 DWRITE_FONT_WEIGHT_NORMAL, 16.0f, L"large") && sharedResourcesReady;
         }
         if (!sharedResourcesReady) {
+            badgeTextWidthCache_.clear();
             smallText_.Reset();
             mediumText_.Reset();
             largeText_.Reset();
@@ -213,6 +220,8 @@ namespace quicksift::app {
         overlayBrush_.Reset();
         glassBorderBrush_.Reset();
         glassHighlightBrush_.Reset();
+        faceOutlineBrush_.Reset();
+        faceOutlineShadowBrush_.Reset();
         hwndRenderTarget_.Reset();
         ResetModernDeviceResources();
     }
@@ -386,12 +395,16 @@ namespace quicksift::app {
     void QuickSiftApplicationImpl::UnindexBitmapSize(const CacheKey& key) {
         // Multiple cache classes may share the same path/size bucket. Keep the
         // size indexed until the last bitmap for that pair is gone.
-        const bool anotherEntry = std::any_of(bitmapCache_.begin(), bitmapCache_.end(),
-            [&](const auto& item) {
-                return item.first.path == key.path && item.first.size == key.size &&
-                    !(item.first.cacheClass == key.cacheClass);
-            });
-        if (anotherEntry) return;
+        // 0.9.4.0: probe the (at most three) sibling classes directly instead of
+        // scanning the whole bitmap cache. Eviction calls this once per victim, so
+        // the former O(cache) scan made every over-budget thumbnail admission
+        // O(cache x victims) on the UI thread.
+        static constexpr CacheClass kIndexedClasses[] = {
+            CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full, CacheClass::Tile };
+        for (const CacheClass sibling : kIndexedClasses) {
+            if (sibling == key.cacheClass) continue;
+            if (bitmapCache_.contains(CacheKey{ key.path, key.size, sibling })) return;
+        }
         auto it = pathToBitmapSizes_.find(key.path);
         if (it == pathToBitmapSizes_.end()) return;
         it->second.erase(key.size);
@@ -472,28 +485,40 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::PruneSupersededViewBitmaps(const std::wstring& path) {
+        // 0.9.4.0: walk only this path's indexed size buckets (a handful) instead of
+        // the entire bitmap cache twice per admitted bitmap.
+        const auto sizesIt = pathToBitmapSizes_.find(path);
+        if (sizesIt == pathToBitmapSizes_.end() || sizesIt->second.empty()) return;
+        static constexpr CacheClass kViewClasses[] = { CacheClass::Preview, CacheClass::Full };
+        std::vector<CacheKey> viewKeys;
+        viewKeys.reserve(sizesIt->second.size() * 2);
+        for (const int size : sizesIt->second) {
+            for (const CacheClass cacheClass : kViewClasses) {
+                CacheKey candidate{ path, size, cacheClass };
+                if (bitmapCache_.contains(candidate)) viewKeys.push_back(std::move(candidate));
+            }
+        }
         int bestFullEdge = 0;
         int bestPreviewEdge = 0;
-        for (const auto& [key, entry] : bitmapCache_) {
-            if (key.path != path || key.cacheClass == CacheClass::Thumbnail) continue;
-            const int edge = BitmapMaximumEdge(&entry);
-            if (entry.previewOnly) bestPreviewEdge = std::max(bestPreviewEdge, edge);
+        for (const CacheKey& key : viewKeys) {
+            const auto it = bitmapCache_.find(key);
+            if (it == bitmapCache_.end()) continue;
+            const int edge = BitmapMaximumEdge(&it->second);
+            if (it->second.previewOnly) bestPreviewEdge = std::max(bestPreviewEdge, edge);
             else bestFullEdge = std::max(bestFullEdge, edge);
         }
         if (bestFullEdge <= 0 && bestPreviewEdge <= 0) return;
-        for (auto iterator = bitmapCache_.begin(); iterator != bitmapCache_.end();) {
-            const bool sameView = iterator->first.path == path &&
-                iterator->first.cacheClass != CacheClass::Thumbnail;
-            const int edge = BitmapMaximumEdge(&iterator->second);
-            const bool supersededFull = sameView && !iterator->second.previewOnly && edge < bestFullEdge;
-            const bool supersededPreview = sameView && iterator->second.previewOnly &&
+        for (const CacheKey& key : viewKeys) {
+            const auto it = bitmapCache_.find(key);
+            if (it == bitmapCache_.end()) continue;
+            const int edge = BitmapMaximumEdge(&it->second);
+            const bool supersededFull = !it->second.previewOnly && edge < bestFullEdge;
+            const bool supersededPreview = it->second.previewOnly &&
                 (edge < bestPreviewEdge || edge <= bestFullEdge);
             if (supersededFull || supersededPreview) {
-                RemoveCacheBytes(iterator->second.cacheClass, iterator->second.bytes);
-                UnindexBitmapSize(iterator->first);
-                iterator = bitmapCache_.erase(iterator);
-            } else {
-                ++iterator;
+                RemoveCacheBytes(it->second.cacheClass, it->second.bytes);
+                UnindexBitmapSize(it->first);
+                bitmapCache_.erase(it);
             }
         }
     }
@@ -657,14 +682,17 @@ namespace quicksift::app {
         decltype(failedDecodes_) emptyFailures;
         failedDecodes_.swap(emptyFailures);
         failedThumbnailPaths_.clear();
-        thumbnailRetryAttempts_.clear();
-        thumbnailRetryCooldown_.clear();
-        thumbnailFailureRetryViewportEpochs_.clear();
+        thumbnailRetryState_.clear();
+        viewRetryState_.clear();
         KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
         decltype(cacheFrequency_) emptyFrequency;
         cacheFrequency_.swap(emptyFrequency);
         decltype(displayedViewKeys_) emptyDisplayed;
         displayedViewKeys_.swap(emptyDisplayed);
+        // 0.9.4.0: the path->size index must be released with the cache; it was
+        // previously left behind and grew across folder switches.
+        decltype(pathToBitmapSizes_) emptySizeIndex;
+        pathToBitmapSizes_.swap(emptySizeIndex);
         cacheFrequencySamples_ = 0;
         thumbnailCacheBytes_ = previewCacheBytes_ = fullCacheBytes_ = tileCacheBytes_ = 0;
     }
@@ -715,6 +743,22 @@ namespace quicksift::app {
             fullCacheBytes_ > limitFor(CacheClass::Full) ||
             tileCacheBytes_ > limitFor(CacheClass::Tile);
         if (!classOver && TotalCacheBytes() <= adjustedHardLimit) return;
+
+        // 0.9.4.0: eviction never removes a pinned (visible/margin) thumbnail, but if
+        // any thumbnail bytes were reclaimed, ask the visible-cell sweep to verify that
+        // nothing on screen (or newly scrolled into the margin) lost its bitmap.
+        struct ThumbnailEvictionReconcile {
+            QuickSiftApplicationImpl* self;
+            size_t thumbnailBytesBefore;
+            ~ThumbnailEvictionReconcile() {
+                try {
+                    if (self->thumbnailCacheBytes_ < thumbnailBytesBefore &&
+                        self->reviewState_.Mode() == ViewMode::Thumbnails)
+                        self->ArmThumbnailReconcile(400);
+                } catch (...) {
+                }
+            }
+        } evictionReconcile{ this, thumbnailCacheBytes_ };
 
         try {
         using BitmapIterator = decltype(bitmapCache_)::iterator;
@@ -1017,7 +1061,6 @@ namespace quicksift::app {
 
     BitmapEntry* QuickSiftApplicationImpl::FindBitmapNoTouch(const fs::path& path, int desired, CacheClass preferredClass) const {
         const std::wstring keyPath = path.wstring();
-        static constexpr int buckets[] = { 128, 256, 512, 1024, 2048, 4096, 8192, 12288 };
         static constexpr CacheClass classes[] = {
             CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full
         };
@@ -1028,7 +1071,16 @@ namespace quicksift::app {
         int bestBelowSize = INT_MIN;
         int bestAboveClassDistance = INT_MAX;
         int bestBelowClassDistance = INT_MAX;
-        for (int bucket : buckets) {
+        // 0.9.4.0: the path->size index is complete for bitmapCache_, so a path with no
+        // indexed sizes has no bitmap at all. Paint calls this for every not-yet-loaded
+        // card on every frame; the early-out avoids 24 key copies + hash probes each.
+        const auto indexedSizes = pathToBitmapSizes_.find(keyPath);
+        if (indexedSizes == pathToBitmapSizes_.end() || indexedSizes->second.empty()) return nullptr;
+        // 0.9.4.0: iterate the path's indexed sizes (ascending std::set) rather than
+        // the fixed bucket list. Some producers store non-bucket targets (clamped
+        // neighbour prefetch, maximumDecodeBucket caps); those entries were resident
+        // and charged to the budget but invisible to this lookup.
+        for (const int bucket : indexedSizes->second) {
             for (CacheClass cacheClass : classes) {
                 const CacheKey candidate{ keyPath, bucket, cacheClass };
                 const auto it = bitmapCache_.find(candidate);
@@ -1060,7 +1112,6 @@ namespace quicksift::app {
 
     BitmapEntry* QuickSiftApplicationImpl::FindBitmap(const fs::path& path, int desired, CacheClass preferredClass) {
         const std::wstring keyPath = path.wstring();
-        static constexpr int buckets[] = { 128, 256, 512, 1024, 2048, 4096, 8192, 12288 };
         static constexpr CacheClass classes[] = {
             CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full
         };
@@ -1073,7 +1124,16 @@ namespace quicksift::app {
         int bestBelowSize = INT_MIN;
         int bestAboveClassDistance = INT_MAX;
         int bestBelowClassDistance = INT_MAX;
-        for (int bucket : buckets) {
+        // 0.9.4.0: the path->size index is complete for bitmapCache_, so a path with no
+        // indexed sizes has no bitmap at all. Paint calls this for every not-yet-loaded
+        // card on every frame; the early-out avoids 24 key copies + hash probes each.
+        const auto indexedSizes = pathToBitmapSizes_.find(keyPath);
+        if (indexedSizes == pathToBitmapSizes_.end() || indexedSizes->second.empty()) return nullptr;
+        // 0.9.4.0: iterate the path's indexed sizes (ascending std::set) rather than
+        // the fixed bucket list. Some producers store non-bucket targets (clamped
+        // neighbour prefetch, maximumDecodeBucket caps); those entries were resident
+        // and charged to the budget but invisible to this lookup.
+        for (const int bucket : indexedSizes->second) {
             for (CacheClass cacheClass : classes) {
                 const CacheKey candidate{ keyPath, bucket, cacheClass };
                 const auto it = bitmapCache_.find(candidate);
@@ -1116,6 +1176,15 @@ namespace quicksift::app {
             now - shellFallbackLastUse_ > std::chrono::seconds(5)) shellFallbackCache_.clear();
         shellFallbackLastUse_ = now;
         if (auto it = shellFallbackCache_.find(key); it != shellFallbackCache_.end()) return it->second;
+        // 0.9.4.0: IShellItemImageFactory::GetImage is synchronous file I/O and may run
+        // a thumbnail handler (seconds for RAW/HEIC on slow storage). Paint callers only
+        // reach this for definitively failed decodes, and at most one new Shell bitmap
+        // is created per frame; the rest are deferred to the next frame.
+        if (shellFallbackFrameBudget_ <= 0) {
+            shellFallbackDeferred_ = true;
+            return nullptr;
+        }
+        --shellFallbackFrameBudget_;
         ComPtr<IShellItem> item;
         if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item)))) return nullptr;
         ComPtr<IShellItemImageFactory> factory;
@@ -1186,10 +1255,22 @@ namespace quicksift::app {
     WicImageSourceEntry* QuickSiftApplicationImpl::GetOrCreateWicImageSource(const fs::path& path) {
         if (!SupportsModernWicImageSource(path)) return nullptr;
         const std::wstring key = path.wstring();
-        const std::uint64_t identity = WicFileIdentity(path);
-        if (identity == 0) return nullptr;
+        const auto verifyNow = std::chrono::steady_clock::now();
+        // 0.9.4.0: WicFileIdentity opens the file (CreateFile + handle query). Single
+        // and Compare view call this on every paint, including zoom/pan animation
+        // frames, so re-verify the identity at most every 500 ms per source.
+        constexpr auto kIdentityReverifyInterval = std::chrono::milliseconds(500);
+        bool recentlyVerified = false;
+        if (const auto cached = wicImageSources_.find(key); cached != wicImageSources_.end()) {
+            recentlyVerified = cached->second.imageSource &&
+                cached->second.identityVerifiedAt != std::chrono::steady_clock::time_point{} &&
+                verifyNow - cached->second.identityVerifiedAt < kIdentityReverifyInterval;
+        }
+        const std::uint64_t identity = recentlyVerified ? 0 : WicFileIdentity(path);
+        if (!recentlyVerified && identity == 0) return nullptr;
         if (auto existing = wicImageSources_.find(key); existing != wicImageSources_.end()) {
-            if (existing->second.identity == identity && existing->second.imageSource) {
+            if ((recentlyVerified || existing->second.identity == identity) && existing->second.imageSource) {
+                if (!recentlyVerified) existing->second.identityVerifiedAt = verifyNow;
                 existing->second.lastUse = ++useCounter_;
                 existing->second.lastUseTime = std::chrono::steady_clock::now();
                 if (existing->second.offered) {
@@ -1223,6 +1304,7 @@ namespace quicksift::app {
             if (FAILED(deviceContext2_->CreateImageSourceFromWic(entry.frame.Get(),
                 D2D1_IMAGE_SOURCE_LOADING_OPTIONS_CACHE_ON_DEMAND, &entry.imageSource))) return nullptr;
             entry.identity = identity;
+            entry.identityVerifiedAt = verifyNow;
             entry.lastUse = ++useCounter_;
             entry.lastUseTime = std::chrono::steady_clock::now();
 
@@ -1359,13 +1441,25 @@ namespace quicksift::app {
 
         if (gridThumbnailRequest) {
             const std::wstring thumbnailRetryKey = NormalizedPathKey(path);
-            if (failedThumbnailPaths_.contains(thumbnailRetryKey)) return existing;
+            // 0.9.4.0 bounded retry policy: terminal failures and paths still inside
+            // their retry backoff are not re-requested from paint.
+            int retryAttempt = 0;
+            bool forceWic = false;
+            if (!thumbnailRetryState_.empty() || !failedThumbnailPaths_.empty()) {
+                const auto photoIndex = IndexForPath(path.wstring());
+                if (photoIndex) {
+                    if (!ThumbnailDecodeAdmissible(VisiblePhoto(*photoIndex), thumbnailRetryKey,
+                        std::chrono::steady_clock::now(), retryAttempt, forceWic)) return existing;
+                } else if (failedThumbnailPaths_.contains(thumbnailRetryKey)) {
+                    return existing;
+                }
+            }
             const bool resolutionSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, false);
             if (exactIt == bitmapCache_.end()) {
                 const std::wstring previewFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
                 if (!HasRecentDecodeFailure(previewFailed))
                     worker_.EnqueuePreview(path, bucket, generation_, priority, CacheClass::Thumbnail, epoch,
-                        thumbnailViewportEpoch, 0, false, 0, ignoreThumbnailViewport);
+                        thumbnailViewportEpoch, retryAttempt, forceWic, 0, ignoreThumbnailViewport);
             } else if (!resolutionSatisfied && !rawJpegOnly) {
                 // Keep an undersized embedded preview as an immediate stand-in, but
                 // never let its bucket identity suppress the real target-sized decode
@@ -1381,23 +1475,54 @@ namespace quicksift::app {
             const bool previewSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, false);
             const std::wstring previewFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
             if (previewIt == bitmapCache_.end() && !previewSatisfied && !HasRecentDecodeFailure(previewFailed)) {
-                worker_.EnqueuePreview(path, bucket, generation_, priority, cacheClass, epoch);
+                RequestViewDecode(path, JobKind::DecodePreview, bucket, cacheClass, priority);
             }
             const bool fullSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, true);
             if (requestFull && !fullSatisfied) {
                 const std::wstring fullFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
                 if (!HasRecentDecodeFailure(fullFailed))
-                    worker_.EnqueueFull(path, bucket, generation_, priority, requestedClass, epoch, 0, false,
-                        reviewState_.Mode() == ViewMode::Single && requestedClass == CacheClass::Full,
-                        viewInteractionEpoch_.load(std::memory_order_acquire));
+                    RequestViewDecode(path, JobKind::DecodeFull, bucket, requestedClass, priority);
             }
         } else if (exactIt == bitmapCache_.end() &&
             !BitmapSatisfiesDisplay(existing, desiredEdge, requestFull)) {
             const std::wstring fullFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
             if (!HasRecentDecodeFailure(fullFailed))
-                worker_.EnqueueFull(path, bucket, generation_, priority, requestedClass, epoch);
+                RequestViewDecode(path, JobKind::DecodeFull, bucket, requestedClass, priority);
         }
+        (void)epoch;
         return existing;
+    }
+
+    void QuickSiftApplicationImpl::RequestViewDecode(const fs::path& path, JobKind kind, int target,
+        CacheClass cacheClass, JobPriority priority, bool prefetch) {
+        const ViewMode mode = reviewState_.Mode();
+        const uint64_t navigationEpoch = reviewState_.Epochs().navigation;
+        const uint64_t interactionEpoch = viewInteractionEpoch_.load(std::memory_order_acquire);
+        const int bucket = BucketFor(std::max(1, target));
+        if (mode == ViewMode::Single || mode == ViewMode::Compare) {
+            // 0.9.4.0: Single/Compare decodes run on the dedicated view lane. The UI
+            // thread never decodes; paint keeps showing the best cached preview or a
+            // scaled-up thumbnail until the completion uploads the new bitmap.
+            int retryAttempt = 0;
+            if (!ViewDecodeAdmissible(path, retryAttempt)) return;
+            worker_.EnqueueViewDecode(path, kind, bucket, generation_, cacheClass, navigationEpoch,
+                mode == ViewMode::Single && cacheClass == CacheClass::Full, interactionEpoch,
+                prefetch, retryAttempt);
+            return;
+        }
+        if (prefetch) return; // neighbour prefetch is a view-mode concept only
+        if (kind == JobKind::DecodePreview) {
+            worker_.EnqueuePreview(path, bucket, generation_, priority, cacheClass, navigationEpoch);
+        } else {
+            // Named arguments: the former call passed (0, false, isSingle, epoch) into
+            // (viewportEpoch, retryAttempt, forceWic, isSingleView) - off by one.
+            constexpr uint64_t viewportEpoch = 0;
+            constexpr int retryAttempt = 0;
+            constexpr bool forceWic = false;
+            constexpr bool isSingleView = false;
+            worker_.EnqueueFull(path, bucket, generation_, priority, cacheClass, navigationEpoch,
+                viewportEpoch, retryAttempt, forceWic, isSingleView, interactionEpoch);
+        }
     }
 
 
@@ -1420,8 +1545,7 @@ namespace quicksift::app {
                 // This is deliberately DecodeFull in the Preview cache lane. An
                 // embedded-thumbnail decode can return the same tiny stand-in,
                 // while this request guarantees a real scaled middle-resolution frame.
-                worker_.EnqueueFull(path, bucket, generation_, priority,
-                    CacheClass::Preview, reviewState_.Epochs().navigation);
+                RequestViewDecode(path, JobKind::DecodeFull, bucket, CacheClass::Preview, priority);
             }
         }
         return existing;

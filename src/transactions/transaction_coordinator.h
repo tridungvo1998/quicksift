@@ -25,8 +25,15 @@ public:
     [[nodiscard]] bool Busy() const noexcept;
     [[nodiscard]] bool FileBusy() const noexcept;
     [[nodiscard]] std::optional<FileTransactionProgress> FileProgress() const;
+    [[nodiscard]] std::optional<MetadataTransactionProgress> MetadataProgress() const noexcept;
     [[nodiscard]] std::uint64_t SubmitFile(FileTransactionPlan& plan);
     [[nodiscard]] std::uint64_t SubmitMetadata(MetadataTransactionPlan& plan);
+    // Interactive edit while a metadata plan runs (see MetadataTransactionService::
+    // SubmitUrgent). Refused while a file transaction runs or a close is pending.
+    [[nodiscard]] std::uint64_t SubmitUrgentMetadata(MetadataTransactionPlan& plan);
+    [[nodiscard]] bool MetadataUrgentSlotFree() const;
+    [[nodiscard]] bool MetadataBusy() const noexcept { return metadataService_.Busy(); }
+    void SkipMetadataWaiting() noexcept { metadataService_.SkipWaiting(); }
     [[nodiscard]] std::optional<FileTransactionResult> TakeFileResult();
     [[nodiscard]] std::optional<MetadataTransactionResult> TakeMetadataResult();
 
@@ -48,6 +55,7 @@ private:
     std::uint64_t nextMetadataToken_ = 1;
     std::uint64_t activeFileToken_ = 0;
     std::uint64_t activeMetadataToken_ = 0;
+    std::uint64_t activeUrgentMetadataToken_ = 0;
     bool closeRequested_ = false;
     bool stopped_ = false;
 };

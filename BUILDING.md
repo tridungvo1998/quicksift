@@ -206,7 +206,7 @@ set QS_SOURCE_URL=https://<exact source release URL>
 package-msix.bat
 ```
 
-The script performs a clean verified Release build, stages `QuickSift.exe`, GPL/source notices and MSIX assets, renders `AppxManifest.xml`, and creates `QuickSift-0.9.3.0-RC-x64.msix` with `makeappx.exe`. If `QS_SIGN_CERT_SHA1` is set it can sign for sideload testing. For Microsoft Store submission, the package may be left unsigned because the Store signs/re-signs certified MSIX packages.
+The script performs a clean verified Release build, stages `QuickSift.exe`, GPL/source notices and MSIX assets, renders `AppxManifest.xml`, and creates `QuickSift-0.9.4.0-RC-x64.msix` with `makeappx.exe`. If `QS_SIGN_CERT_SHA1` is set it can sign for sideload testing. For Microsoft Store submission, the package may be left unsigned because the Store signs/re-signs certified MSIX packages.
 
 When installed as MSIX, QuickSift detects package identity with the native Windows package API and stores QuickSift-owned state under the package `LocalState`; it never attempts to write into the package installation directory. User-requested photo metadata/copy/move/delete operations continue to target the user's selected photo locations.
 

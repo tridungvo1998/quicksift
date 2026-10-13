@@ -8,6 +8,8 @@
 #include <initializer_list>
 #include <algorithm>
 #include <utility>
+#include <unordered_map>
+#include <vector>
 
 namespace quicksift {
 namespace {
@@ -126,10 +128,15 @@ const std::initializer_list<TranslationPair> kTranslations{
     TranslationPair{L"Loading image…", L"Đang tải ảnh…"},
     TranslationPair{L"Loading…", L"Đang tải…"},
     TranslationPair{L"loading…", L"đang tải…"},
-    TranslationPair{L"Red border: the largest detected face appears quite blurry or out of focus. Medium sensitivity flags only clear focus misses; treat this as a warning, not a definitive focus test.",
-        L"Viền đỏ: khuôn mặt lớn nhất được phát hiện có vẻ khá nhòe hoặc lệch nét. Độ nhạy trung bình chỉ đánh dấu các trường hợp hụt nét rõ ràng; đây là cảnh báo, không phải phép kiểm tra nét tuyệt đối."},
-    TranslationPair{L"Face Lock centers the view on the largest detected face. Detection runs locally through Windows Media FaceAnalysis.",
-        L"Khóa khuôn mặt căn vùng nhìn vào khuôn mặt lớn nhất được phát hiện. Việc phát hiện chạy cục bộ qua Windows Media FaceAnalysis."},
+    TranslationPair{L"Couldn't load image", L"Không thể tải ảnh"},
+    TranslationPair{L"Red border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.",
+        L"Viền đỏ: ít nhất một khuôn mặt được phát hiện có vẻ bị nhòe (lệch nét hoặc nhòe chuyển động) hoặc đang nhắm mắt. Các phép kiểm tra được đặt thận trọng; đây là cảnh báo, không phải phép kiểm tra tuyệt đối."},
+    TranslationPair{L"Face Lock centers the view on the face closest to the image centre, or on the face you click. Detection runs locally through Windows Media FaceAnalysis.",
+        L"Khóa khuôn mặt căn vùng nhìn vào khuôn mặt gần tâm ảnh nhất, hoặc vào khuôn mặt bạn nhấp chọn. Việc phát hiện chạy cục bộ qua Windows Media FaceAnalysis."},
+    TranslationPair{L"Face", L"Khuôn mặt"},
+    TranslationPair{L"out of focus", L"lệch nét"},
+    TranslationPair{L"motion blur", L"nhòe chuyển động"},
+    TranslationPair{L"eyes closed", L"nhắm mắt"},
     TranslationPair{L"Face Lock is unavailable because Windows reports that face detection is not supported on this device.",
         L"Khóa khuôn mặt không khả dụng vì Windows báo rằng thiết bị này không hỗ trợ phát hiện khuôn mặt."},
     TranslationPair{L"Windows face detection could not be initialized. QuickSift will retry automatically.",
@@ -262,6 +269,17 @@ const std::initializer_list<TranslationPair> kTranslations{
     TranslationPair{L"Safe JPEG writes enabled", L"Đã bật ghi JPEG an toàn"},
     TranslationPair{L"Fast JPEG writes enabled", L"Đã bật ghi JPEG nhanh"},
     TranslationPair{L"PHOTO DETAILS", L"CHI TIẾT ẢNH"},
+    // 0.9.4.0 UI polish: left-pane section headers, empty states, diagnostic export.
+    TranslationPair{L"USER COMMENTS", L"BÌNH LUẬN NGƯỜI DÙNG"},
+    TranslationPair{L"THUMBNAILS", L"ẢNH THU NHỎ"},
+    TranslationPair{L"RAW HANDLING", L"XỬ LÝ RAW"},
+    TranslationPair{L"METADATA HANDLING", L"XỬ LÝ METADATA"},
+    TranslationPair{L"HELP & DIAGNOSTICS", L"TRỢ GIÚP & CHẨN ĐOÁN"},
+    TranslationPair{L"LANGUAGE", L"NGÔN NGỮ"},
+    TranslationPair{L"No item in Library", L"Thư viện trống"},
+    TranslationPair{L"Diagnostic log exported to:", L"Đã xuất nhật ký chẩn đoán tới:"},
+    TranslationPair{L"QuickSift could not export the diagnostic log to that location.",
+        L"QuickSift không thể xuất nhật ký chẩn đoán tới vị trí đó."},
     TranslationPair{L"Scanning folder…", L"Đang quét thư mục…"},
     TranslationPair{L"Reading EXIF metadata…", L"Đang đọc metadata EXIF…"},
     TranslationPair{L"Unrated", L"Chưa xếp hạng"},
@@ -299,6 +317,284 @@ const std::initializer_list<TranslationPair> kTranslations{
     TranslationPair{L"Undo stopped for safety", L"Hoàn tác đã dừng để đảm bảo an toàn"},
     TranslationPair{L"Redo stopped before changing files", L"Làm lại đã dừng trước khi thay đổi tệp"},
     TranslationPair{L"Redo stopped for safety", L"Làm lại đã dừng để đảm bảo an toàn"},
+    // 0.9.4.0 polish: previously untranslated UI, write-lane and error-catalog keys.
+    TranslationPair{L"0 \u2605 (Unrated)", L"0 \u2605 (Chưa xếp hạng)"},
+    TranslationPair{L"Select 2 to 6 photos to compare",
+        L"Chọn từ 2 đến 6 ảnh để so sánh"},
+    TranslationPair{L"Compare layout is unavailable for this window",
+        L"Bố cục So sánh không khả dụng với kích thước cửa sổ này"},
+    TranslationPair{L"EXIF could not be read because the decoder or filesystem failed temporarily.",
+        L"Không thể đọc EXIF vì bộ giải mã hoặc hệ thống tệp tạm thời gặp lỗi."},
+    TranslationPair{L"No EXIF information was exposed for this file.",
+        L"Tệp này không cung cấp thông tin EXIF nào."},
+    TranslationPair{L"Folder batch needs a refresh",
+        L"Lô thư mục cần được làm mới"},
+    TranslationPair{L"The photos were committed safely, but QuickSift could not finish scheduling all follow-up work. The final folder rebuild will restore ordering and metadata requests.",
+        L"Các ảnh đã được ghi nhận an toàn, nhưng QuickSift chưa thể lên lịch hết các công việc tiếp theo. Lần dựng lại thư mục cuối cùng sẽ khôi phục thứ tự và các yêu cầu đọc metadata."},
+    TranslationPair{L"Folder scan batch could not be committed",
+        L"Không thể ghi nhận lô quét thư mục"},
+    TranslationPair{L"QuickSift left the existing catalog unchanged because one incoming batch could not be validated or allocated safely.",
+        L"QuickSift giữ nguyên danh mục hiện có vì một lô dữ liệu mới không thể được kiểm tra hoặc cấp phát an toàn."},
+    TranslationPair{L"The photos were committed safely, but follow-up UI work stopped unexpectedly. The final folder rebuild will reconcile the view.",
+        L"Các ảnh đã được ghi nhận an toàn, nhưng công việc giao diện tiếp theo đã dừng bất ngờ. Lần dựng lại thư mục cuối cùng sẽ đồng bộ lại chế độ xem."},
+    TranslationPair{L"QuickSift left the existing catalog unchanged after an unexpected catalog error.",
+        L"QuickSift giữ nguyên danh mục hiện có sau một lỗi danh mục không mong muốn."},
+    TranslationPair{L"Folder scan failed",
+        L"Quét thư mục thất bại"},
+    TranslationPair{L"Folder scan incomplete",
+        L"Quét thư mục chưa hoàn tất"},
+    TranslationPair{L"FILE",
+        L"TỆP"},
+    TranslationPair{L"LIBRARY",
+        L"THƯ VIỆN"},
+    TranslationPair{L"SETTINGS",
+        L"CÀI ĐẶT"},
+    TranslationPair{L"User comment saved.",
+        L"Đã lưu ghi chú người dùng."},
+    TranslationPair{L"QuickSift could not locate one or more metadata targets.",
+        L"QuickSift không tìm thấy một hoặc nhiều tệp cần cập nhật metadata."},
+    TranslationPair{L"QuickSift could not determine an image size before preparing a verified metadata update. Nothing was changed.",
+        L"QuickSift không xác định được kích thước ảnh trước khi chuẩn bị bản cập nhật metadata có xác minh. Không có gì thay đổi."},
+    TranslationPair{L"{operation} needs cumulative free space for the complete batch.",
+        L"{operation} cần đủ dung lượng trống cộng dồn cho toàn bộ lô."},
+    TranslationPair{L"Volume:",
+        L"Ổ đĩa:"},
+    TranslationPair{L"Required:",
+        L"Cần:"},
+    TranslationPair{L"Available:",
+        L"Còn trống:"},
+    TranslationPair{L"Nothing was changed.",
+        L"Không có gì thay đổi."},
+    TranslationPair{L"Metadata update is waiting",
+        L"Cập nhật metadata đang chờ"},
+    TranslationPair{L"QuickSift serializes verified file and metadata transactions so they cannot race over the same media.",
+        L"QuickSift xử lý tuần tự các giao dịch tệp và metadata có xác minh để chúng không tranh chấp trên cùng một tệp."},
+    TranslationPair{L"{label} update stopped",
+        L"{label}: cập nhật đã dừng"},
+    TranslationPair{L"{label} already matches the selected photos — no files were rewritten",
+        L"{label} đã khớp với các ảnh được chọn — không tệp nào bị ghi lại"},
+    TranslationPair{L"{label} update could not start",
+        L"{label}: không thể bắt đầu cập nhật"},
+    TranslationPair{L"Another serialized transaction became active before the metadata batch could be submitted.",
+        L"Một giao dịch tuần tự khác đã bắt đầu trước khi lô metadata kịp được gửi."},
+    TranslationPair{L"{count} files",
+        L"{count} tệp"},
+    TranslationPair{L"Retry",
+        L"Thử lại"},
+    TranslationPair{L"Skip",
+        L"Bỏ qua"},
+    TranslationPair{L"Some metadata items could not be written safely.",
+        L"Một số mục metadata không thể được ghi an toàn."},
+    TranslationPair{L"Total failed items:",
+        L"Tổng số mục thất bại:"},
+    TranslationPair{L"External-change conflicts:",
+        L"Xung đột do thay đổi bên ngoài:"},
+    TranslationPair{L"Edits made while this update was running were also undone:",
+        L"Các chỉnh sửa thực hiện trong lúc cập nhật này đang chạy cũng đã được hoàn tác:"},
+    TranslationPair{L"Metadata update cancelled",
+        L"Đã hủy cập nhật metadata"},
+    TranslationPair{L"Metadata update incomplete",
+        L"Cập nhật metadata chưa hoàn tất"},
+    TranslationPair{L"{label} update complete",
+        L"{label}: đã cập nhật xong"},
+    TranslationPair{L"Relinquish history",
+        L"Bỏ lịch sử"},
+    TranslationPair{L"Keep history",
+        L"Giữ lịch sử"},
+    TranslationPair{L"History reconcile is waiting",
+        L"Đối chiếu lịch sử đang chờ"},
+    TranslationPair{L"A serialized file or metadata transaction is still running. QuickSift will not drop history while that work is active.",
+        L"Một giao dịch tệp hoặc metadata tuần tự vẫn đang chạy. QuickSift sẽ không bỏ lịch sử khi công việc đó còn hoạt động."},
+    TranslationPair{L"History entry relinquished; on-disk files left untouched",
+        L"Đã bỏ mục lịch sử; các tệp trên ổ đĩa được giữ nguyên"},
+    TranslationPair{L"Metadata update blocked by an external change",
+        L"Cập nhật metadata bị chặn do có thay đổi từ bên ngoài"},
+    TranslationPair{L"Refresh from disk",
+        L"Làm mới từ ổ đĩa"},
+    TranslationPair{L"Keep catalog",
+        L"Giữ danh mục"},
+    TranslationPair{L"No catalog paths needed refresh; on-disk files left untouched",
+        L"Không có đường dẫn nào trong danh mục cần làm mới; các tệp trên ổ đĩa được giữ nguyên"},
+    TranslationPair{L"Catalog refreshed from disk; on-disk files left untouched",
+        L"Đã làm mới danh mục từ ổ đĩa; các tệp trên ổ đĩa được giữ nguyên"},
+    TranslationPair{L"Undo is waiting",
+        L"Hoàn tác đang chờ"},
+    TranslationPair{L"A serialized file or metadata transaction is still running. QuickSift will not let Undo race it.",
+        L"Một giao dịch tệp hoặc metadata tuần tự vẫn đang chạy. QuickSift sẽ không để Hoàn tác chạy song song với nó."},
+    TranslationPair{L"Undo history is incomplete",
+        L"Lịch sử Hoàn tác không đầy đủ"},
+    TranslationPair{L"The metadata history record is internally inconsistent, so QuickSift refused to write any file.",
+        L"Bản ghi lịch sử metadata không nhất quán nên QuickSift từ chối ghi bất kỳ tệp nào."},
+    TranslationPair{L"Undo could not start",
+        L"Không thể bắt đầu Hoàn tác"},
+    TranslationPair{L"Another serialized transaction became active before metadata Undo could be submitted.",
+        L"Một giao dịch tuần tự khác đã bắt đầu trước khi lệnh Hoàn tác metadata kịp được gửi."},
+    TranslationPair{L"Undoing metadata safely…",
+        L"Đang hoàn tác metadata an toàn…"},
+    TranslationPair{L"Another verified file transaction became active before Undo could be submitted.",
+        L"Một giao dịch tệp có xác minh khác đã bắt đầu trước khi lệnh Hoàn tác kịp được gửi."},
+    TranslationPair{L"Undoing and verifying file history…",
+        L"Đang hoàn tác và xác minh lịch sử tệp…"},
+    TranslationPair{L"Redo is waiting",
+        L"Làm lại đang chờ"},
+    TranslationPair{L"A serialized file or metadata transaction is still running. QuickSift will not let Redo race it.",
+        L"Một giao dịch tệp hoặc metadata tuần tự vẫn đang chạy. QuickSift sẽ không để Làm lại chạy song song với nó."},
+    TranslationPair{L"Redo history is incomplete",
+        L"Lịch sử Làm lại không đầy đủ"},
+    TranslationPair{L"Redo could not start",
+        L"Không thể bắt đầu Làm lại"},
+    TranslationPair{L"Another serialized transaction became active before metadata Redo could be submitted.",
+        L"Một giao dịch tuần tự khác đã bắt đầu trước khi lệnh Làm lại metadata kịp được gửi."},
+    TranslationPair{L"Redoing metadata safely…",
+        L"Đang làm lại metadata an toàn…"},
+    TranslationPair{L"Another verified file transaction became active before Redo could be submitted.",
+        L"Một giao dịch tệp có xác minh khác đã bắt đầu trước khi lệnh Làm lại kịp được gửi."},
+    TranslationPair{L"Redoing and verifying file history…",
+        L"Đang làm lại và xác minh lịch sử tệp…"},
+    TranslationPair{L"the file",
+        L"tệp"},
+    TranslationPair{L"Pick state: Mixed",
+        L"Trạng thái chọn: Hỗn hợp"},
+    TranslationPair{L"Performance HUD enabled.",
+        L"Đã bật HUD hiệu năng."},
+    TranslationPair{L"Performance HUD disabled.",
+        L"Đã tắt HUD hiệu năng."},
+    TranslationPair{L"JPEG metadata edits will use a verified temporary copy, post-write validation, and atomic replacement. This is slower, especially for large JPEGs or slow storage, but it protects the original from partial writes.",
+        L"Chỉnh sửa metadata JPEG sẽ dùng một bản sao tạm có xác minh, kiểm tra sau khi ghi và thay thế nguyên tử. Cách này chậm hơn, nhất là với JPEG lớn hoặc ổ lưu trữ chậm, nhưng bảo vệ tệp gốc khỏi bị ghi dở dang."},
+    TranslationPair{L"JPEG metadata will be written directly to the original file. This is faster, but a crash, power loss, storage fault, or metadata-library failure during the write can damage the JPEG. Enable Safe JPEG writes or use XMP sidecars when file protection matters more than speed.",
+        L"Metadata JPEG sẽ được ghi trực tiếp vào tệp gốc. Cách này nhanh hơn, nhưng sự cố treo ứng dụng, mất điện, lỗi ổ lưu trữ hoặc lỗi thư viện metadata trong lúc ghi có thể làm hỏng tệp JPEG. Hãy bật Ghi JPEG an toàn hoặc dùng tệp XMP sidecar khi việc bảo vệ tệp quan trọng hơn tốc độ."},
+    TranslationPair{L"QuickSift will update a verified temporary copy and atomically replace the original only after validation. Even so, proprietary RAW containers are less universally writable than JPEG, PNG, or TIFF. XMP sidecars remain the safer default. Existing metadata is not automatically migrated between storage modes.",
+        L"QuickSift sẽ cập nhật một bản sao tạm có xác minh và chỉ thay thế nguyên tử tệp gốc sau khi kiểm tra. Dù vậy, định dạng RAW độc quyền khó ghi an toàn hơn JPEG, PNG hay TIFF. Tệp XMP sidecar vẫn là lựa chọn mặc định an toàn hơn. Metadata hiện có không được tự động chuyển giữa các chế độ lưu trữ."},
+    TranslationPair{L"Safe JPG writes",
+        L"Ghi JPG an toàn"},
+    TranslationPair{L"RAW files",
+        L"Tệp RAW"},
+    TranslationPair{L"JPG, PNG and lossy formats",
+        L"JPG, PNG và định dạng nén mất dữ liệu"},
+    TranslationPair{L"Show performance HUD",
+        L"Hiện HUD hiệu năng"},
+    TranslationPair{L"Show diagnostic log",
+        L"Hiện nhật ký chẩn đoán"},
+    TranslationPair{L"All",
+        L"Tất cả"},
+    TranslationPair{L"formats",
+        L"định dạng"},
+    TranslationPair{L"A serialized transaction is still running",
+        L"Một giao dịch tuần tự vẫn đang chạy"},
+    TranslationPair{L"QuickSift runs file and metadata transactions serially to prevent races and accidental overwrites.",
+        L"QuickSift chạy tuần tự các giao dịch tệp và metadata để tránh tranh chấp và ghi đè ngoài ý muốn."},
+    TranslationPair{L"The destination path is not a normal folder. QuickSift stopped before changing any files.",
+        L"Đường dẫn đích không phải là thư mục thông thường. QuickSift đã dừng trước khi thay đổi bất kỳ tệp nào."},
+    TranslationPair{L"QuickSift could not safely inspect the destination folder. No files were changed.",
+        L"QuickSift không thể kiểm tra an toàn thư mục đích. Không có tệp nào bị thay đổi."},
+    TranslationPair{L"QuickSift could not determine the complete size of the selected files. It stopped before copying or moving anything.",
+        L"QuickSift không xác định được tổng dung lượng của các tệp đã chọn. Ứng dụng đã dừng trước khi sao chép hoặc di chuyển bất kỳ tệp nào."},
+    TranslationPair{L"QuickSift could not create or access the destination folder. No files were changed.",
+        L"QuickSift không thể tạo hoặc truy cập thư mục đích. Không có tệp nào bị thay đổi."},
+    TranslationPair{L"Another file operation is already running",
+        L"Một thao tác tệp khác đang chạy"},
+    TranslationPair{L"QuickSift serializes verified file transactions so two operations cannot race over the same media. The new request was not started.",
+        L"QuickSift xử lý tuần tự các giao dịch tệp có xác minh để hai thao tác không tranh chấp trên cùng một tệp. Yêu cầu mới chưa được bắt đầu."},
+    TranslationPair{L"Moving selected files to Deleted…",
+        L"Đang chuyển các tệp đã chọn vào thư mục đã xóa…"},
+    TranslationPair{L"Moving and verifying…",
+        L"Đang di chuyển và xác minh…"},
+    TranslationPair{L"Copying and verifying…",
+        L"Đang sao chép và xác minh…"},
+    TranslationPair{L"File Undo complete",
+        L"Đã hoàn tác thao tác tệp"},
+    TranslationPair{L"File Redo complete",
+        L"Đã làm lại thao tác tệp"},
+    TranslationPair{L"File operation cancelled",
+        L"Đã hủy thao tác tệp"},
+    TranslationPair{L"Copy completed with a warning",
+        L"Sao chép hoàn tất kèm cảnh báo"},
+    TranslationPair{L"Move completed with a warning",
+        L"Di chuyển hoàn tất kèm cảnh báo"},
+    TranslationPair{L"Rating: Unrated",
+        L"Xếp hạng: Chưa xếp hạng"},
+    TranslationPair{L"XMP vs embedded metadata for RAW",
+        L"XMP hay metadata nhúng cho RAW"},
+    TranslationPair{L"XMP vs embedded metadata for JPG/PNG/lossy",
+        L"XMP hay metadata nhúng cho JPG/PNG/nén mất dữ liệu"},
+    TranslationPair{L"XMP vs embedded metadata for TIFF",
+        L"XMP hay metadata nhúng cho TIFF"},
+    TranslationPair{L"Language",
+        L"Ngôn ngữ"},
+    TranslationPair{L"Waiting for a file",
+        L"Đang chờ tệp"},
+    TranslationPair{L"Waiting for {file} — in use by another app",
+        L"Đang chờ {file} — tệp đang được ứng dụng khác sử dụng"},
+    TranslationPair{L"File is in use by another app",
+        L"Tệp đang được ứng dụng khác sử dụng"},
+    TranslationPair{L"{file} stayed locked by another app for 30 seconds. The new value was not written and the previous value is shown again. Close the other app (or pause sync) and choose Retry, or choose Skip.",
+        L"{file} bị ứng dụng khác khóa suốt 30 giây. Giá trị mới chưa được ghi và giá trị trước đó đã được hiển thị lại. Hãy đóng ứng dụng kia (hoặc tạm dừng đồng bộ) rồi chọn Thử lại, hoặc chọn Bỏ qua."},
+    TranslationPair{L"Metadata update skipped",
+        L"Đã bỏ qua cập nhật metadata"},
+    TranslationPair{L"{file} was skipped because another app is using it. The previous value is shown again.",
+        L"Đã bỏ qua {file} vì một ứng dụng khác đang sử dụng tệp. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"File changed outside QuickSift",
+        L"Tệp đã thay đổi bên ngoài QuickSift"},
+    TranslationPair{L"{file} changed outside QuickSift while the update was waiting. Nothing was overwritten.",
+        L"{file} đã thay đổi bên ngoài QuickSift trong lúc bản cập nhật đang chờ. Không có gì bị ghi đè."},
+    TranslationPair{L"There is not enough free space to update {file} safely. The previous value is shown again.",
+        L"Không đủ dung lượng trống để cập nhật {file} an toàn. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"File is read-only",
+        L"Tệp chỉ đọc"},
+    TranslationPair{L"{file} is read-only (or on read-only media). The previous value is shown again.",
+        L"{file} ở chế độ chỉ đọc (hoặc nằm trên thiết bị chỉ đọc). Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"Access denied",
+        L"Bị từ chối truy cập"},
+    TranslationPair{L"Windows denied write access to {file}. The previous value is shown again.",
+        L"Windows từ chối quyền ghi vào {file}. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"Drive is not responding",
+        L"Ổ đĩa không phản hồi"},
+    TranslationPair{L"The drive holding {file} did not respond. The previous value is shown again.",
+        L"Ổ đĩa chứa {file} không phản hồi. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"Metadata update could not be verified",
+        L"Không thể xác minh bản cập nhật metadata"},
+    TranslationPair{L"QuickSift could not verify the update of {file}; the original file was kept unchanged.",
+        L"QuickSift không thể xác minh bản cập nhật của {file}; tệp gốc được giữ nguyên."},
+    TranslationPair{L"Metadata cannot be stored in this file",
+        L"Không thể lưu metadata vào tệp này"},
+    TranslationPair{L"{file} cannot carry this metadata safely. The previous value is shown again.",
+        L"{file} không thể lưu metadata này một cách an toàn. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"The requested value is outside the supported range. Nothing was changed.",
+        L"Giá trị yêu cầu nằm ngoài phạm vi được hỗ trợ. Không có gì thay đổi."},
+    TranslationPair{L"{file} could not be updated safely. The previous value is shown again.",
+        L"Không thể cập nhật {file} an toàn. Giá trị trước đó đã được hiển thị lại."},
+    TranslationPair{L"The metadata update was cancelled at a safe file boundary.",
+        L"Cập nhật metadata đã bị hủy tại một ranh giới tệp an toàn."},
+    TranslationPair{L"An image decoder did not release {file} in time. Try again in a moment.",
+        L"Một bộ giải mã ảnh chưa giải phóng {file} kịp thời. Hãy thử lại sau giây lát."},
+    TranslationPair{L"Metadata update queued",
+        L"Cập nhật metadata đang xếp hàng"},
+    TranslationPair{L"Saving after the current update…",
+        L"Sẽ lưu sau bản cập nhật hiện tại…"},
+    TranslationPair{L"Cache is busy",
+        L"Bộ nhớ đệm đang bận"},
+    TranslationPair{L"The thumbnail cache is busy; QuickSift will retry in the background.",
+        L"Bộ nhớ đệm ảnh thu nhỏ đang bận; QuickSift sẽ thử lại ở chế độ nền."},
+    TranslationPair{L"Cache was rebuilt",
+        L"Đã dựng lại bộ nhớ đệm"},
+    TranslationPair{L"The thumbnail cache could not be upgraded and was rebuilt. Thumbnails will be regenerated.",
+        L"Không thể nâng cấp bộ nhớ đệm ảnh thu nhỏ nên bộ nhớ đệm đã được dựng lại. Ảnh thu nhỏ sẽ được tạo lại."},
+    TranslationPair{L"Search is incomplete",
+        L"Kết quả tìm kiếm chưa đầy đủ"},
+    TranslationPair{L"Some photos could not be read for search and are matched by name only.",
+        L"Một số ảnh không đọc được để tìm kiếm nên chỉ được so khớp theo tên."},
+    TranslationPair{L"The ratings file could not be read.",
+        L"Không thể đọc tệp xếp hạng."},
+    TranslationPair{L"Ratings export failed",
+        L"Xuất xếp hạng thất bại"},
+    TranslationPair{L"The ratings file could not be written.",
+        L"Không thể ghi tệp xếp hạng."},
+    TranslationPair{L"The batch could not be prepared.",
+        L"Không thể chuẩn bị lô xử lý."},
+    TranslationPair{L"Background task stopped",
+        L"Tác vụ nền đã dừng"},
+    TranslationPair{L"A background task stopped unexpectedly. Details were written to the diagnostic log.",
+        L"Một tác vụ nền đã dừng bất ngờ. Chi tiết đã được ghi vào nhật ký chẩn đoán."},
 };
 
 // Longer fragments come first. This second pass localizes generated status,
@@ -362,6 +658,371 @@ constexpr std::array kDynamicFragments{
     TranslationPair{L"advanced", L"nâng cao"},
     TranslationPair{L"verified copy", L"bản sao đã xác minh"},
     TranslationPair{L"faster", L"nhanh hơn"},
+    // 0.9.4.0 Import / Export Ratings and face-outline UX.
+    TranslationPair{L"Import / Export Ratings",
+        L"Nhập / Xuất xếp hạng"},
+    TranslationPair{L"Export saves the star rating, pick state and color tag of every file in this folder that has any of them to a UTF-8 text file. Import reads such a file and applies it to the files with the same names in this folder.",
+        L"Xuất sẽ lưu số sao, trạng thái chọn và nhãn màu của mọi tệp trong thư mục này có ít nhất một trong các giá trị đó vào một tệp văn bản UTF-8. Nhập sẽ đọc tệp như vậy và áp dụng cho các tệp cùng tên trong thư mục này."},
+    TranslationPair{L"Export…",
+        L"Xuất…"},
+    TranslationPair{L"Import…",
+        L"Nhập…"},
+    TranslationPair{L"Export ratings",
+        L"Xuất xếp hạng"},
+    TranslationPair{L"Import ratings",
+        L"Nhập xếp hạng"},
+    TranslationPair{L"Open a folder first.",
+        L"Hãy mở một thư mục trước."},
+    TranslationPair{L"QuickSift is still listing this folder. Try again when the folder has finished loading.",
+        L"QuickSift vẫn đang liệt kê thư mục này. Hãy thử lại khi thư mục đã tải xong."},
+    TranslationPair{L"Wait for the current file, metadata or ratings operation to finish, then try again.",
+        L"Hãy chờ thao tác tệp, metadata hoặc xếp hạng hiện tại hoàn tất rồi thử lại."},
+    TranslationPair{L"Text files (*.txt)",
+        L"Tệp văn bản (*.txt)"},
+    TranslationPair{L"QuickSift could not start the export.",
+        L"QuickSift không thể bắt đầu xuất."},
+    TranslationPair{L"Exporting ratings…",
+        L"Đang xuất xếp hạng…"},
+    TranslationPair{L"QuickSift could not start reading the file.",
+        L"QuickSift không thể bắt đầu đọc tệp."},
+    TranslationPair{L"Ratings exported: {count} of {total} files carry data — {file}",
+        L"Đã xuất xếp hạng: {count} trên {total} tệp có dữ liệu — {file}"},
+    TranslationPair{L"Export failed",
+        L"Xuất thất bại"},
+    TranslationPair{L"QuickSift could not write the ratings file. Nothing was exported.",
+        L"QuickSift không thể ghi tệp xếp hạng. Không có gì được xuất."},
+    TranslationPair{L"Ratings import cancelled because the folder changed.",
+        L"Đã hủy nhập xếp hạng vì thư mục đã thay đổi."},
+    TranslationPair{L"The file is far too large to be a QuickSift ratings file.",
+        L"Tệp quá lớn để là một tệp xếp hạng QuickSift."},
+    TranslationPair{L"Import failed",
+        L"Nhập thất bại"},
+    TranslationPair{L"QuickSift could not read the ratings file. Nothing was changed.",
+        L"QuickSift không thể đọc tệp xếp hạng. Không có gì thay đổi."},
+    TranslationPair{L"The file is empty.",
+        L"Tệp trống."},
+    TranslationPair{L"The file is not valid UTF-8 text.",
+        L"Tệp không phải văn bản UTF-8 hợp lệ."},
+    TranslationPair{L"The header line is missing or is not a QuickSift header.",
+        L"Thiếu dòng tiêu đề hoặc đó không phải tiêu đề QuickSift."},
+    TranslationPair{L"The \"Exported time\" line is missing or invalid.",
+        L"Dòng \"Exported time\" bị thiếu hoặc không hợp lệ."},
+    TranslationPair{L"The \"Total files count\" line is missing or invalid.",
+        L"Dòng \"Total files count\" bị thiếu hoặc không hợp lệ."},
+    TranslationPair{L"The rated/picked/tagged files count line is missing or invalid.",
+        L"Dòng đếm số tệp đã xếp hạng/chọn/gắn nhãn bị thiếu hoặc không hợp lệ."},
+    TranslationPair{L"The first separator line (—) is missing.",
+        L"Thiếu dòng phân cách đầu tiên (—)."},
+    TranslationPair{L"The \"Exported data:\" line is missing.",
+        L"Thiếu dòng \"Exported data:\"."},
+    TranslationPair{L"A data line is not \"FILENAME.EXTENSION | Star Rating | Pick State | Color Tag\" with valid values.",
+        L"Một dòng dữ liệu không có dạng \"FILENAME.EXTENSION | Star Rating | Pick State | Color Tag\" với giá trị hợp lệ."},
+    TranslationPair{L"The same file name is listed more than once.",
+        L"Cùng một tên tệp xuất hiện nhiều lần."},
+    TranslationPair{L"The closing separator line (—) is missing.",
+        L"Thiếu dòng phân cách cuối (—)."},
+    TranslationPair{L"The footer line is missing.",
+        L"Thiếu dòng chân trang."},
+    TranslationPair{L"There is unexpected text after the footer.",
+        L"Có nội dung không mong đợi sau dòng chân trang."},
+    TranslationPair{L"The number of data lines does not match the count in the header.",
+        L"Số dòng dữ liệu không khớp với số đếm ở phần đầu."},
+    TranslationPair{L"The file is not a valid QuickSift ratings export.",
+        L"Tệp không phải bản xuất xếp hạng QuickSift hợp lệ."},
+    TranslationPair{L"This file is not a valid QuickSift ratings export, so nothing was imported.",
+        L"Tệp này không phải bản xuất xếp hạng QuickSift hợp lệ nên không có gì được nhập."},
+    TranslationPair{L"Line {line}:",
+        L"Dòng {line}:"},
+    TranslationPair{L"Total files count mismatch. Expected is {expected} files, {present} files present. Continue?",
+        L"Tổng số tệp không khớp. Dự kiến {expected} tệp, hiện có {present} tệp. Tiếp tục?"},
+    TranslationPair{L"Continue",
+        L"Tiếp tục"},
+    TranslationPair{L"Some files to be modified are missing. Ignore and continue?",
+        L"Một số tệp cần sửa đổi bị thiếu. Bỏ qua và tiếp tục?"},
+    TranslationPair{L"{missing} of {listed} listed files are not in this folder.",
+        L"{missing} trên {listed} tệp trong danh sách không có trong thư mục này."},
+    TranslationPair{L"Yes",
+        L"Có"},
+    TranslationPair{L"See missing files list",
+        L"Xem danh sách tệp bị thiếu"},
+    TranslationPair{L"Import ratings for {count} files",
+        L"Nhập xếp hạng cho {count} tệp"},
+    TranslationPair{L"Are you sure? This cannot be undone.",
+        L"Bạn có chắc không? Thao tác này không thể hoàn tác."},
+    TranslationPair{L"Import",
+        L"Nhập"},
+    TranslationPair{L"Missing files",
+        L"Tệp bị thiếu"},
+    TranslationPair{L"Ratings import complete: {applied} applied, {skipped} skipped, {failed} failed.",
+        L"Nhập xếp hạng hoàn tất: {applied} đã áp dụng, {skipped} bỏ qua, {failed} thất bại."},
+    TranslationPair{L"Importing ratings…",
+        L"Đang nhập xếp hạng…"},
+    TranslationPair{L"External-change conflicts: {count}",
+        L"Xung đột do thay đổi bên ngoài: {count}"},
+    TranslationPair{L"Ratings import cancelled",
+        L"Đã hủy nhập xếp hạng"},
+    TranslationPair{L"Ratings import incomplete",
+        L"Nhập xếp hạng chưa hoàn tất"},
+    TranslationPair{L"Reading ratings file…",
+        L"Đang đọc tệp xếp hạng…"},
+    TranslationPair{L"Exporting ratings: {done} / {total} files",
+        L"Đang xuất xếp hạng: {done} / {total} tệp"},
+    TranslationPair{L"Importing ratings: {done} / {total} files",
+        L"Đang nhập xếp hạng: {done} / {total} tệp"},
+    TranslationPair{L"Ratings import",
+        L"Nhập xếp hạng"},
+    TranslationPair{L"Ratings import could not start",
+        L"Không thể bắt đầu nhập xếp hạng"},
+    TranslationPair{L"Face outlines: always shown (right-click to auto-hide)",
+        L"Viền khuôn mặt: luôn hiển thị (nhấp chuột phải để tự ẩn)"},
+    TranslationPair{L"Face outlines: auto-hide after 1 second (right-click to keep shown)",
+        L"Viền khuôn mặt: tự ẩn sau 1 giây (nhấp chuột phải để luôn hiển thị)"},
+    // 0.9.4.0 Batch Processing.
+    TranslationPair{L"Batch Processing",
+        L"Xử lý hàng loạt"},
+    TranslationPair{L"File name list",
+        L"Danh sách tên tệp"},
+    TranslationPair{L"Type or paste file names, separated by spaces, commas, semicolons or new lines.",
+        L"Nhập hoặc dán tên tệp, phân tách bằng dấu cách, dấu phẩy, dấu chấm phẩy hoặc xuống dòng."},
+    TranslationPair{L"Load names from folder",
+        L"Tải tên từ thư mục"},
+    TranslationPair{L"Load names",
+        L"Tải tên"},
+    TranslationPair{L"Do what?",
+        L"Làm gì?"},
+    TranslationPair{L"Star rating",
+        L"Số sao"},
+    TranslationPair{L"Pick state",
+        L"Trạng thái chọn"},
+    TranslationPair{L"Color tag",
+        L"Nhãn màu"},
+    TranslationPair{L"No change",
+        L"Không đổi"},
+    TranslationPair{L"Additional settings",
+        L"Cài đặt bổ sung"},
+    TranslationPair{L"Extensions",
+        L"Phần mở rộng"},
+    TranslationPair{L"e.g. jpg, arw (empty = all supported types)",
+        L"ví dụ: jpg, arw (để trống = mọi định dạng được hỗ trợ)"},
+    TranslationPair{L"Matching method",
+        L"Cách so khớp"},
+    TranslationPair{L"Partial matching",
+        L"So khớp một phần"},
+    TranslationPair{L"Complete matching",
+        L"So khớp toàn bộ"},
+    TranslationPair{L"Execute",
+        L"Thực hiện"},
+    TranslationPair{L"Confirm",
+        L"Xác nhận"},
+    TranslationPair{L"Not a supported image type: {list}",
+        L"Không phải định dạng ảnh được hỗ trợ: {list}"},
+    TranslationPair{L"QuickSift could not open the Batch Processing window.",
+        L"QuickSift không thể mở cửa sổ Xử lý hàng loạt."},
+    TranslationPair{L"QuickSift could not start reading that folder.",
+        L"QuickSift không thể bắt đầu đọc thư mục đó."},
+    TranslationPair{L"Reading folder…",
+        L"Đang đọc thư mục…"},
+    TranslationPair{L"Enter at least one file name.",
+        L"Hãy nhập ít nhất một tên tệp."},
+    TranslationPair{L"Choose at least one change under \u201CDo what?\u201D.",
+        L"Hãy chọn ít nhất một thay đổi trong mục \u201CLàm gì?\u201D."},
+    TranslationPair{L"Fix the Extensions field: it lists a type QuickSift does not support.",
+        L"Hãy sửa ô Phần mở rộng: ô này có định dạng QuickSift không hỗ trợ."},
+    TranslationPair{L"QuickSift could not start Batch Processing.",
+        L"QuickSift không thể bắt đầu Xử lý hàng loạt."},
+    TranslationPair{L"Finding matching files…",
+        L"Đang tìm các tệp khớp…"},
+    TranslationPair{L"QuickSift could not read that folder.",
+        L"QuickSift không thể đọc thư mục đó."},
+    TranslationPair{L"That folder has no supported image files.",
+        L"Thư mục đó không có tệp ảnh nào được hỗ trợ."},
+    TranslationPair{L"The name list would be too long. Nothing was added.",
+        L"Danh sách tên sẽ quá dài. Không có tên nào được thêm."},
+    TranslationPair{L"Added {added} names ({duplicates} already listed)",
+        L"Đã thêm {added} tên ({duplicates} tên đã có sẵn)"},
+    TranslationPair{L"The folder changed. Check the settings and try again.",
+        L"Thư mục đã thay đổi. Hãy kiểm tra cài đặt và thử lại."},
+    TranslationPair{L"QuickSift could not prepare Batch Processing.",
+        L"QuickSift không thể chuẩn bị Xử lý hàng loạt."},
+    TranslationPair{L"Extensions: all supported image types (the Extensions field is empty).",
+        L"Phần mở rộng: mọi định dạng ảnh được hỗ trợ (ô Phần mở rộng để trống)."},
+    TranslationPair{L"No files in this folder match the names and extensions given. Nothing was changed.",
+        L"Không có tệp nào trong thư mục này khớp với tên và phần mở rộng đã cho. Không có gì thay đổi."},
+    TranslationPair{L"Batch operations: {count} files ({breakdown}) will be processed. Confirm? This cannot be undone.",
+        L"Thao tác hàng loạt: {count} tệp ({breakdown}) sẽ được xử lý. Xác nhận? Thao tác này không thể hoàn tác."},
+    TranslationPair{L"Batch operations: {count} file ({breakdown}) will be processed. Confirm? This cannot be undone.",
+        L"Thao tác hàng loạt: {count} tệp ({breakdown}) sẽ được xử lý. Xác nhận? Thao tác này không thể hoàn tác."},
+    TranslationPair{L"{count} name matched no file.",
+        L"{count} tên không khớp với tệp nào."},
+    TranslationPair{L"{count} names matched no file.",
+        L"{count} tên không khớp với tệp nào."},
+    TranslationPair{L"See unmatched names",
+        L"Xem các tên không khớp"},
+    TranslationPair{L"Unmatched names",
+        L"Các tên không khớp"},
+    TranslationPair{L"Batch processing",
+        L"Xử lý hàng loạt"},
+    TranslationPair{L"Batch processing…",
+        L"Đang xử lý hàng loạt…"},
+    TranslationPair{L"Batch processing: {done} / {total} files",
+        L"Đang xử lý hàng loạt: {done} / {total} tệp"},
+    TranslationPair{L"Batch processing: preparing…",
+        L"Xử lý hàng loạt: đang chuẩn bị…"},
+    TranslationPair{L"Batch processing complete: {applied} applied, {skipped} skipped, {failed} failed.",
+        L"Xử lý hàng loạt hoàn tất: {applied} đã áp dụng, {skipped} bỏ qua, {failed} thất bại."},
+    TranslationPair{L"Batch processing cancelled",
+        L"Đã hủy xử lý hàng loạt"},
+    TranslationPair{L"Batch processing incomplete",
+        L"Xử lý hàng loạt chưa hoàn tất"},
+    TranslationPair{L"Batch processing could not start",
+        L"Không thể bắt đầu xử lý hàng loạt"},
+    // Thumbnail search box
+    TranslationPair{L"Search names, 8AM, date:12, 5 stars, red, picked\u2026",
+        L"Tìm tên, 8AM, date:12, 5 sao, đỏ, đã chọn\u2026"},
+    TranslationPair{L"{shown} of {total}", L"{shown} / {total}"},
+    TranslationPair{L"Searching\u2026", L"Đang tìm\u2026"},
+    TranslationPair{L"No photos match the search", L"Không có ảnh nào khớp với tìm kiếm"},
+    // Status-bar filter tags (streamed into the status line, localized as fragments).
+    TranslationPair{L"  •  date filter", L"  •  lọc ngày"},
+    TranslationPair{L"  •  rating filter", L"  •  lọc xếp hạng"},
+    TranslationPair{L"  •  pick filter", L"  •  lọc trạng thái chọn"},
+    TranslationPair{L"  •  label filter", L"  •  lọc nhãn"},
+    TranslationPair{L"  •  format filter", L"  •  lọc định dạng"},
+    TranslationPair{L"  •  metadata pending", L"  •  metadata đang chờ"},
+    // 0.9.4.0 polish: transaction/sidecar result details. They are often extended
+    // with sizes or paths, so they live here as sentence fragments.
+    TranslationPair{L"The metadata patch contains no supported change.",
+        L"Bản vá metadata không chứa thay đổi nào được hỗ trợ."},
+    TranslationPair{L"The XMP sidecar identity could not be captured safely.",
+        L"Không thể ghi nhận an toàn danh tính của tệp XMP sidecar."},
+    TranslationPair{L"The existing XMP sidecar could not be decoded, so QuickSift preserved it unchanged.",
+        L"Không thể giải mã tệp XMP sidecar hiện có, vì vậy QuickSift giữ nguyên tệp đó."},
+    TranslationPair{L"The rating property could not be updated without rewriting unfamiliar XMP.",
+        L"Không thể cập nhật thuộc tính xếp hạng mà không ghi lại phần XMP lạ."},
+    TranslationPair{L"The color-label property could not be updated without rewriting unfamiliar XMP.",
+        L"Không thể cập nhật thuộc tính nhãn màu mà không ghi lại phần XMP lạ."},
+    TranslationPair{L"The pick-state property could not be updated without rewriting unfamiliar XMP.",
+        L"Không thể cập nhật thuộc tính trạng thái chọn mà không ghi lại phần XMP lạ."},
+    TranslationPair{L"The XMP sidecar changed outside QuickSift, so the metadata update was stopped.",
+        L"Tệp XMP sidecar đã bị thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"Another app is using the XMP sidecar, so it could not be published yet.",
+        L"Một ứng dụng khác đang dùng tệp XMP sidecar nên chưa thể ghi tệp này."},
+    TranslationPair{L"The XMP sidecar could not be published atomically.",
+        L"Không thể ghi tệp XMP sidecar theo cách nguyên tử."},
+    TranslationPair{L"The sidecar was written but the requested metadata could not be verified.",
+        L"Tệp sidecar đã được ghi nhưng không thể xác minh metadata được yêu cầu."},
+    TranslationPair{L"An unexpected XMP sidecar error occurred.",
+        L"Đã xảy ra lỗi tệp XMP sidecar không mong muốn."},
+    TranslationPair{L"The update is verified, but QuickSift retained the unchanged private backup at: ",
+        L"Bản cập nhật đã được xác minh, nhưng QuickSift vẫn giữ bản sao lưu riêng chưa thay đổi tại: "},
+    TranslationPair{L"This build does not include embedded-metadata support. Use XMP sidecars or build with build-release.cmd.",
+        L"Bản dựng này không hỗ trợ metadata nhúng. Hãy dùng tệp XMP sidecar hoặc dựng lại bằng build-release.cmd."},
+    TranslationPair{L"A guarded Undo primitive raised an exception.",
+        L"Một thao tác Hoàn tác được bảo vệ đã phát sinh ngoại lệ."},
+    TranslationPair{L"A guarded Redo primitive raised an exception.",
+        L"Một thao tác Làm lại được bảo vệ đã phát sinh ngoại lệ."},
+    TranslationPair{L"History media-group compensation was incomplete: ",
+        L"Việc bù trừ nhóm tệp trong lịch sử chưa hoàn tất: "},
+    TranslationPair{L"The operation was cancelled at a safe media-group boundary.",
+        L"Thao tác đã bị hủy tại một ranh giới nhóm tệp an toàn."},
+    TranslationPair{L"A verified file primitive raised an exception before completing its media group.",
+        L"Một thao tác tệp có xác minh đã phát sinh ngoại lệ trước khi hoàn tất nhóm tệp của nó."},
+    TranslationPair{L"A verified companion-file primitive raised an exception.",
+        L"Một thao tác trên tệp đi kèm có xác minh đã phát sinh ngoại lệ."},
+    TranslationPair{L"Media-group rollback was incomplete: ",
+        L"Việc khôi phục nhóm tệp chưa hoàn tất: "},
+    TranslationPair{L"The file transaction stopped after an unexpected exception at a safe boundary.",
+        L"Giao dịch tệp đã dừng tại một ranh giới an toàn sau một ngoại lệ không mong muốn."},
+    TranslationPair{L"The metadata batch was cancelled while waiting for a file to be released.",
+        L"Lô cập nhật metadata đã bị hủy trong khi chờ một tệp được giải phóng."},
+    TranslationPair{L"Skipped while waiting for the file to be released by another app.",
+        L"Đã bỏ qua trong khi chờ ứng dụng khác giải phóng tệp."},
+    TranslationPair{L"Active decoders could not be released for the metadata batch.",
+        L"Không thể giải phóng các bộ giải mã đang hoạt động cho lô cập nhật metadata."},
+    TranslationPair{L"The metadata batch was cancelled at a safe file boundary.",
+        L"Lô cập nhật metadata đã bị hủy tại một ranh giới tệp an toàn."},
+    TranslationPair{L" (Windows error ",
+        L" (lỗi Windows "},
+    TranslationPair{L"Source and destination identify the same path.",
+        L"Nguồn và đích trỏ đến cùng một đường dẫn."},
+    TranslationPair{L"The destination already exists or cannot be safely inspected.",
+        L"Đích đã tồn tại hoặc không thể kiểm tra an toàn."},
+    TranslationPair{L"The destination folder could not be created.",
+        L"Không thể tạo thư mục đích."},
+    TranslationPair{L"The source is not a normal, fingerprintable file.",
+        L"Nguồn không phải là một tệp thông thường có thể lấy dấu vân tay."},
+    TranslationPair{L"Memory allocation for the locked-handle rename failed.",
+        L"Cấp phát bộ nhớ cho thao tác đổi tên bằng handle bị khóa đã thất bại."},
+    TranslationPair{L"The source identity changed during the cross-volume handoff.",
+        L"Danh tính của tệp nguồn đã thay đổi trong lúc chuyển giữa các ổ đĩa."},
+    TranslationPair{L"The published destination changed before source retirement.",
+        L"Tệp đích đã ghi bị thay đổi trước khi gỡ bỏ tệp nguồn."},
+    TranslationPair{L"The source could not be retired after final destination verification.",
+        L"Không thể gỡ bỏ tệp nguồn sau khi xác minh tệp đích lần cuối."},
+    TranslationPair{L"The destination folder is unavailable or lacks verified-copy headroom.",
+        L"Thư mục đích không khả dụng hoặc không đủ dung lượng dự phòng cho bản sao có xác minh."},
+    TranslationPair{L"Could not reserve a private verification filename.",
+        L"Không thể dành riêng một tên tệp xác minh riêng tư."},
+    TranslationPair{L"Memory allocation for exact-object rollback failed.",
+        L"Cấp phát bộ nhớ cho việc khôi phục chính xác đối tượng đã thất bại."},
+    TranslationPair{L"Could not prepare handle-bound publication and rollback paths.",
+        L"Không thể chuẩn bị các đường dẫn ghi và khôi phục gắn với handle."},
+    TranslationPair{L"The folder could not be enumerated safely.",
+        L"Không thể liệt kê thư mục một cách an toàn."},
+    TranslationPair{L"The folder was only partially enumerated.",
+        L"Thư mục chỉ được liệt kê một phần."},
+    TranslationPair{L"\n\nWindows error: ",
+        L"\n\nLỗi Windows: "},
+    TranslationPair{L"The embedded metadata container could not be updated safely.",
+        L"Không thể cập nhật an toàn vùng chứa metadata nhúng."},
+    TranslationPair{L"\n\nRequired working space: ",
+        L"\n\nDung lượng làm việc cần thiết: "},
+    TranslationPair{L"\nAvailable space: ",
+        L"\nDung lượng khả dụng: "},
+    TranslationPair{L"A file expected at the operation destination is missing:\n\n",
+        L"Thiếu một tệp lẽ ra phải có ở đích của thao tác:\n\n"},
+    TranslationPair{L"A destination file changed after QuickSift created it:\n\n",
+        L"Một tệp đích đã thay đổi sau khi QuickSift tạo ra nó:\n\n"},
+    TranslationPair{L"The original location is no longer empty:\n\n",
+        L"Vị trí ban đầu không còn trống:\n\n"},
+    TranslationPair{L"There is not enough free space to restore files across volumes.\n\nRequired working space: ",
+        L"Không đủ dung lượng trống để khôi phục tệp giữa các ổ đĩa.\n\nDung lượng làm việc cần thiết: "},
+    TranslationPair{L"A source file is missing, inaccessible, symbolic, or not a normal file:\n\n",
+        L"Một tệp nguồn bị thiếu, không truy cập được, là liên kết tượng trưng hoặc không phải tệp thông thường:\n\n"},
+    TranslationPair{L"A source file changed after Undo, so Redo will not copy or move different bytes:\n\n",
+        L"Một tệp nguồn đã thay đổi sau khi Hoàn tác, vì vậy Làm lại sẽ không sao chép hoặc di chuyển dữ liệu khác:\n\n"},
+    TranslationPair{L"The source and destination resolve to the same path:\n\n",
+        L"Nguồn và đích trỏ đến cùng một đường dẫn:\n\n"},
+    TranslationPair{L"A destination filename is already occupied:\n\n",
+        L"Một tên tệp đích đã bị chiếm:\n\n"},
+    TranslationPair{L"There is not enough free space to repeat this file operation.\n\nRequired working space: ",
+        L"Không đủ dung lượng trống để lặp lại thao tác tệp này.\n\nDung lượng làm việc cần thiết: "},
+    TranslationPair{L"\n\nQuickSift left the entire operation untouched. It never overwrites or automatically renames files.",
+        L"\n\nQuickSift giữ nguyên toàn bộ thao tác. Ứng dụng không bao giờ ghi đè hoặc tự động đổi tên tệp."},
+    TranslationPair{L"The file's rating changed outside QuickSift, so the metadata update was stopped.",
+        L"Xếp hạng của tệp đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The file's color label changed outside QuickSift, so the metadata update was stopped.",
+        L"Nhãn màu của tệp đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The file's pick state changed outside QuickSift, so the metadata update was stopped.",
+        L"Trạng thái chọn của tệp đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The file's metadata field changed outside QuickSift, so the metadata update was stopped.",
+        L"Một trường metadata của tệp đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The image's rating changed outside QuickSift, so the metadata update was stopped.",
+        L"Xếp hạng của ảnh đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The image's color label changed outside QuickSift, so the metadata update was stopped.",
+        L"Nhãn màu của ảnh đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The image's pick state changed outside QuickSift, so the metadata update was stopped.",
+        L"Trạng thái chọn của ảnh đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The image's metadata field changed outside QuickSift, so the metadata update was stopped.",
+        L"Một trường metadata của ảnh đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata đã dừng."},
+    TranslationPair{L"The JPEG's rating changed outside QuickSift, so the direct metadata update was stopped.",
+        L"Xếp hạng của tệp JPEG đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata trực tiếp đã dừng."},
+    TranslationPair{L"The JPEG's color label changed outside QuickSift, so the direct metadata update was stopped.",
+        L"Nhãn màu của tệp JPEG đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata trực tiếp đã dừng."},
+    TranslationPair{L"The JPEG's pick state changed outside QuickSift, so the direct metadata update was stopped.",
+        L"Trạng thái chọn của tệp JPEG đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata trực tiếp đã dừng."},
+    TranslationPair{L"The JPEG's metadata field changed outside QuickSift, so the direct metadata update was stopped.",
+        L"Một trường metadata của tệp JPEG đã thay đổi bên ngoài QuickSift nên việc cập nhật metadata trực tiếp đã dừng."},
 };
 
 void ReplaceAll(std::wstring& value, std::wstring_view from, std::wstring_view to) {
@@ -375,13 +1036,46 @@ void ReplaceAll(std::wstring& value, std::wstring_view from, std::wstring_view t
 
 } // namespace
 
+namespace {
+
+// Built once (thread-safe function-local static). Exact keys come from both
+// tables, first entry wins, so a whole-string match never goes through the
+// fragment pass. Fragments are applied longest-first so that a short fragment
+// ("Batch processing") can no longer pre-empt a longer, more specific one
+// ("Batch processing cancelled") and leave half-English text behind. The
+// portable checker (scripts/check-localization.py) mirrors this exact order.
+struct LookupIndex {
+    std::unordered_map<std::wstring_view, std::wstring_view> exact;
+    std::vector<const TranslationPair*> fragments;
+};
+
+const LookupIndex& Index() {
+    static const LookupIndex index = [] {
+        LookupIndex built;
+        built.exact.reserve(kTranslations.size() + kDynamicFragments.size());
+        for (const auto& item : kTranslations) built.exact.emplace(item.english, item.vietnamese);
+        for (const auto& item : kDynamicFragments) built.exact.emplace(item.english, item.vietnamese);
+        built.fragments.reserve(kDynamicFragments.size());
+        for (const auto& item : kDynamicFragments) built.fragments.push_back(&item);
+        std::stable_sort(built.fragments.begin(), built.fragments.end(),
+            [](const TranslationPair* a, const TranslationPair* b) {
+                return a->english.size() > b->english.size();
+            });
+        return built;
+    }();
+    return index;
+}
+
+} // namespace
+
 std::wstring Localizer::Text(std::wstring_view english) const {
     if (language_ == Language::English) return std::wstring(english);
-    for (const auto& item : kTranslations) {
-        if (item.english == english) return std::wstring(item.vietnamese);
-    }
+    const LookupIndex& index = Index();
+    if (const auto found = index.exact.find(english); found != index.exact.end())
+        return std::wstring(found->second);
     std::wstring localized(english);
-    for (const auto& item : kDynamicFragments) ReplaceAll(localized, item.english, item.vietnamese);
+    for (const TranslationPair* item : index.fragments)
+        ReplaceAll(localized, item->english, item->vietnamese);
     return localized;
 }
 
@@ -444,6 +1138,7 @@ PHÍM TẮT
 • Nhãn màu: 6 (Đỏ), 7 (Vàng), 8 (Xanh lá), 9 (Xanh dương), Ctrl+5 (Tím), Ctrl+0 (xóa nhãn).
 • Xem ảnh: Con lăn (thu phóng), Kéo (di chuyển), F (vừa khung), Z (100%), R (xoay), F11 (toàn màn hình), F7 (thanh phim).
 • Lịch sử: Ctrl+Z (hoàn tác), Ctrl+Y (làm lại).
+• Tìm kiếm (chế độ Ảnh thu nhỏ): Ctrl+F (đặt con trỏ vào ô tìm kiếm), Enter/Tab/Mũi tên xuống (áp dụng và về lưới), Esc (xóa nội dung; bấm lần nữa để rời ô).
 
 BẮT ĐẦU
 • Mở: chọn thư mục chứa ảnh. Danh sách thư mục ở mép trái cho phép chuyển nhanh sang thư mục con.
@@ -463,9 +1158,9 @@ XEM ẢNH
 • Kéo chuột: di chuyển vùng nhìn khi ảnh đã phóng to.
 • Zoom: chọn Vừa khung, Vừa chiều rộng, Vừa chiều cao, 100% hoặc Lấp đầy.
 • Sync: trong chế độ so sánh, đồng bộ thu phóng và vị trí giữa các ảnh.
-• Face Lock: khi có khuôn mặt, tự căn vùng nhìn vào khuôn mặt lớn nhất khi đổi ảnh hoặc thu phóng.
+• Face Lock: khi có khuôn mặt, tự căn vùng nhìn vào khuôn mặt gần tâm ảnh nhất khi đổi ảnh hoặc thu phóng. Mỗi khuôn mặt được phát hiện có một khung mờ; nhấp vào khung để chọn khuôn mặt đó làm mục tiêu và phóng to để khuôn mặt chiếm khoảng 70% khung nhìn. Lựa chọn được ghi nhớ cho từng ảnh (bị xóa khi nội dung tệp thay đổi).
 • Toàn màn hình / F11: lấp đầy màn hình và thu thanh tiêu đề vào mép trên. Giữ con trỏ ở vùng mép trên trong chốc lát để hiện thanh. Thanh tiêu đề nổi trên ảnh thay vì làm vùng xem ảnh đổi kích thước; đưa chuột ra xa để thanh tự ẩn lại.
-• Viền đỏ quanh ảnh thu nhỏ: khuôn mặt lớn nhất có vẻ khá nhòe hoặc lệch nét. Di chuột lên viền để xem giải thích. Ngưỡng trung bình được đặt khá thận trọng và chỉ đánh dấu các trường hợp hụt nét rõ ràng; nên kiểm tra ở 100% trước khi loại ảnh.
+• Viền đỏ quanh ảnh thu nhỏ: ít nhất một khuôn mặt có vẻ lệch nét, nhòe chuyển động hoặc đang nhắm mắt. Di chuột lên viền để xem khuôn mặt nào và lý do (ví dụ “Khuôn mặt 2: nhắm mắt”). Các ngưỡng được đặt thận trọng; khuôn mặt quá nhỏ không được đánh giá. Kính râm, mặt nghiêng hoặc nheo mắt có thể gây cảnh báo sai; nên kiểm tra ở 100% trước khi loại ảnh.
 • Xoay trái / phải: xoay cách hiển thị; tệp gốc không bị thay đổi.
 
 LỌC VÀ SẮP XẾP
@@ -474,6 +1169,21 @@ LỌC VÀ SẮP XẾP
 • Bộ lọc metadata chỉ nhận giá trị đã đọc chắc chắn; ảnh đang chờ đọc, không đọc được hoặc có giá trị tùy chỉnh không bị giả vờ là chưa xếp hạng/chưa đánh dấu/chưa gắn nhãn.
 • Sort thay đổi thứ tự hiển thị theo tên, ngày, xếp hạng hoặc định dạng.
 • Thumbnail size thay đổi kích thước lưới.
+
+TÌM KIẾM
+• Ô tìm kiếm nổi ở góc trên bên phải, chỉ có trong chế độ Ảnh thu nhỏ. Bấm Ctrl+F hoặc nhấp vào ô. Kết quả cập nhật khi bạn gõ.
+• Tìm theo tên tệp hoặc ghi chú người dùng (không phân biệt dấu: “dam cuoi” tìm được “đám cưới”), giờ chụp (8AM, 20h15), ngày (date:12, date:thứ sáu, 2026-10-12), số sao (5 sao, >=4 stars, unrated), nhãn màu (đỏ, xanh lá) và trạng thái chọn (đã chọn, loại).
+• Đặt chữ trong dấu ngoặc kép (“red”) hoặc dùng name:/comment: để tìm đúng chữ đó trong tên hoặc ghi chú.
+• Tìm kiếm kết hợp với các bộ lọc (mọi điều kiện đều phải khớp) và vẫn được giữ khi mở một kết quả ở chế độ Một ảnh. Bộ đếm hiển thị số ảnh hiện ra trên tổng số.
+
+LƯU XẾP HẠNG, CHỌN/LOẠI VÀ NHÃN
+• Mỗi thay đổi được lưu ở chế độ nền; giao diện không bao giờ phải chờ việc ghi tệp. Khi bạn đổi nhanh nhiều lần, chỉ giá trị cuối cùng được ghi, theo đúng thứ tự cho từng tệp.
+• Nếu một ứng dụng khác (trình chỉnh ảnh, công cụ đồng bộ, trình quét virus) đang dùng tệp, QuickSift tự thử lại trong vài giây. Nếu tệp vẫn bị khóa, thông báo “Đang chờ <tệp> — tệp đang được ứng dụng khác sử dụng” xuất hiện và QuickSift tiếp tục chờ tối đa 30 giây; sau đó bạn có thể chọn Thử lại hoặc Bỏ qua. Khi bỏ qua hoặc thất bại, giá trị trước đó được hiển thị lại.
+• QuickSift chỉ dừng hẳn khi việc ghi có thể làm hỏng tệp (tệp đã thay đổi bên ngoài, thiếu dung lượng, phương tiện chỉ đọc); khi đó không có gì bị ghi đè.
+
+NHẬP/XUẤT XẾP HẠNG VÀ XỬ LÝ HÀNG LOẠT
+• Xuất xếp hạng lưu số sao, trạng thái chọn và nhãn màu của các tệp trong thư mục vào một tệp văn bản UTF-8; Nhập xếp hạng áp dụng lại cho các tệp cùng tên. Định dạng tệp xuất (dòng đầu, dòng cuối và tên cột) luôn bằng tiếng Anh để có thể dùng chung giữa các ngôn ngữ.
+• Xử lý hàng loạt áp dụng xếp hạng, trạng thái chọn hoặc nhãn cho danh sách tên tệp được dán hoặc nạp từ một thư mục khác.
 
 QUẢN LÝ TỆP
 • Copy: sao chép ảnh đã chọn sang thư mục khác và hiện thông báo hoàn tất trong 2 giây.
@@ -500,7 +1210,7 @@ GIẢI MÃ VÀ LẬP LỊCH
 • Công việc được chia thành Interactive, Visible, Face và Idle.
 • Số worker, số luồng codec, ngân sách buffer, mức đọc trước và độ sâu cache được suy ra từ RAM, CPU, GPU và loại ổ đĩa.
 • Yêu cầu lỗi thời bị hủy bằng generation/navigation epoch. Yêu cầu cùng nguồn được hợp nhất; chất lượng cao hơn có thể phục vụ các mức thấp hơn.
-• Cảnh báo nét khuôn mặt kết hợp phương sai Laplacian với năng lượng gradient trên vùng khuôn mặt lớn nhất. Ngưỡng trung bình chỉ đánh dấu khi mất chi tiết tần số cao rất rõ hoặc cả hai phép đo đều cho thấy lệch nét.
+• Cảnh báo khuôn mặt đánh giá từng khuôn mặt trên ảnh giải mã độ phân giải cao: độ chi tiết Laplacian chuẩn hóa theo kích thước và độ tương phản (lệch nét), độ dị hướng của chi tiết (nhòe chuyển động), và một phép kiểm tra lòng trắng mắt thận trọng (nhắm mắt). Tất cả chạy trên luồng nền và được lưu vào bộ nhớ đệm.
 • JPEG dùng đường TurboJPEG khi có lợi; WIC là đường tương thích. RAW ưu tiên preview nhúng trước khi demosaic. AVIF dùng libavif/dav1d với libyuv.
 • WIC native transforms, thumbnail nhúng, progressive refinement và Direct2D image source theo nhu cầu được dùng khi codec/driver hỗ trợ.
 
@@ -561,9 +1271,9 @@ VIEWING
 • Drag: pan when the photo is zoomed.
 • Zoom: choose Fit, Fit width, Fit height, 100%, or Fill.
 • Sync: in Compare view, keeps zoom and pan aligned between panes.
-• Face Lock: when a face is available, recenters on the largest face when changing photos or zooming.
+• Face Lock: when a face is available, recenters on the face closest to the image centre when changing photos or zooming. Every detected face gets a faint outline; click an outline to make that face the target and zoom so it fills about 70% of the pane. The choice is remembered per photo (cleared if the file content changes).
 • Fullscreen / F11 fills the monitor and retracts the title bar into the top edge. Rest the pointer briefly against the top edge to reveal it. The bar floats over the photograph without resizing the image view; move away and it hides again.
-• Red thumbnail border: the largest detected face appears quite blurry or out of focus. Hover the border for the explanation. The medium threshold is intentionally conservative and flags only clear misses; verify at 100% before rejecting the photo.
+• Red thumbnail border: at least one face looks out of focus, motion-blurred, or has its eyes closed. Hover the border to see which face and why (for example “Face 2: eyes closed”). Thresholds are conservative and very small faces are not judged. Sunglasses, profiles, or squinting can cause false warnings; verify at 100% before rejecting the photo.
 • Rotate left / right changes only the display orientation; it does not rotate the original file.
 
 FILTERING AND SORTING
@@ -572,6 +1282,21 @@ FILTERING AND SORTING
 • Metadata filters accept only authoritative values; pending, unreadable, and unsupported custom values do not masquerade as unrated, unmarked, or unlabeled.
 • Sort changes display order by name, date, rating, or format.
 • Thumbnail size changes the grid density.
+
+SEARCH
+• Thumbnail view has a floating search field at the top right. Press Ctrl+F or click it; results update as you type. Enter, Tab or Down apply the query and return to the grid; Esc clears it, and a second Esc leaves the field.
+• Search matches file names and user comments (accent-insensitive: “dam cuoi” finds “đám cưới”), capture times (8AM, 20h15), dates (date:12, date:friday, 2026-10-12), stars (5 stars, >=4 stars, unrated), colour labels (red, green) and pick states (picked, rejected).
+• Quote a word (“red”) or use name:/comment: to search for that literal text.
+• Search is combined with the Filter tab (every term must match) and stays applied when you open a result in Single view. The counter shows shown of total.
+
+SAVING RATINGS, PICKS AND LABELS
+• Every change is saved in the background; the interface never waits for a file write. Rapid repeated changes are coalesced: the last value wins and per-file order is kept.
+• If another app (an editor, a sync client, a virus scanner) is using a file, QuickSift retries for a few seconds. If the file stays locked, a “Waiting for <file> — in use by another app” notice appears and QuickSift keeps waiting for up to 30 seconds; then you can choose Retry or Skip. A skipped or failed change shows the previous value again.
+• QuickSift stops for good only when writing could corrupt a file (it changed outside QuickSift, storage is low, or the media is read-only); nothing is overwritten.
+
+IMPORT/EXPORT RATINGS AND BATCH PROCESSING
+• Export Ratings saves the stars, pick state and colour label of the folder's files to a UTF-8 text file; Import Ratings applies them again to files with the same names. The export file format (header, footer and column names) is always English so files can be shared between languages.
+• Batch Processing applies a rating, pick state or label to a list of file names that you paste or load from another folder.
 
 FILE MANAGEMENT
 • Copy copies selected photos to another folder and shows a two-second completion toast.
@@ -598,7 +1323,7 @@ DECODING AND SCHEDULING
 • Work is separated into Interactive, Visible, Face, and Idle lanes.
 • Worker counts, codec threads, buffer budgets, read-ahead, and cache depth are derived from RAM, CPU topology, GPU budget, and storage class.
 • Obsolete work is cancelled through generation/navigation epochs. Requests for the same source are coalesced; a higher-quality decode may satisfy lower levels.
-• The face-focus warning combines Laplacian variance with broad gradient energy over the largest face crop. At the medium threshold, a face is flagged only after severe high-frequency loss or when both measurements indicate clear defocus.
+• The face warning analyzes every face on a high-resolution decode: Laplacian detail normalized by face size and contrast (defocus), directional detail anisotropy (motion blur), and a conservative sclera-visibility check (closed eyes). All analysis runs on worker threads and is cached.
 • JPEG uses TurboJPEG when its measured path is advantageous, with WIC as compatibility fallback. RAW prefers embedded previews before demosaic. AVIF uses libavif/dav1d with libyuv.
 • WIC native transforms, embedded thumbnails, progressive refinement, and on-demand Direct2D image sources are used when the codec and driver support them.
 

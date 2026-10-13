@@ -6,12 +6,14 @@
 #include "decode_budget.h"
 #include "face_detection_policy.h"
 #include "metadata_state.h"
+#include "photo_predicate.h"
 #include "../persistent_cache.h"
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,9 +42,31 @@ struct PhotoItem {
     int sourceHeight = 0;
     bool facesScanned = false;
     bool faceBlurScanned = false;
-    bool faceBlurry = false;
-    float faceSharpness = 0.0f;
-    std::vector<quicksift::NormalizedFaceRect> faces;
+    bool faceBlurry = false;          // ANY face flagged (blur, motion blur, eyes closed)
+    float faceSharpness = 0.0f;       // primary (default-target) face sharpness score
+    std::vector<quicksift::NormalizedFaceRect> faces;   // ordered by core::RankFacesForAnchor
+    std::vector<quicksift::FaceQualityRecord> faceQualities; // parallel to faces when analyzed
+    // FaceLock target chosen by the user (normalized box, matched to faces by IoU).
+    // faceSelectionKnown=false: not yet hydrated from the cache for this session.
+    bool faceSelectionKnown = false;
+    std::optional<quicksift::NormalizedFaceRect> faceSelection;
+    // Search facts (part of the authoritative metadata model, see core/image_metadata.h).
+    // Capture time: EXIF DateTimeOriginal, else the file-modified time (local);
+    // Unknown until the search-facts worker hydrates it.
+    quicksift::core::predicate::LocalDateTime captureTime{};
+    quicksift::core::predicate::CaptureTimeSource captureTimeSource =
+        quicksift::core::predicate::CaptureTimeSource::Unknown;
+    // User comment (comment store); userCommentKnown=false until hydrated.
+    std::wstring userComment;
+    bool userCommentKnown = false;
+    // Camera settings for fast indexed search (0 / empty / -1 = unknown)
+    int iso = -1;
+    double aperture = 0.0;
+    double focalLength = 0.0;
+    double shutterSpeed = 0.0;
+    std::wstring camera;
+    std::wstring lens;
+    bool cameraSettingsKnown = false;
 };
 
 enum class ViewMode { Thumbnails, Single, Compare };
@@ -60,6 +84,10 @@ enum class JobKind { DecodePreview, DecodeFull, DecodeTile, Metadata, Exif, Face
 // Predictive work sits ahead of face/background analysis, but never ahead of pixels
 // already required for the current viewport.
 enum class JobPriority { Interactive, Visible, Predictive, Face, Idle, Analysis };
+// 0.9.4.0: why a visual decode produced no pixels. Classified on the worker thread
+// so the UI retry policy can tell transient I/O trouble (retry with backoff) from
+// a deterministic codec rejection (fallback decoder, then a failed placeholder).
+enum class DecodeFailureKind { None, Transient, Timeout, Missing, Decode };
 
 struct WorkJob {
     JobKind kind = JobKind::DecodeFull;
@@ -82,8 +110,18 @@ struct WorkJob {
     bool rawJpegPreviewOnly = false;
     int retryAttempt = 0;
     int timeoutMs = 5000;
+    // 0.9.4.0: when true, timeoutMs is provisional (computed on the enqueueing UI
+    // thread without touching the file system) and the worker refines it with the
+    // real file size when execution starts. Never part of the job identity.
+    bool timeoutDeferred = false;
+    bool timeoutSingleView = false;
     bool forceWic = false;
     bool ignoreThumbnailViewport = false;
+    // 0.9.4.0: Single/Compare decodes run on the dedicated view lane (never on the
+    // thumbnail pool). viewPrefetch marks low-priority neighbour prefetch on that
+    // lane; it is cancelled by any foreground view request or a new prefetch set.
+    bool viewLane = false;
+    bool viewPrefetch = false;
     std::wstring key;
 };
 
@@ -132,9 +170,14 @@ struct WorkResult {
     float faceSharpness = 0.0f;
     bool workFailed = false;
     bool cancelled = false;
+    bool viewLane = false;
+    DecodeFailureKind failureKind = DecodeFailureKind::None;
     FaceAnalysisOutcome faceAnalysisOutcome = FaceAnalysisOutcome::None;
     std::wstring exifText;
     std::vector<quicksift::NormalizedFaceRect> faces;
+    std::vector<quicksift::FaceQualityRecord> faceQualities;
+    bool faceSelectionKnown = false;
+    std::optional<quicksift::NormalizedFaceRect> faceSelection;
     std::vector<std::uint8_t> pixels;
     std::shared_ptr<DecodeReservation> decodeReservation;
     std::wstring pendingKey;

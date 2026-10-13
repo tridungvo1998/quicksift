@@ -35,6 +35,7 @@
 - [ ] Test 100%, 150%, 200%, mixed-DPI, light, dark, and fullscreen.
 - [ ] Test JPEG, PNG, TIFF, WebP, AVIF, HEIF/HEIC where available, and representative RAW files.
 - [ ] Test thumbnail, single, compare, zoom, pan, synchronized view, face lock, rotation, filters, sorting, and language switching.
+- [ ] FaceLock multi-face: centre-closest default target; faint outlines track zoom/pan/rotation in Single and Compare; click (no drag) selects and frames at ~70%; drag on a face still pans; double-click after a face click does not toggle Fit/100%; Sync on/off behaviour; selection survives restart and is dropped after editing the file elsewhere; red-border tooltip/status reasons; an existing v1 cache migrates (log: "schema migrated from v1 to v2") and quality is re-analysed lazily.
 - [ ] Rapidly wheel/touchpad-scroll a large uncached folder in both directions; current rows should recover first and old rows must not dominate the queue.
 - [ ] Reverse scroll direction while decoding, resize the window, change thumbnail size, clear cache, and repeat on HDD/removable/network storage.
 - [ ] Test low-memory pressure, rapid cancellation, app close during background work, and cache rebuild.
@@ -85,5 +86,5 @@ Use expendable copies for every destructive test.
 - [ ] Install a test-signed MSIX and confirm QuickSift-owned state appears only under package `LocalState`.
 - [ ] Confirm no file is created or modified inside the package installation directory.
 - [ ] Repeat photo open/cull/metadata/copy/move/delete tests and compare behavior with the portable build.
-- [ ] Verify Start-menu identity, icon assets, version `0.9.3.0`, publisher display name, uninstall, reinstall, and update behavior.
+- [ ] Verify Start-menu identity, icon assets, version `0.9.4.0`, publisher display name, uninstall, reinstall, and update behavior.
 - [ ] Submit the final package to Store certification and archive the submitted MSIX SHA-256 plus corresponding source SHA-256.

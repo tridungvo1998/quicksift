@@ -8,11 +8,12 @@
 namespace quicksift::review::thumbnail {
 
 ThumbnailLayoutMetrics CalculateThumbnailLayout(float canvasWidth, float canvasHeight,
-    int thumbnailSize, std::size_t itemCount, float leftInset) noexcept {
+    int thumbnailSize, std::size_t itemCount, float leftInset, float topInset) noexcept {
     ThumbnailLayoutMetrics result;
     result.canvasWidth = std::max(0.0f, canvasWidth);
     result.canvasHeight = std::max(0.0f, canvasHeight);
     result.leftInset = std::max(result.padding, leftInset);
+    result.topInset = std::isfinite(topInset) ? std::max(result.padding, topInset) : result.padding;
     result.cellWidth = static_cast<float>(std::max(1, thumbnailSize) + 24);
     // Filename text requires a real 18-DIP line plus the badge lane.
     result.cellHeight = static_cast<float>(std::max(1, thumbnailSize) + 56);
@@ -27,7 +28,8 @@ ThumbnailLayoutMetrics CalculateThumbnailLayout(float canvasWidth, float canvasH
     const std::size_t rowCount = itemCount == 0 ? 0 : 1 + (itemCount - 1) / columnCount;
     result.rows = static_cast<int>(std::min(rowCount,
         static_cast<std::size_t>(std::numeric_limits<int>::max())));
-    result.contentHeight = result.padding * 2.0f + static_cast<float>(result.rows) * result.cellHeight;
+    result.contentHeight = result.topInset + result.padding +
+        static_cast<float>(result.rows) * result.cellHeight;
     result.maximumScroll = std::max(0.0f, result.contentHeight - result.canvasHeight);
     return result;
 }
@@ -38,7 +40,7 @@ ThumbnailRect ThumbnailCardRect(const ThumbnailLayoutMetrics& metrics, std::size
     const std::size_t row = index / columns;
     const std::size_t column = index % columns;
     const float x = metrics.leftInset + static_cast<float>(column) * metrics.cellWidth;
-    const float y = metrics.padding + static_cast<float>(row) * metrics.cellHeight - scrollOffset;
+    const float y = metrics.topInset + static_cast<float>(row) * metrics.cellHeight - scrollOffset;
     return { x, y, x + metrics.cardWidth, y + metrics.cardHeight };
 }
 
@@ -46,7 +48,7 @@ std::optional<std::size_t> HitTestThumbnail(const ThumbnailLayoutMetrics& metric
     std::size_t itemCount, float scrollOffset, float x, float y) noexcept {
     if (itemCount == 0 || x < metrics.leftInset || y < 0.0f) return std::nullopt;
     const float columnValue = (x - metrics.leftInset) / metrics.cellWidth;
-    const float rowValue = (y + scrollOffset - metrics.padding) / metrics.cellHeight;
+    const float rowValue = (y + scrollOffset - metrics.topInset) / metrics.cellHeight;
     if (!std::isfinite(columnValue) || !std::isfinite(rowValue) ||
         columnValue < 0.0f || rowValue < 0.0f) return std::nullopt;
     const int column = static_cast<int>(std::floor(columnValue));
@@ -63,17 +65,19 @@ std::optional<std::size_t> HitTestThumbnail(const ThumbnailLayoutMetrics& metric
 float ScrollToRevealThumbnail(const ThumbnailLayoutMetrics& metrics, std::size_t index,
     float currentScroll) noexcept {
     const std::size_t row = index / static_cast<std::size_t>(std::max(1, metrics.columns));
-    const float top = metrics.padding + static_cast<float>(row) * metrics.cellHeight;
+    const float top = metrics.topInset + static_cast<float>(row) * metrics.cellHeight;
     const float bottom = top + metrics.cellHeight;
+    // Keep a revealed row below the reserved top lane (the floating search field).
+    const float lane = metrics.topInset - metrics.padding;
     float scroll = currentScroll;
-    if (top < scroll) scroll = top;
+    if (top - lane < scroll) scroll = top - lane;
     else if (bottom > scroll + metrics.canvasHeight) scroll = bottom - metrics.canvasHeight;
     return std::clamp(scroll, 0.0f, metrics.maximumScroll);
 }
 
 float ScrollToCenterThumbnail(const ThumbnailLayoutMetrics& metrics, std::size_t index) noexcept {
     const std::size_t row = index / static_cast<std::size_t>(std::max(1, metrics.columns));
-    const float center = metrics.padding + (static_cast<float>(row) + 0.5f) * metrics.cellHeight;
+    const float center = metrics.topInset + (static_cast<float>(row) + 0.5f) * metrics.cellHeight;
     return std::clamp(center - metrics.canvasHeight * 0.5f, 0.0f, metrics.maximumScroll);
 }
 

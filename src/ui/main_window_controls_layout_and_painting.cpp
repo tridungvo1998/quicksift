@@ -68,7 +68,12 @@ namespace quicksift::app {
         // ApplyRoundedControlRegion so the library content panel matches kLeftPaneContentRadiusDip.
         libraryListSpec.extendedStyle = 0;
         libraryListSpec.className = L"LISTBOX";
-        libraryListSpec.style = WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
+        // No WS_VSCROLL: the classic (unthemed) native bar painted a light strip along
+        // the right edge of the dark panel. The framework overlay scrollbar replaces it
+        // (PaintLibraryList); wheel/drag scrolling is handled in LibraryListSubclassProc.
+        // LBS_NOINTEGRALHEIGHT: the list keeps exactly the height layout gives it
+        // (integral-height shrinking left an unpainted band above the action button).
+        libraryListSpec.style = WS_CHILD | WS_VISIBLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT |
             LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_CLIPSIBLINGS;
         libraryListSpec.parent = hwnd_;
         libraryListSpec.id = ID_LIBRARY_LIST;
@@ -102,6 +107,8 @@ namespace quicksift::app {
         SendMessageW(userCommentLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFontSemibold_ ? uiFontSemibold_ : uiFont_), TRUE);
         if (!CreateMainWindowButton(ID_SAVE_USER_COMMENT, L"Save")) return -1;
         ShowWindow(userCommentEdit_, SW_HIDE);
+        // Floating thumbnail search (framework text input inside canvas-painted chrome).
+        if (!CreateSearchField()) return -1;
         ShowWindow(userCommentLabel_, SW_HIDE);
         ShowWindow(controls_[ID_SAVE_USER_COMMENT], SW_HIDE);
 
@@ -207,17 +214,22 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::OnDpiChanged(UINT newDpi, const RECT* suggested) {
         currentDpi_ = newDpi ? newDpi : USER_DEFAULT_SCREEN_DPI;
+        // Fonts and DPI-scaled resources FIRST: SetWindowPos below sends WM_SIZE,
+        // whose layout pass used to run with the previous DPI's fonts/item heights
+        // (one visibly wrong frame, then a second full layout).
+        RecreateUiFonts();
+        SendMessageW(libraryList_, LB_SETITEMHEIGHT, 0, DipToPx(36));
+        if (userCommentEdit_) uiFramework_.SetD2DTextInputPalette(userCommentEdit_, Palette(), currentDpi_);
+        UpdateSearchFieldTheme(); // DPI: palette scale + pixel geometry
+        if (userCommentLabel_) SendMessageW(userCommentLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFontSemibold_ ? uiFontSemibold_ : uiFont_), FALSE);
+        if (languageSelector_) SendMessageW(languageSelector_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFontSemibold_ ? uiFontSemibold_ : uiFont_), FALSE);
+        if (renderTarget_) renderTarget_->SetDpi(static_cast<float>(currentDpi_), static_cast<float>(currentDpi_));
+        badgeTextWidthCache_.clear();
         if (suggested) {
             SetWindowPos(hwnd_, nullptr, suggested->left, suggested->top,
                 suggested->right - suggested->left, suggested->bottom - suggested->top,
                 SWP_NOACTIVATE | SWP_NOZORDER);
         }
-        RecreateUiFonts();
-        SendMessageW(libraryList_, LB_SETITEMHEIGHT, 0, DipToPx(36));
-        if (userCommentEdit_) uiFramework_.SetD2DTextInputPalette(userCommentEdit_, Palette(), currentDpi_);
-        if (userCommentLabel_) SendMessageW(userCommentLabel_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFontSemibold_ ? uiFontSemibold_ : uiFont_), TRUE);
-        if (languageSelector_) SendMessageW(languageSelector_, WM_SETFONT, reinterpret_cast<WPARAM>(uiFontSemibold_ ? uiFontSemibold_ : uiFont_), TRUE);
-        if (renderTarget_) renderTarget_->SetDpi(static_cast<float>(currentDpi_), static_cast<float>(currentDpi_));
         if (swapChain_) {
             RECT canvasRect{};
             GetClientRect(canvas_, &canvasRect);
@@ -233,6 +245,11 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::DrawBackgroundBlobs(HDC dc, const RECT& client) {
         const ThemePalette palette = Palette();
+        if (palette.highContrast) {
+            // High contrast: plain system window colour, no decorative colour blobs.
+            uiFramework_.PaintSolidSurface(dc, client, palette.windowBottom);
+            return;
+        }
         const auto safeExtent = [](LONG low, LONG high) {
             const std::int64_t extent = static_cast<std::int64_t>(high) - static_cast<std::int64_t>(low);
             return static_cast<int>(std::clamp<std::int64_t>(extent, 1, std::numeric_limits<int>::max()));
@@ -376,7 +393,7 @@ namespace quicksift::app {
         if (bottom <= top) return {};
         const int fullWidth = LeftPaneWidthPx(width);
         const int stripWidth = DipToPx(kLeftPaneHitStripDip);
-        const float t = quicksift::ui::framework::Smoothstep01(
+        const float t = quicksift::ui::animation::Ease(quicksift::ui::animation::Curve::Smoothstep,
             std::clamp(leftPaneOpenBlend_, 0.0f, 1.0f));
         // Lerp hit-strip (x=0, narrow) → open pane (x=outer, full width) so open/close
         // is a real width animation instead of a discrete show/hide snap.
@@ -511,16 +528,15 @@ namespace quicksift::app {
             treeScrollDragging_ = false;
             if (GetCapture() == libraryList_) ReleaseCapture();
         }
-        const bool switchingSection = activeFlyout_ != FlyoutPanel::None
-            && panel != FlyoutPanel::None;
+        const bool opening = activeFlyout_ == FlyoutPanel::None && panel != FlyoutPanel::None;
         if (panel != FlyoutPanel::None) lastFlyoutSection_ = panel;
         activeFlyout_ = panel;
         lastFlyoutHover_ = std::chrono::steady_clock::now();
-        // Tab switch: hide every prior section quietly. LayoutControls opaque-erases
-        // once then shows the new section (single compose — no mid-frame erase thrash).
-        if (switchingSection) {
-            HideAllLeftPaneSectionContent();
-        }
+        // Opening: refresh the frost from the canvas under the pane (next canvas frame).
+        if (opening) MarkLeftPaneFrostDirty();
+        // Tab switch: LayoutControls hides ONLY the previous section's children
+        // (HideLeftPaneSectionContentExcept) and moves/shows the new one with
+        // SWP_NOREDRAW, then composes the pane once (buffered surfaces, no erase).
         RECT client{};
         GetClientRect(hwnd_, &client);
         LayoutControls(client.right, client.bottom);
@@ -539,6 +555,14 @@ namespace quicksift::app {
         return blend >= kLeftPaneContentRevealBlend;
     }
 
+    int QuickSiftApplicationImpl::LeftPaneBackdropRadiusDip() const noexcept {
+        const float ease = quicksift::ui::animation::Ease(quicksift::ui::animation::Curve::Smoothstep,
+            std::clamp(leftPaneOpenBlend_, 0.0f, 1.0f));
+        const float span = static_cast<float>(kLeftPaneOpenRadiusDip - kLeftPaneClosedRadiusDip);
+        const int raw = static_cast<int>(std::lround(static_cast<float>(kLeftPaneClosedRadiusDip) + span * ease));
+        return std::max(kLeftPaneClosedRadiusDip, (raw / 2) * 2);
+    }
+
     void QuickSiftApplicationImpl::PlaceLeftPaneBackdrop(const RECT& pane, bool show) {
         if (!flyoutBackdrop_) return;
         if (!show || IsRectEmpty(&pane)) {
@@ -554,22 +578,26 @@ namespace quicksift::app {
         }
         const int paneW = std::max(0, static_cast<int>(pane.right - pane.left));
         const int paneH = std::max(0, static_cast<int>(pane.bottom - pane.top));
-        const float ease = quicksift::ui::framework::Smoothstep01(
-            std::clamp(leftPaneOpenBlend_, 0.0f, 1.0f));
-        // Quantize radius to 2-DIP steps so SetWindowRgn is not called every ease tick.
-        const int radiusDip = (std::max(6, static_cast<int>(std::lround(6.0f + 10.0f * ease))) / 2) * 2;
-        // Insert above the canvas, never HWND_TOP — content siblings must stay above.
+        // Quantized to 2-DIP steps so SetWindowRgn is not called every ease tick; the
+        // painter uses the SAME quantized value so the stroke matches the region.
+        const int radiusDip = LeftPaneBackdropRadiusDip();
+        // Directly ABOVE the canvas (and the search input on it), below every pane
+        // content sibling. The old hWndInsertAfter = canvas_ placed the backdrop BEHIND
+        // the canvas (SetWindowPos inserts after = below), so the clip-siblings canvas
+        // covered it: the pane looked transparent and every content repaint exposed
+        // thumbnails between its children.
         // Geometry/z-order only; paint is a single invalidate (no ShowWindow thrash).
-        HWND insertAfter = canvas_ ? canvas_ : HWND_BOTTOM;
+        HWND insertAfter = LeftPaneBackdropInsertAfter();
         const bool wasVisible = IsWindowVisible(flyoutBackdrop_) != FALSE;
         UINT posFlags = SWP_NOACTIVATE | SWP_NOREDRAW;
+        if (!insertAfter) posFlags |= SWP_NOZORDER;
         if (!wasVisible) posFlags |= SWP_SHOWWINDOW;
         SetWindowPos(flyoutBackdrop_, insertAfter, pane.left, pane.top, paneW, paneH, posFlags);
         // Quiet region update (bRedraw=false): never SetWindowRgn TRUE mid-animation.
         if (paneW != leftPaneBackdropLastW_ || paneH != leftPaneBackdropLastH_ ||
             radiusDip != leftPaneBackdropLastRadiusDip_) {
             uiFramework_.ApplyRoundedControlRegion(flyoutBackdrop_, paneW, paneH,
-                DipToPx(std::max(6, radiusDip)), /*redraw=*/false);
+                DipToPx(radiusDip), /*redraw=*/false);
             leftPaneBackdropLastW_ = paneW;
             leftPaneBackdropLastH_ = paneH;
             leftPaneBackdropLastRadiusDip_ = radiusDip;
@@ -612,13 +640,35 @@ namespace quicksift::app {
         }
     }
 
-    void QuickSiftApplicationImpl::HideAllLeftPaneSectionContent() {
-        // Unconditionally hide every flyout section child. All sections share one
-        // LeftPaneContentRect; leaving prior sections WS_VISIBLE stacks them.
-        // SWP_NOREDRAW: batch hides without mid-frame ShowWindow paint thrash; the
-        // caller opaque-erases the backdrop before showing the next section.
-        auto hideQuiet = [](HWND window) {
+    bool QuickSiftApplicationImpl::LeftPaneWindowBelongsTo(HWND window, int id, FlyoutPanel panel) const {
+        if (!window) return false;
+        switch (panel) {
+        case FlyoutPanel::Folders: return window == libraryList_ || id == ID_REMOVE_LIBRARY;
+        case FlyoutPanel::Info:
+            return window == exif_ || window == userCommentLabel_ || window == userCommentEdit_ ||
+                id == ID_SAVE_USER_COMMENT;
+        case FlyoutPanel::File: return id != 0 && IsFileControlId(id);
+        case FlyoutPanel::Cull: return id != 0 && IsCullControlId(id);
+        case FlyoutPanel::Filter: return id != 0 && IsFilterControlId(id);
+        case FlyoutPanel::Settings: {
+            if (window == languageSelector_) return true;
+            for (HWND label : settingsSectionLabels_) if (label == window) return true;
+            return id != 0 && IsSettingsControlId(id);
+        }
+        default: return false;
+        }
+    }
+
+    void QuickSiftApplicationImpl::HideLeftPaneSectionContentExcept(FlyoutPanel keep) {
+        // All sections share one LeftPaneContentRect, so every child NOT in `keep` is
+        // hidden (leaving them WS_VISIBLE stacked sections). Children of `keep` are
+        // left alone: the old hide-all + re-show on every LayoutControls/tab switch
+        // flashed each child (hide exposes, show repaints) and reset button hover
+        // (ClearButtonHot on SWP_HIDEWINDOW), which read as pane flicker.
+        // SWP_NOREDRAW: the caller composes the pane once afterwards.
+        auto hideQuiet = [&](HWND window, int id) {
             if (!window || !IsWindowVisible(window)) return;
+            if (keep != FlyoutPanel::None && LeftPaneWindowBelongsTo(window, id, keep)) return;
             SetWindowPos(window, nullptr, 0, 0, 0, 0,
                 SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                 SWP_NOACTIVATE | SWP_NOREDRAW);
@@ -627,24 +677,30 @@ namespace quicksift::app {
             if (!control) continue;
             if (IsFileControlId(id) || IsCullControlId(id) || IsFilterControlId(id) ||
                 IsSettingsControlId(id) || id == ID_REMOVE_LIBRARY || id == ID_SAVE_USER_COMMENT) {
-                hideQuiet(control);
+                hideQuiet(control, id);
             }
         }
-        hideQuiet(filterLabel_);
-        hideQuiet(languageSelector_);
-        for (HWND label : settingsSectionLabels_) hideQuiet(label);
-        hideQuiet(libraryList_);
-        hideQuiet(exif_);
-        hideQuiet(userCommentEdit_);
-        hideQuiet(userCommentLabel_);
+        hideQuiet(filterLabel_, 0); // never part of a pane section layout
+        hideQuiet(languageSelector_, 0);
+        for (HWND label : settingsSectionLabels_) hideQuiet(label, 0);
+        hideQuiet(libraryList_, 0);
+        hideQuiet(exif_, 0);
+        hideQuiet(userCommentEdit_, 0);
+        hideQuiet(userCommentLabel_, 0);
+    }
+
+    void QuickSiftApplicationImpl::HideAllLeftPaneSectionContent() {
+        HideLeftPaneSectionContentExcept(FlyoutPanel::None);
     }
 
     void QuickSiftApplicationImpl::EraseLeftPaneBackdropFully() {
         if (!flyoutBackdrop_ || !IsWindowVisible(flyoutBackdrop_)) return;
-        // Force WM_ERASEBKGND (opaque panelStrong) + DrawFlyoutBackdrop now so the
-        // shared content rect is clean before the next section's children appear.
+        // Invalidate only. This used to force RDW_ERASE | RDW_UPDATENOW: a solid
+        // panelStrong erase painted and shown, then the frosted paint on top (two
+        // visible frames per tab switch). The single buffered compose happens in
+        // RedrawActiveFlyoutContents.
         RedrawWindow(flyoutBackdrop_, nullptr, nullptr,
-            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+            RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN);
     }
 
     void QuickSiftApplicationImpl::LayoutLeftPaneAnimationFrame() {
@@ -758,9 +814,12 @@ namespace quicksift::app {
         if (width <= 0 || height <= 0) return;
 
         const float openBlend = std::clamp(leftPaneOpenBlend_, 0.0f, 1.0f);
-        const float ease = quicksift::ui::framework::Smoothstep01(openBlend);
+        const float ease = quicksift::ui::animation::Ease(quicksift::ui::animation::Curve::Smoothstep, openBlend);
         const bool raised = ease > 0.15f;
-        const int radius = static_cast<int>(std::lround(6.0f + 10.0f * ease));
+        // Same quantized radius as the HWND region (PlaceLeftPaneBackdrop): the
+        // unquantized value used to differ by up to 1 DIP mid-animation, so the AA
+        // border was cut by the region staircase at the corners.
+        const int radius = LeftPaneBackdropRadiusDip();
         const ThemePalette palette = Palette();
 
         // Double-buffer: opaque frost fill + grip chrome compose off-screen, then
@@ -772,13 +831,21 @@ namespace quicksift::app {
         HDC target = buffered ? memDc : draw->hDC;
         RECT local = buffered ? RECT{ 0, 0, width, height } : rc;
 
-        // Opaque underlay first (rectangular) so rounded GDI+ AA edges cannot leave
-        // holes that show the thumbnail canvas through the pane.
-        uiFramework_.PaintSolidSurface(target, local, palette.panelStrong);
-        // Frosted panel: opaque panelStrong base + highlight wash (see PaintPanel).
-        uiFramework_.PaintPanel(target, local,
-            quicksift::ui::framework::PanelPresentation{ raised, raised /* frost wash */, radius },
-            palette, currentDpi_);
+        if (leftPaneFrostValid_ && LeftPaneFrostEnabled() && uiFramework_.HasPaneFrost() &&
+            leftPaneFrostTint_ == Palette().panelStrong) { // never the previous theme's tint
+            // Frosted material: the cached blurred canvas snapshot under the pane,
+            // tinted with panelStrong (ui_frost), covering the whole pane (tab column,
+            // content area and bottom action row), plus hairline + top wash.
+            uiFramework_.PaintPaneFrost(target, local, LeftPaneFrostSourceFor(flyoutBackdrop_),
+                palette.panelStrong);
+            uiFramework_.PaintFrostedPanelChrome(target, local, radius, raised, palette, currentDpi_);
+        } else {
+            // Fallback (transparency off / high contrast / no snapshot yet): opaque.
+            uiFramework_.PaintSolidSurface(target, local, palette.panelStrong);
+            uiFramework_.PaintPanel(target, local,
+                quicksift::ui::framework::PanelPresentation{ raised, raised /* frost wash */, radius },
+                palette, currentDpi_);
+        }
 
         // Closed / nearly-closed hit strip: small visible affordance so the rail
         // reads as interactable without relying on hover alone.
@@ -815,6 +882,228 @@ namespace quicksift::app {
     }
 
 
+    // ---- Left-pane frost + buffered pane surfaces ------------------------------------
+
+    HWND QuickSiftApplicationImpl::LeftPaneBackdropInsertAfter() const {
+        // Bottom of the stack: canvas, then the search input glued to it. The backdrop
+        // goes directly above that floor; SetWindowPos(backdrop, X) puts it just
+        // BELOW X, so X is the window currently above the floor.
+        HWND floor = (searchInput_ && IsWindowVisible(searchInput_)) ? searchInput_ : canvas_;
+        if (!floor) return HWND_BOTTOM;
+        HWND above = GetWindow(floor, GW_HWNDPREV);
+        if (above == flyoutBackdrop_) return nullptr; // already in its slot
+        return above ? above : HWND_TOP;
+    }
+
+    bool QuickSiftApplicationImpl::LeftPaneFrostEnabled() const noexcept {
+        // Transparency effects off / high contrast: opaque panelStrong (no snapshot).
+        return quicksift::ui::CurrentVisualEffects().Glass();
+    }
+
+    POINT QuickSiftApplicationImpl::LeftPaneFrostSourceFor(HWND window) const {
+        RECT rect{};
+        if (!window || !hwnd_ || !GetWindowRect(window, &rect)) return POINT{ 0, 0 };
+        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&rect), 2);
+        return POINT{ rect.left - leftPaneFrostOrigin_.x, rect.top - leftPaneFrostOrigin_.y };
+    }
+
+    bool QuickSiftApplicationImpl::IsLeftPaneSurface(HWND window) const {
+        if (!window) return false;
+        if (window == flyoutBackdrop_ || window == libraryList_ || window == exif_ ||
+            window == userCommentLabel_ || window == languageSelector_ || window == filterLabel_) return true;
+        for (HWND tab : flyoutTabs_) if (tab == window) return true;
+        for (HWND label : settingsSectionLabels_) if (label == window) return true;
+        const int id = GetDlgCtrlID(window);
+        if (id == 0) return false;
+        const auto it = controls_.find(id);
+        if (it == controls_.end() || it->second != window) return false;
+        return IsFileControlId(id) || IsCullControlId(id) || IsFilterControlId(id) ||
+            IsSettingsControlId(id) || id == ID_REMOVE_LIBRARY || id == ID_SAVE_USER_COMMENT;
+    }
+
+    void QuickSiftApplicationImpl::PaintLeftPaneFrostBehind(HWND window, HDC dc, const RECT& local) const {
+        const COLORREF fallback = Palette().panelStrong;
+        if (leftPaneFrostValid_ && LeftPaneFrostEnabled() && uiFramework_.HasPaneFrost() &&
+            leftPaneFrostTint_ == Palette().panelStrong) { // never the previous theme's tint
+            POINT source = LeftPaneFrostSourceFor(window);
+            source.x += local.left;
+            source.y += local.top;
+            uiFramework_.PaintPaneFrost(dc, local, source, fallback);
+        } else {
+            uiFramework_.PaintSolidSurface(dc, local, fallback);
+        }
+    }
+
+    void QuickSiftApplicationImpl::MaybeCaptureLeftPaneFrost() {
+        if (!swapChainTarget_ || !deviceContext2_ || !canvas_ || !hwnd_ || !flyoutBackdrop_ ||
+            activeFlyout_ == FlyoutPanel::None || !IsWindowVisible(flyoutBackdrop_)) return;
+        if (!LeftPaneFrostEnabled()) {
+            if (leftPaneFrostValid_) {
+                uiFramework_.ClearPaneFrost();
+                leftPaneFrostValid_ = false;
+            }
+            leftPaneFrostDirty_ = leftPaneFrostPending_ = false;
+            return;
+        }
+        const ThemePalette palette = Palette();
+        if (palette.panelStrong != leftPaneFrostTint_) leftPaneFrostDirty_ = true;
+        // Never read back while the grid is in scroll motion / fling (placeholders):
+        // the next settled frame refreshes it.
+        if (ThumbnailScrollPrefersPlaceholders()) {
+            leftPaneFrostPending_ = true;
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!leftPaneFrostDirty_ && now - leftPaneFrostCapturedAt_ <
+            std::chrono::milliseconds(quicksift::ui::frost::kRefreshIntervalMs)) {
+            leftPaneFrostPending_ = true; // throttled: ServiceLeftPaneFrost re-renders once
+            return;
+        }
+        leftPaneFrostCapturedAt_ = now;
+        leftPaneFrostDirty_ = false;
+        leftPaneFrostPending_ = false;
+
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        const RECT open = LeftPaneOpenRect(client.right, client.bottom);
+        RECT canvasRect{};
+        GetWindowRect(canvas_, &canvasRect);
+        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&canvasRect), 2);
+        const D2D1_SIZE_U pixels = swapChainTarget_->GetPixelSize();
+        RECT source{ open.left - canvasRect.left, open.top - canvasRect.top,
+            open.right - canvasRect.left, open.bottom - canvasRect.top };
+        const RECT bounds{ 0, 0, static_cast<LONG>(pixels.width), static_cast<LONG>(pixels.height) };
+        if (!IntersectRect(&source, &source, &bounds)) return;
+        const UINT32 width = static_cast<UINT32>(source.right - source.left);
+        const UINT32 height = static_cast<UINT32>(source.bottom - source.top);
+        if (!leftPaneFrostReadback_ || leftPaneFrostReadbackSize_.width != width ||
+            leftPaneFrostReadbackSize_.height != height) {
+            leftPaneFrostReadback_.Reset();
+            D2D1_BITMAP_PROPERTIES1 properties{};
+            properties.pixelFormat = D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE);
+            properties.dpiX = 96.0f;
+            properties.dpiY = 96.0f;
+            properties.bitmapOptions = D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
+            if (FAILED(deviceContext2_->CreateBitmap(D2D1::SizeU(width, height), nullptr, 0,
+                &properties, &leftPaneFrostReadback_)) || !leftPaneFrostReadback_) return;
+            leftPaneFrostReadbackSize_ = D2D1::SizeU(width, height);
+        }
+        const D2D1_POINT_2U destination = D2D1::Point2U(0, 0);
+        const D2D1_RECT_U from = D2D1::RectU(static_cast<UINT32>(source.left), static_cast<UINT32>(source.top),
+            static_cast<UINT32>(source.right), static_cast<UINT32>(source.bottom));
+        if (FAILED(leftPaneFrostReadback_->CopyFromBitmap(&destination, swapChainTarget_.Get(), &from))) return;
+        D2D1_MAPPED_RECT mapped{};
+        if (FAILED(leftPaneFrostReadback_->Map(D2D1_MAP_OPTIONS_READ, &mapped)) || !mapped.bits) return;
+        const quicksift::ui::frost::Image image = quicksift::ui::frost::Build(mapped.bits,
+            static_cast<int>(width), static_cast<int>(height), static_cast<int>(mapped.pitch),
+            quicksift::ui::frost::FromColorRef(palette.panelStrong),
+            quicksift::ui::frost::TintAlpha(palette.dark));
+        leftPaneFrostReadback_->Unmap();
+        if (!image.Valid()) return;
+        const POINT origin{ canvasRect.left + source.left, canvasRect.top + source.top };
+        if (leftPaneFrostValid_ && image.signature == leftPaneFrostSignature_ &&
+            origin.x == leftPaneFrostOrigin_.x && origin.y == leftPaneFrostOrigin_.y &&
+            palette.panelStrong == leftPaneFrostTint_) return; // nothing visible changed
+        uiFramework_.SetPaneFrost(image);
+        leftPaneFrostValid_ = uiFramework_.HasPaneFrost();
+        leftPaneFrostSignature_ = image.signature;
+        leftPaneFrostTint_ = palette.panelStrong;
+        leftPaneFrostOrigin_ = origin;
+        // Repaint the pane surfaces (each is one buffered blit; no erase, no UPDATENOW
+        // from inside the canvas paint).
+        auto invalidate = [](HWND window) {
+            if (window && IsWindowVisible(window)) RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
+        };
+        invalidate(flyoutBackdrop_);
+        for (HWND tab : flyoutTabs_) invalidate(tab);
+        for (const auto& [id, control] : controls_) {
+            if (control && IsWindowVisible(control) && IsLeftPaneSurface(control)) invalidate(control);
+        }
+        for (HWND label : settingsSectionLabels_) invalidate(label);
+        invalidate(languageSelector_);
+        invalidate(libraryList_);
+        invalidate(exif_);
+        invalidate(userCommentLabel_);
+    }
+
+    void QuickSiftApplicationImpl::ServiceLeftPaneFrost() {
+        if (!leftPaneFrostDirty_ && !leftPaneFrostPending_) return;
+        if (!hwnd_ || IsIconic(hwnd_) || !swapChainTarget_ || activeFlyout_ == FlyoutPanel::None ||
+            !flyoutBackdrop_ || !IsWindowVisible(flyoutBackdrop_) || !LeftPaneFrostEnabled()) return;
+        if (ThumbnailScrollPrefersPlaceholders()) return;
+        if (!leftPaneFrostDirty_ && std::chrono::steady_clock::now() - leftPaneFrostCapturedAt_ <
+            std::chrono::milliseconds(quicksift::ui::frost::kRefreshIntervalMs)) return;
+        // One canvas frame; Render reads the pixels under the pane back after EndDraw.
+        InvalidateCanvas();
+    }
+
+    RECT QuickSiftApplicationImpl::LibraryListThumbRect(HWND list) const {
+        RECT client{};
+        GetClientRect(list, &client);
+        const int count = static_cast<int>(SendMessageW(list, LB_GETCOUNT, 0, 0));
+        const int itemHeight = std::max(1, static_cast<int>(SendMessageW(list, LB_GETITEMHEIGHT, 0, 0)));
+        const int visible = std::max(1, static_cast<int>(client.bottom - client.top) / itemHeight);
+        if (count <= visible) return RECT{};
+        const int margin = DipToPx(4);
+        const int width = DipToPx(5);
+        const int trackTop = client.top + margin;
+        const int trackHeight = std::max(1, static_cast<int>(client.bottom - client.top) - 2 * margin);
+        const int thumbHeight = std::clamp(MulDiv(trackHeight, visible, count), DipToPx(28), trackHeight);
+        const int maxTop = std::max(1, count - visible);
+        const int top = std::clamp(static_cast<int>(SendMessageW(list, LB_GETTOPINDEX, 0, 0)), 0, maxTop);
+        const int y = trackTop + MulDiv(std::max(0, trackHeight - thumbHeight), top, maxTop);
+        return RECT{ client.right - margin - width, y, client.right - margin, y + thumbHeight };
+    }
+
+    HBRUSH QuickSiftApplicationImpl::LibraryListBrush() {
+        // Any area the list control fills by itself uses the panel colour (the default
+        // COLOR_WINDOW brush is white).
+        const COLORREF color = Palette().panelStrong;
+        if (!libraryListBrush_ || libraryListBrushColor_ != color) {
+            if (libraryListBrush_) DeleteObject(libraryListBrush_);
+            libraryListBrush_ = CreateSolidBrush(color);
+            libraryListBrushColor_ = color;
+        }
+        return libraryListBrush_;
+    }
+
+    void QuickSiftApplicationImpl::PaintLibraryList(HWND hwnd) {
+        PAINTSTRUCT paint{};
+        HDC target = BeginPaint(hwnd, &paint);
+        if (!target) return;
+        RECT rect{};
+        GetClientRect(hwnd, &rect);
+        const ThemePalette palette = Palette();
+        // ONE buffered pass: frost behind the rounded corners, the opaque content
+        // panel, the owner-drawn rows (rendered into the same buffer through
+        // WM_PRINTCLIENT -> WM_DRAWITEM), the overlay scrollbar and the border.
+        uiFramework_.PaintBuffered(target, rect, [&](HDC dc, const RECT& local) {
+            PaintLeftPaneFrostBehind(hwnd, dc, local);
+            uiFramework_.PaintPanel(dc, local,
+                quicksift::ui::framework::PanelPresentation{ false, false, kLeftPaneContentRadiusDip },
+                palette, currentDpi_);
+            if (SendMessageW(hwnd, LB_GETCOUNT, 0, 0) == 0) {
+                HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
+                RECT textRect = local;
+                InflateRect(&textRect, -DipToPx(12), 0);
+                uiFramework_.PaintCenteredMutedText(dc, textRect, Tr(L"No item in Library"),
+                    palette, currentDpi_, font);
+            } else {
+                DefSubclassProc(hwnd, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+                const RECT thumb = LibraryListThumbRect(hwnd);
+                if (!IsRectEmpty(&thumb)) {
+                    RECT track = thumb;
+                    track.top = local.top + DipToPx(4);
+                    track.bottom = local.bottom - DipToPx(4);
+                    uiFramework_.PaintOverlayScrollbar(dc, thumb, track, treeScrollbarHot_,
+                        libraryScrollDragging_, palette, currentDpi_);
+                }
+            }
+            uiFramework_.PaintControlBorder(dc, local, kLeftPaneContentRadiusDip, palette, currentDpi_);
+        });
+        EndPaint(hwnd, &paint);
+    }
+
     void QuickSiftApplicationImpl::RedrawActiveFlyoutContents() {
         if (activeFlyout_ == FlyoutPanel::None || !flyoutBackdrop_ ||
             !IsWindowVisible(flyoutBackdrop_)) return;
@@ -822,8 +1111,9 @@ namespace quicksift::app {
         // Single opaque compose: backdrop under content, then raise + invalidate
         // active section only. One UPDATENOW at the end — never erase parent under
         // visible children mid-pass, never per-child UPDATENOW thrash.
-        HWND insertAfter = canvas_ ? canvas_ : HWND_BOTTOM;
+        HWND insertAfter = LeftPaneBackdropInsertAfter();
         UINT zFlags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW;
+        if (!insertAfter) zFlags |= SWP_NOZORDER;
         if (!IsWindowVisible(flyoutBackdrop_)) zFlags |= SWP_SHOWWINDOW;
         SetWindowPos(flyoutBackdrop_, insertAfter, 0, 0, 0, 0, zFlags);
         // NOERASE: DrawFlyoutBackdrop is fully opaque. LayoutControls already called
@@ -1003,13 +1293,13 @@ namespace quicksift::app {
         if (const auto help = controls_.find(ID_HELP); help != controls_.end()) {
             SetWindowPos(help->second, HWND_TOP, helpX, firstRowY,
                 helpWidth, titleButtonHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            uiFramework_.ApplyRoundedControlRegion(help->second, helpWidth, titleButtonHeight,
+            uiFramework_.ApplyAntialiasedControlRegion(help->second, helpWidth, titleButtonHeight,
                 titlePillRadius);
         }
         if (const auto theme = controls_.find(ID_THEME_TOGGLE); theme != controls_.end()) {
             SetWindowPos(theme->second, HWND_TOP, themeX, firstRowY,
                 themeWidth, titleButtonHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            uiFramework_.ApplyRoundedControlRegion(theme->second, themeWidth, titleButtonHeight,
+            uiFramework_.ApplyAntialiasedControlRegion(theme->second, themeWidth, titleButtonHeight,
                 titlePillRadius);
         }
 
@@ -1042,7 +1332,7 @@ namespace quicksift::app {
             if (const auto it = controls_.find(spec.id); it != controls_.end()) {
                 SetWindowPos(it->second, HWND_TOP, x, titleY, controlWidth, titleButtonHeight,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                uiFramework_.ApplyRoundedControlRegion(it->second, controlWidth, titleButtonHeight,
+                uiFramework_.ApplyAntialiasedControlRegion(it->second, controlWidth, titleButtonHeight,
                     titlePillRadius);
             }
             x += controlWidth + gap;
@@ -1056,11 +1346,10 @@ namespace quicksift::app {
         const int outer = DipToPx(kOuterMarginDip);
         LayoutTitleControls(width);
 
-        // Hide EVERY flyout section first. Prior logic left the active section's
-        // children WS_VISIBLE when showPaneContent was false (reveal hysteresis),
-        // and all sections share one content rect — so File/Settings/Info/Library
-        // children stacked on top of each other after tab switches.
-        HideAllLeftPaneSectionContent();
+        // Hide every flyout section child EXCEPT the one being laid out (sections share
+        // one content rect, so stale WS_VISIBLE children stacked). The kept section is
+        // moved in place below (never hidden and re-shown: that flashed and reset hover).
+        HideLeftPaneSectionContentExcept(LeftPaneShouldShowContent() ? activeFlyout_ : FlyoutPanel::None);
 
         RECT canvasRect = CanvasLayoutRect(width, height);
         const int canvasW = std::max(0, static_cast<int>(canvasRect.right - canvasRect.left));
@@ -1074,7 +1363,10 @@ namespace quicksift::app {
         UINT canvasFlags = SWP_SHOWWINDOW | SWP_NOACTIVATE;
         if (!canvasGeometryChanged) canvasFlags |= SWP_NOMOVE | SWP_NOSIZE;
         SetWindowPos(canvas_, HWND_BOTTOM, canvasRect.left, canvasRect.top, canvasW, canvasH, canvasFlags);
-        if (canvasGeometryChanged) uiFramework_.ApplyRoundedControlRegion(canvas_, canvasW, canvasH, DipToPx(20));
+        // Slack AA region: DrawCanvasCornerUnderlay paints the exact AA corner arc
+        // (radius kPanelRadiusDip) in the background colour inside the region.
+        if (canvasGeometryChanged) uiFramework_.ApplyAntialiasedControlRegion(canvas_, canvasW, canvasH, DipToPx(kPanelRadiusDip));
+        LayoutSearchField(); // keeps the field glued to the canvas (and just above it in z-order)
 
         // Left-pane vertical tabs live inside the open pane. Content uses hysteresis
         // (LeftPaneShouldShowContent) so open sessions keep children shown until close.
@@ -1117,7 +1409,7 @@ namespace quicksift::app {
             if (showFilmstripToggle) {
                 // Keep glyphs in lock-step with ToggleFilmstrip().
                 SetWindowTextW(filmstripToggle_, filmstripVisible_ ? L"‹" : L"›");
-                uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(12));
+                uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(kCompactControlRadiusDip));
             }
         }
 
@@ -1154,7 +1446,7 @@ namespace quicksift::app {
                         flyout.bottom - bh, bw, bh, bf);
                     // Match File/Cull action buttons: rounded HWND so PaintButton chrome
                     // cannot leave a sharp rectangular underlay behind the pill fill.
-                    uiFramework_.ApplyRoundedControlRegion(it->second, bw, bh,
+                    uiFramework_.ApplyAntialiasedControlRegion(it->second, bw, bh,
                         DipToPx(kButtonRadiusDip), /*redraw=*/false);
                 }
             }
@@ -1191,7 +1483,7 @@ namespace quicksift::app {
                 UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                 if (!IsWindowVisible(userCommentLabel_)) f |= SWP_SHOWWINDOW;
                 SetWindowPos(userCommentLabel_, HWND_TOP, flyout.left, y, infoW, labelH, f);
-                uiFramework_.ApplyRoundedControlRegion(userCommentLabel_, infoW, labelH,
+                uiFramework_.ApplyAntialiasedControlRegion(userCommentLabel_, infoW, labelH,
                     DipToPx(kButtonRadiusDip), /*redraw=*/false);
             }
             y += labelH + gap;
@@ -1210,7 +1502,7 @@ namespace quicksift::app {
                     UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                     if (!IsWindowVisible(save->second)) f |= SWP_SHOWWINDOW;
                     SetWindowPos(save->second, HWND_TOP, flyout.left, y, infoW, saveH, f);
-                    uiFramework_.ApplyRoundedControlRegion(save->second, infoW, saveH,
+                    uiFramework_.ApplyAntialiasedControlRegion(save->second, infoW, saveH,
                         DipToPx(kButtonRadiusDip), /*redraw=*/false);
                 }
             }
@@ -1247,7 +1539,7 @@ namespace quicksift::app {
                     UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                     if (!IsWindowVisible(it->second)) f |= SWP_SHOWWINDOW;
                     SetWindowPos(it->second, HWND_TOP, x, y, buttonWidth, panelRowHeight, f);
-                    uiFramework_.ApplyRoundedControlRegion(it->second, buttonWidth, panelRowHeight,
+                    uiFramework_.ApplyAntialiasedControlRegion(it->second, buttonWidth, panelRowHeight,
                         DipToPx(kButtonRadiusDip), /*redraw=*/false);
                 }
                 x += buttonWidth + gapX;
@@ -1273,7 +1565,7 @@ namespace quicksift::app {
                                 UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                                 if (!IsWindowVisible(label)) f |= SWP_SHOWWINDOW;
                                 SetWindowPos(label, HWND_TOP, leftEdge, y, availableWidth, sectionHeight, f);
-                                uiFramework_.ApplyRoundedControlRegion(label, availableWidth, sectionHeight,
+                                uiFramework_.ApplyAntialiasedControlRegion(label, availableWidth, sectionHeight,
                                     DipToPx(kButtonRadiusDip), /*redraw=*/false);
                             }
                         }
@@ -1294,7 +1586,7 @@ namespace quicksift::app {
                             UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                             if (!IsWindowVisible(it->second)) f |= SWP_SHOWWINDOW;
                             SetWindowPos(it->second, HWND_TOP, x, rowY, buttonWidth, panelRowHeight, f);
-                            uiFramework_.ApplyRoundedControlRegion(it->second, buttonWidth, panelRowHeight,
+                            uiFramework_.ApplyAntialiasedControlRegion(it->second, buttonWidth, panelRowHeight,
                                 DipToPx(kButtonRadiusDip), /*redraw=*/false);
                         }
                         x += buttonWidth + columnGap;
@@ -1317,7 +1609,7 @@ namespace quicksift::app {
                         UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
                         if (!IsWindowVisible(settingsSectionLabels_[4])) f |= SWP_SHOWWINDOW;
                         SetWindowPos(settingsSectionLabels_[4], HWND_TOP, leftEdge, y, availableWidth, sectionHeight, f);
-                        uiFramework_.ApplyRoundedControlRegion(settingsSectionLabels_[4], availableWidth, sectionHeight,
+                        uiFramework_.ApplyAntialiasedControlRegion(settingsSectionLabels_[4], availableWidth, sectionHeight,
                             DipToPx(kButtonRadiusDip), /*redraw=*/false);
                     }
                 }
@@ -1345,9 +1637,9 @@ namespace quicksift::app {
 
         if (showPaneContent) RedrawActiveFlyoutContents();
         else if (flyoutBackdrop_ && IsWindowVisible(flyoutBackdrop_)) {
-            // Closing / content hidden: one opaque backdrop paint (no parent erase).
+            // Closing / content hidden: one buffered backdrop paint (no erase pass).
             RedrawWindow(flyoutBackdrop_, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_ERASE | RDW_NOCHILDREN | RDW_UPDATENOW);
+                RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN | RDW_UPDATENOW);
         }
 
         if (filmstripToggle_ && reviewState_.Mode() == ViewMode::Single) {
@@ -1362,15 +1654,25 @@ namespace quicksift::app {
             SetWindowPos(filmstripToggle_, HWND_TOP, toggleX, toggleY, toggleSize, toggleSize,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
             SetWindowTextW(filmstripToggle_, filmstripVisible_ ? L"‹" : L"›");
-            uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(12));
+            uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(kCompactControlRadiusDip));
         }
 
         const int statusX = outer;
         const int statusY = height - DipToPx(kStatusHeightDip) + DipToPx(2);
         const int statusW = std::max(0, width - outer * 2);
         const int statusH = DipToPx(statusProgressText_.empty() ? 34 : 44);
-        MoveWindow(status_, statusX, statusY, statusW, statusH, TRUE);
-        uiFramework_.ApplyRoundedControlRegion(status_, statusW, statusH, DipToPx(17));
+        RECT statusBefore{};
+        if (GetWindowRect(status_, &statusBefore)) MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&statusBefore), 2);
+        const bool statusSizeChanged = statusBefore.right - statusBefore.left != statusW ||
+            statusBefore.bottom - statusBefore.top != statusH;
+        const bool statusMoved = statusSizeChanged || statusBefore.left != statusX || statusBefore.top != statusY;
+        // Only touch the status HWND when its geometry changes: MoveWindow(TRUE) +
+        // a redrawing SetWindowRgn on every layout pass repainted it twice per
+        // resize step. Region and paint share kStatusRadiusDip (AA slack region;
+        // PaintStatus fills the slack with the surface behind the bar).
+        if (statusMoved) MoveWindow(status_, statusX, statusY, statusW, statusH, TRUE);
+        if (statusSizeChanged)
+            uiFramework_.ApplyAntialiasedControlRegion(status_, statusW, statusH, DipToPx(kStatusRadiusDip));
         RaiseFullscreenTitleOverlay();
     }
 
@@ -1385,11 +1687,33 @@ namespace quicksift::app {
     void QuickSiftApplicationImpl::RefreshUserComment() {
         if (!userCommentEdit_) return;
         const std::wstring path = ActiveInfoPath();
-        const std::wstring comment = path.empty() ? L"" : persistentCache_.GetPhotoComment(fs::path(path));
+        // The catalog record is the authoritative copy once known (search hydration or
+        // an earlier visit); otherwise read the database once and publish it to the store.
+        std::wstring comment;
+        bool available = !path.empty();
+        if (!path.empty()) {
+            const auto index = catalog_.FindPath(path);
+            if (index && catalog_.PhotoAt(*index).userCommentKnown) {
+                comment = catalog_.PhotoAt(*index).userComment;
+            } else if (auto stored = persistentCache_.TryGetPhotoComment(fs::path(path))) {
+                comment = std::move(*stored);
+                if (index) catalog_.EditPhoto(*index, [&comment](PhotoItem& photo) {
+                    photo.userComment = comment;
+                    photo.userCommentKnown = true;
+                });
+            } else {
+                // 0.9.4.0 polish: the cache database is busy (writer, search
+                // hydration, startup open). Never block the UI thread on it: keep the
+                // field disabled (so an empty field cannot be saved over a real
+                // comment) and retry shortly.
+                available = false;
+                SetTimer(hwnd_, ID_TIMER_USER_COMMENT_RETRY, 120, nullptr);
+            }
+        }
         SetWindowTextW(userCommentEdit_, comment.c_str());
-        EnableWindow(userCommentEdit_, !path.empty());
+        EnableWindow(userCommentEdit_, available);
         auto save = controls_.find(ID_SAVE_USER_COMMENT);
-        if (save != controls_.end()) EnableWindow(save->second, !path.empty());
+        if (save != controls_.end()) EnableWindow(save->second, available);
     }
 
     void QuickSiftApplicationImpl::SaveUserComment() {
@@ -1398,6 +1722,14 @@ namespace quicksift::app {
         const int length = GetWindowTextLengthW(userCommentEdit_);
         std::wstring comment(static_cast<size_t>(std::max(0, length)), L'\0');
         if (length > 0) GetWindowTextW(userCommentEdit_, comment.data(), length + 1);
+        // Store first (search/filters see it immediately via the metadata epoch), then
+        // persist.
+        if (const auto index = catalog_.FindPath(path)) {
+            catalog_.EditPhoto(*index, [&comment](PhotoItem& photo) {
+                photo.userComment = comment;
+                photo.userCommentKnown = true;
+            });
+        }
         persistentCache_.SetPhotoComment(fs::path(path), std::move(comment));
         ShowToast(L"User comment saved.");
     }
@@ -1468,15 +1800,10 @@ namespace quicksift::app {
     LRESULT CALLBACK QuickSiftApplicationImpl::FlyoutBackdropSubclassProc(HWND hwnd, UINT message,
         WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR referenceData) {
         auto* self = reinterpret_cast<QuickSiftApplicationImpl*>(referenceData);
+        (void)self;
         if (message == WM_ERASEBKGND) {
-            // Opaque fill so RDW_ERASE / tab-switch clears cannot leave holes that
-            // show the thumbnail canvas through the pane.
-            if (self) {
-                HDC dc = reinterpret_cast<HDC>(wParam);
-                RECT rect{};
-                GetClientRect(hwnd, &rect);
-                self->uiFramework_.PaintSolidSurface(dc, rect, self->Palette().panelStrong);
-            }
+            // No erase pass: DrawFlyoutBackdrop paints the complete opaque surface in
+            // one buffered blit. Erasing to a solid colour first was a visible frame.
             return 1;
         }
         if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, FlyoutBackdropSubclassProc, subclassId);
@@ -1488,45 +1815,102 @@ namespace quicksift::app {
         auto* self = reinterpret_cast<QuickSiftApplicationImpl*>(referenceData);
         if (!self) return DefSubclassProc(hwnd, message, wParam, lParam);
         switch (message) {
-        case WM_ERASEBKGND: {
-            HDC dc = reinterpret_cast<HDC>(wParam);
-            RECT rect{};
-            GetClientRect(hwnd, &rect);
-            // Opaque rounded panel base; ApplyRoundedControlRegion clips the HWND.
-            self->uiFramework_.PaintPanel(dc, rect,
-                quicksift::ui::framework::PanelPresentation{
-                    false, false, kLeftPaneContentRadiusDip },
-                self->Palette(), self->currentDpi_);
+        case WM_ERASEBKGND:
+            // PaintLibraryList paints the complete surface in one buffered pass.
             return 1;
-        }
-        case WM_PAINT: {
-            const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
-            HDC dc = GetDC(hwnd);
-            if (dc) {
-                RECT rect{};
-                GetClientRect(hwnd, &rect);
-                const bool empty = SendMessageW(hwnd, LB_GETCOUNT, 0, 0) == 0;
-                if (empty) {
-                    // Refill so empty-state text sits on a clean panel (DefSubclassProc
-                    // may have left a blank client without our frosted fill).
-                    self->uiFramework_.PaintPanel(dc, rect,
-                        quicksift::ui::framework::PanelPresentation{
-                            false, false, kLeftPaneContentRadiusDip },
-                        self->Palette(), self->currentDpi_);
-                    HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
-                    self->uiFramework_.PaintCenteredMutedText(dc, rect, L"No item in Library",
-                        self->Palette(), self->currentDpi_, font);
-                } else {
-                    // Stroke only — do not cover owner-drawn list items.
-                    self->uiFramework_.PaintControlBorder(dc, rect, kLeftPaneContentRadiusDip,
-                        self->Palette(), self->currentDpi_);
-                }
-                ReleaseDC(hwnd, dc);
+        case WM_PAINT:
+            if (wParam) break; // caller-supplied DC (print paths): default painting
+            self->PaintLibraryList(hwnd);
+            return 0;
+        case WM_MOUSEWHEEL: {
+            // Explicit wheel scrolling (the list has no native scrollbar).
+            const int count = static_cast<int>(SendMessageW(hwnd, LB_GETCOUNT, 0, 0));
+            if (count <= 0) return 0;
+            UINT lines = 3;
+            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+            if (lines == WHEEL_PAGESCROLL || lines == 0) lines = 3;
+            const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
+            const int top = static_cast<int>(SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0));
+            const int target = std::clamp(top - notches * static_cast<int>(lines), 0, std::max(0, count - 1));
+            if (target != top) {
+                SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+                SendMessageW(hwnd, LB_SETTOPINDEX, static_cast<WPARAM>(target), 0);
+                SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+                InvalidateRect(hwnd, nullptr, FALSE);
             }
-            return result;
+            return 0;
         }
+        case WM_LBUTTONDOWN: {
+            const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            const RECT thumb = self->LibraryListThumbRect(hwnd);
+            RECT hit = thumb;
+            InflateRect(&hit, self->DipToPx(4), 0);
+            if (!IsRectEmpty(&thumb) && PtInRect(&hit, point)) {
+                self->libraryScrollDragging_ = true;
+                self->libraryScrollDragOffset_ = static_cast<int>(point.y - thumb.top);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        }
+        case WM_LBUTTONUP:
+            if (self->libraryScrollDragging_) {
+                self->libraryScrollDragging_ = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            if (self->libraryScrollDragging_) {
+                self->libraryScrollDragging_ = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            break;
+        case WM_MOUSELEAVE:
+            if (self->treeScrollbarHot_ && !self->libraryScrollDragging_) {
+                self->treeScrollbarHot_ = false;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            break;
         case WM_MOUSEMOVE: {
             const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            if (self->libraryScrollDragging_) {
+                RECT client{};
+                GetClientRect(hwnd, &client);
+                const RECT thumb = self->LibraryListThumbRect(hwnd);
+                const int count = static_cast<int>(SendMessageW(hwnd, LB_GETCOUNT, 0, 0));
+                const int itemHeight = std::max(1, static_cast<int>(SendMessageW(hwnd, LB_GETITEMHEIGHT, 0, 0)));
+                const int visible = std::max(1, static_cast<int>(client.bottom - client.top) / itemHeight);
+                const int margin = self->DipToPx(4);
+                const int travel = std::max(1, static_cast<int>(client.bottom - client.top) - 2 * margin -
+                    static_cast<int>(thumb.bottom - thumb.top));
+                const int desired = std::clamp(static_cast<int>(point.y) - self->libraryScrollDragOffset_ - margin, 0, travel);
+                const int maxTop = std::max(0, count - visible);
+                const int top = static_cast<int>(std::lround(static_cast<double>(desired) / travel * maxTop));
+                if (top != static_cast<int>(SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0))) {
+                    SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+                    SendMessageW(hwnd, LB_SETTOPINDEX, static_cast<WPARAM>(top), 0);
+                    SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            {
+                RECT hotRect = self->LibraryListThumbRect(hwnd);
+                InflateRect(&hotRect, self->DipToPx(4), 0);
+                const bool hot = !IsRectEmpty(&hotRect) && PtInRect(&hotRect, point);
+                if (hot != self->treeScrollbarHot_) {
+                    self->treeScrollbarHot_ = hot;
+                    if (hot) {
+                        TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+                        TrackMouseEvent(&track);
+                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
             const LRESULT hit = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, MAKELPARAM(point.x, point.y));
             const int index = LOWORD(hit);
             const bool outside = HIWORD(hit) != 0;
@@ -1547,6 +1931,17 @@ namespace quicksift::app {
                 }
             }
             break;
+        }
+        case WM_KEYDOWN:
+        case WM_CHAR: {
+            // Keyboard navigation scrolls with ScrollWindowEx, which would shift the
+            // painted border / overlay thumb with the rows: repaint the whole (buffered)
+            // client once instead.
+            SendMessageW(hwnd, WM_SETREDRAW, FALSE, 0);
+            const LRESULT result = DefSubclassProc(hwnd, message, wParam, lParam);
+            SendMessageW(hwnd, WM_SETREDRAW, TRUE, 0);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return result;
         }
         case WM_VSCROLL:
         case WM_HSCROLL:
@@ -1574,6 +1969,24 @@ namespace quicksift::app {
 
     LRESULT QuickSiftApplicationImpl::OnDrawItem(DRAWITEMSTRUCT* draw) {
         if (!draw) return FALSE;
+        // Every left-pane surface (tabs, section buttons, labels, info panel) paints
+        // in ONE off-screen pass over its slice of the pane frost, then one BitBlt.
+        // Owner-draw painters used to draw straight to the screen DC in several
+        // layers (corner fill, shadow, fill, sheen, border, text): every hover-fade
+        // frame was visible mid-paint, which read as flicker.
+        if (!paneItemBuffering_ && draw->CtlType != ODT_LISTBOX && draw->hwndItem &&
+            draw->hwndItem != flyoutBackdrop_ && IsLeftPaneSurface(draw->hwndItem)) {
+            paneItemBuffering_ = true;
+            const HWND item = draw->hwndItem;
+            uiFramework_.PaintItemBuffered(*draw,
+                [&](HDC dc, const RECT& local) { PaintLeftPaneFrostBehind(item, dc, local); },
+                [&](const DRAWITEMSTRUCT& buffered) {
+                    DRAWITEMSTRUCT copy = buffered;
+                    OnDrawItem(&copy);
+                });
+            paneItemBuffering_ = false;
+            return TRUE;
+        }
         if (draw->CtlID == ID_LIBRARY_LIST) {
             const int index = static_cast<int>(draw->itemID);
             if (index >= 0 && index < static_cast<int>(libraryPaths_.size())) {
@@ -1588,17 +2001,17 @@ namespace quicksift::app {
             return TRUE;
         }
         if (draw->hwndItem == userCommentLabel_) {
-            uiFramework_.PaintSectionTitle(draw->hDC, draw->rcItem, L"USER COMMENTS", Palette(),
+            uiFramework_.PaintSectionTitle(draw->hDC, draw->rcItem, Tr(L"USER COMMENTS"), Palette(),
                 currentDpi_, uiFontSemibold_);
             return TRUE;
         }
         for (std::size_t i = 0; i < settingsSectionLabels_.size(); ++i) {
             if (draw->hwndItem == settingsSectionLabels_[i]) {
-                const std::wstring title =
+                const std::wstring title = Tr(
                     i == 0 ? L"THUMBNAILS" :
                     i == 1 ? L"RAW HANDLING" :
                     i == 2 ? L"METADATA HANDLING" :
-                    i == 3 ? L"HELP & DIAGNOSTICS" : L"LANGUAGE";
+                    i == 3 ? L"HELP & DIAGNOSTICS" : L"LANGUAGE");
                 uiFramework_.PaintSectionTitle(draw->hDC, draw->rcItem, title, Palette(),
                     currentDpi_, uiFontSemibold_);
                 return TRUE;
@@ -1712,6 +2125,16 @@ namespace quicksift::app {
         presentation.state.popup = ButtonHasPopupMenu(id);
         presentation.hoverBlend = uiFramework_.ButtonHoverBlend(draw->hwndItem);
         presentation.pressBlend = presentation.state.pressed ? 1.0f : 0.0f;
+        // Parent-coloured AA corners (paired with ApplyAntialiasedControlRegion in
+        // layout): title-bar buttons sit on the title gradient, every other glass
+        // button on the opaque panelStrong flyout surface.
+        presentation.parentSurface = static_cast<std::uint32_t>(
+            presentation.role == ButtonRole::TitleBar
+                ? quicksift::ui::framework::MacOsUiFramework::TitleBarSurfaceColor(Palette())
+                : Palette().panelStrong);
+        // Pane buttons: the buffer already holds the frost slice behind the button
+        // (OnDrawItem), so the AA corners blend into the real backdrop pixels.
+        if (paneItemBuffering_ && IsLeftPaneSurface(draw->hwndItem)) presentation.parentSurface.reset();
         uiFramework_.PaintButton(draw->hDC, draw->rcItem, presentation, Palette(),
             currentDpi_, uiFont_, uiFontSemibold_);
     }
@@ -1748,6 +2171,7 @@ namespace quicksift::app {
         presentation.leftText = left;
         presentation.rightText = statusRightText_;
         presentation.secondaryText = statusProgressText_;
+        presentation.parentSurface = Palette().windowBottom;
         uiFramework_.PaintStatus(draw->hDC, draw->rcItem, presentation, Palette(),
             currentDpi_, uiFont_, uiFontSemibold_);
     }

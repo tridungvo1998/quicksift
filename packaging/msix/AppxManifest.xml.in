@@ -6,7 +6,7 @@
   IgnorableNamespaces="uap rescap">
   <Identity Name="@QS_MSIX_IDENTITY_NAME@"
             Publisher="@QS_MSIX_PUBLISHER@"
-            Version="0.9.3.0"
+            Version="0.9.4.0"
             ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>QuickSift</DisplayName>

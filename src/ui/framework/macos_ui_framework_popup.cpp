@@ -1,13 +1,19 @@
 // OWNER: Central macOS-inspired dropdown host, input routing, placement, scrolling, and painting.
 #include "ui/framework/macos_ui_framework.h"
+#include "ui/ui_layout_metrics.h"
 #include <dwmapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <utility>
 namespace quicksift::ui::framework {
 namespace {
 inline constexpr UINT_PTR kPopupMaintenanceTimerId = 0x5153504Du; inline constexpr UINT kPopupMaintenanceIntervalMs = 50u;
+// Kill switch for the layered (LWA_ALPHA) dropdown fade. Constant alpha is not
+// per-pixel layering, so DWM keeps the Windows 11 rounded corners; flip to false if
+// a Windows build ever squares them (the reveal then degrades to instant).
+inline constexpr bool kLayeredPopupTransitions = true;
 HFONT SafeFont(HFONT requested) noexcept {
     return requested ? requested : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 }
@@ -43,6 +49,15 @@ struct MacOsUiFramework::PopupRuntime {
     int viewportHeight = 0;
     int scrollOffset = 0;
     bool done = false, maintenanceFailed = false;
+    // True when DWM (Windows 11+) rounds and borders the popup itself; then the
+    // window has no 1-bit region and we skip our own rounded fill/border.
+    bool dwmRounded = false;
+    // DropDownReveal: the nested loop below cannot see the app's animation timer, so
+    // the dropdown owns a local Animator (same class, same preset) and pumps its
+    // frames from the loop itself (no timer). Layered only while animations are on.
+    animation::Animator reveal;
+    bool opensUpward = false;
+    bool layered = false;
     std::function<void()> maintenancePump;
     std::function<void(std::wstring_view)> errorSink;
     explicit PopupRuntime(std::vector<MenuItem> items) : model(std::move(items)) {}
@@ -118,17 +133,34 @@ void MacOsUiFramework::PaintPopup(HWND window, PopupRuntime& runtime) const {
         return;
     }
     FillSolidRect(bufferDc, client, runtime.palette.menu);
-    {
+    // Dark mode: a single solid fill. The previous rounded overlay on a solid
+    // base could leave a one-pixel two-tone edge when DWM rounds the window.
+    if (!runtime.dwmRounded) {
         Gdiplus::Graphics graphics(bufferDc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-        FillRoundedRectGp(graphics, client, static_cast<float>(ScaleDip(11, runtime.dpi)),
+        FillRoundedRectGp(graphics, client, static_cast<float>(ScaleDip(layout::kPopupRadiusDip, runtime.dpi)),
             ToGpColor(runtime.palette.menu));
-        DrawRoundedRectGp(graphics, client, static_cast<float>(ScaleDip(11, runtime.dpi)),
+        DrawRoundedRectGp(graphics, client, static_cast<float>(ScaleDip(layout::kPopupRadiusDip, runtime.dpi)),
             ToGpColor(BlendColor(runtime.palette.border, runtime.palette.menu, 0.12f)), 1.0f);
     }
+    // Reveal frame: contents travel a few DIP away from the anchor and are clipped
+    // to a band growing from the anchor edge; the menu surface itself is complete
+    // from the first frame (the window alpha does the fade).
+    const animation::Appearance reveal = runtime.reveal.Appear(animation::element::kPopupReveal,
+        animation::presets::DropDownReveal(runtime.opensUpward), 1.0f);
+    const int contentShift = static_cast<int>(std::lround(
+        reveal.offsetY * static_cast<float>(runtime.dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI)));
+    const bool revealing = !reveal.AtRest();
+    int savedClip = 0;
+    if (revealing) {
+        savedClip = SaveDC(bufferDc);
+        const int band = static_cast<int>(std::lround(static_cast<float>(height) * reveal.reveal));
+        if (runtime.opensUpward) IntersectClipRect(bufferDc, 0, height - band, width, height);
+        else IntersectClipRect(bufferDc, 0, 0, width, band);
+    }
     for (int index = 0; index < static_cast<int>(runtime.model.Items().size()); ++index) {
-        const int top = runtime.model.ItemTop(index, runtime.metrics) - runtime.scrollOffset;
+        const int top = runtime.model.ItemTop(index, runtime.metrics) - runtime.scrollOffset + contentShift;
         const int itemHeight = runtime.model.ItemHeight(index, runtime.metrics);
         if (top >= height || top + itemHeight <= 0) continue;
         RECT itemRect{ runtime.metrics.padding, top,
@@ -155,6 +187,7 @@ void MacOsUiFramework::PaintPopup(HWND window, PopupRuntime& runtime) const {
         PaintOverlayScrollbar(bufferDc, thumb, track, false, false,
             runtime.palette, runtime.dpi);
     }
+    if (revealing && savedClip) RestoreDC(bufferDc, savedClip);
     BitBlt(dc, 0, 0, width, height, bufferDc, 0, 0, SRCCOPY);
     SelectObject(bufferDc, oldBitmap);
     DeleteObject(bitmap);
@@ -178,8 +211,15 @@ LRESULT MacOsUiFramework::HandlePopupMessage(HWND window, PopupRuntime& runtime,
             }
         return 0;
     case WM_MOUSEMOVE: {
-        const int contentY = SaturatingAdd(GET_Y_LPARAM(lParam), runtime.scrollOffset);
-        const int next = runtime.model.HitTestY(contentY, runtime.metrics);
+        // The popup holds capture, so moves outside it arrive here too. Only a
+        // pointer inside the client hovers an item (HitTestY alone ignores x, so a
+        // pointer beside the menu used to highlight the row at its height).
+        const POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT client{};
+        GetClientRect(window, &client);
+        const int contentY = SaturatingAdd(point.y, runtime.scrollOffset);
+        const int next = PtInRect(&client, point)
+            ? runtime.model.HitTestY(contentY, runtime.metrics) : -1;
         if (next != runtime.model.HoveredIndex()) {
             runtime.model.SetHoveredIndex(next);
             InvalidateRect(window, nullptr, FALSE);
@@ -196,7 +236,9 @@ LRESULT MacOsUiFramework::HandlePopupMessage(HWND window, PopupRuntime& runtime,
                 static_cast<long long>(std::numeric_limits<int>::max())));
             ClampPopupScroll(runtime);
             POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            if (ScreenToClient(window, &point)) {
+            RECT client{};
+            if (ScreenToClient(window, &point) && GetClientRect(window, &client) &&
+                PtInRect(&client, point)) {
                 const int contentY = SaturatingAdd(point.y, runtime.scrollOffset);
                 runtime.model.SetHoveredIndex(runtime.model.HitTestY(contentY, runtime.metrics));
             }
@@ -347,24 +389,58 @@ int MacOsUiFramework::TrackDropdown(DropdownRequest request) {
     int top = anchorRect.bottom + gap;
     const int below = workArea.bottom - screenInset - top;
     const int above = anchorRect.top - gap - (workArea.top + screenInset);
-    if (height > below && above > below) top = anchorRect.top - height - gap;
+    if (height > below && above > below) {
+        top = anchorRect.top - height - gap;
+        runtime.opensUpward = true;
+    }
     left = std::clamp(left, static_cast<int>(workArea.left) + screenInset,
         std::max(static_cast<int>(workArea.left) + screenInset, static_cast<int>(workArea.right) - screenInset - width));
     top = std::clamp(top, static_cast<int>(workArea.top) + screenInset,
         std::max(static_cast<int>(workArea.top) + screenInset, static_cast<int>(workArea.bottom) - screenInset - height));
-    HWND menu = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+    // Layered (constant alpha, not per-pixel) only when the reveal will animate, so
+    // reduced-motion users get exactly the previous non-layered popup.
+    runtime.reveal.SetEnabled(CurrentVisualEffects().Animate());
+    runtime.layered = runtime.reveal.Enabled() && kLayeredPopupTransitions;
+    HWND menu = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | (runtime.layered ? WS_EX_LAYERED : 0),
         PopupWindowClassName, L"", WS_POPUP, left, top, width, height,
         request.owner, nullptr, request.instance, &runtime);
     if (!menu) {
         ReportDropdownError(request.errorSink, L"Creating a centralized dropdown window");
         return 0;
     }
-    ApplyRoundedRegion(menu, width, height, ScaleDip(11, runtime.dpi));
-    const int corner = 2;
-    DwmSetWindowAttribute(menu, 33, &corner, sizeof(corner));
+    {
+        // Windows 11: DWM rounds (anti-aliased) and borders the popup when it has
+        // no window region, so prefer that over SetWindowRgn's aliased staircase.
+        // Windows 10 rejects attribute 33 (DWMWA_WINDOW_CORNER_PREFERENCE) and keeps
+        // the region + our GDI+ rounded border.
+        runtime.dwmRounded = ApplyWindowChrome(menu, WindowChromeKind::Popup, runtime.palette);
+        if (!runtime.dwmRounded)
+            ApplyRoundedRegion(menu, width, height, ScaleDip(layout::kPopupRadiusDip, runtime.dpi));
+    }
     if (runtime.maintenancePump && SetTimer(menu, kPopupMaintenanceTimerId,
         kPopupMaintenanceIntervalMs, nullptr) == 0)
         ReportDropdownError(request.errorSink, L"Starting dropdown background-maintenance timer");
+    const auto applyRevealFrame = [&](animation::Animator::TimePoint now) {
+        const animation::Animator::TickResult frame = runtime.reveal.Tick(now);
+        if (frame.dirty == animation::surface::kNone) return;
+        if (runtime.layered) {
+            const animation::Appearance appearance = runtime.reveal.Appear(
+                animation::element::kPopupReveal, animation::presets::DropDownReveal(runtime.opensUpward), 1.0f);
+            SetLayeredWindowAttributes(menu, 0, static_cast<BYTE>(std::lround(
+                std::clamp(appearance.opacity, 0.0f, 1.0f) * 255.0f)), LWA_ALPHA);
+        }
+        InvalidateRect(menu, nullptr, FALSE);
+    };
+    {
+        const auto now = animation::Animator::Clock::now();
+        runtime.reveal.Snap(animation::element::kPopupReveal, runtime.layered ? 0.0f : 1.0f,
+            animation::surface::kPopup);
+        if (runtime.layered) {
+            SetLayeredWindowAttributes(menu, 0, 0, LWA_ALPHA);
+            runtime.reveal.Show(animation::element::kPopupReveal,
+                animation::presets::DropDownReveal(runtime.opensUpward), animation::surface::kPopup, now);
+        }
+    }
     ShowWindow(menu, SW_SHOWNORMAL);
     UpdateWindow(menu);
     SetCapture(menu);
@@ -373,6 +449,24 @@ int MacOsUiFramework::TrackDropdown(DropdownRequest request) {
     bool sawQuit = false;
     int quitCode = 0;
     while (!runtime.done) {
+        if (runtime.reveal.AnyActive()) {
+            // Reveal frames (~120 ms): poll the popup's queue, otherwise wait at most
+            // one frame for new input, then advance the local animator. No timer.
+            if (!PeekMessageW(&message, menu, 0, 0, PM_REMOVE)) {
+                MsgWaitForMultipleObjectsEx(0, nullptr, tokens::kAnimationFrameMs, QS_ALLINPUT, 0);
+                applyRevealFrame(animation::Animator::Clock::now());
+                continue;
+            }
+            if (message.message == WM_QUIT) {
+                sawQuit = true;
+                quitCode = static_cast<int>(message.wParam);
+                break;
+            }
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+            applyRevealFrame(animation::Animator::Clock::now());
+            continue;
+        }
         // Keep input isolated to the popup. Its timer drains background results
         // without dispatching owner commands or allowing arbitrary reentrancy.
         const BOOL status = GetMessageW(&message, menu, 0, 0);
@@ -391,7 +485,19 @@ int MacOsUiFramework::TrackDropdown(DropdownRequest request) {
     }
     if (GetCapture() == menu) ReleaseCapture();
     KillTimer(menu, kPopupMaintenanceTimerId);
-    DestroyWindow(menu);
+    // Detach the stack-owned runtime first: the window may outlive this frame while
+    // it fades out (its proc then falls back to DefWindowProc; the layered surface
+    // keeps the last painted frame).
+    SetWindowLongPtrW(menu, GWLP_USERDATA, 0);
+    if (runtime.layered && !sawQuit) {
+        // Same activation hand-back DestroyWindow would do, before the fade starts.
+        HWND root = GetAncestor(request.owner, GA_ROOT);
+        if (GetActiveWindow() == menu && root && IsWindow(root)) SetActiveWindow(root);
+        FadeOutAndDestroyWindow(menu, runtime.reveal.Appear(animation::element::kPopupReveal,
+            animation::presets::DropDownReveal(runtime.opensUpward), 1.0f).opacity);
+    } else {
+        DestroyWindow(menu);
+    }
     if (sawQuit) PostQuitMessage(quitCode);
     return runtime.result;
 }

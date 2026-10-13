@@ -2,6 +2,7 @@
 #pragma once
 
 #include "app_types.h"
+#include "image_metadata.h"
 #include "path_identity.h"
 
 #include <cstddef>
@@ -35,6 +36,14 @@ public:
     // changed through a general record callback.
     void EditPhoto(Index index, const std::function<void(PhotoItem&)>& edit);
     [[nodiscard]] std::span<const PhotoItem> Photos() const noexcept { return photos_; }
+
+    // Metadata epoch: bumped whenever a fact a predicate can test changes (any
+    // rating/pick/color/knowledge, capture time, comment, name, or the record set).
+    // Workers compare it with their snapshot's epoch and drop stale results.
+    [[nodiscard]] std::uint64_t MetadataEpoch() const noexcept { return metadataEpoch_; }
+    // Immutable snapshot of every record's metadata facts for worker threads.
+    // UI thread only; cached until the epoch changes.
+    [[nodiscard]] CatalogSnapshotPtr Snapshot() const;
 
     [[nodiscard]] Index VisibleCount() const noexcept { return visibleIndices_.size(); }
     [[nodiscard]] bool VisibleEmpty() const noexcept { return visibleIndices_.empty(); }
@@ -73,7 +82,16 @@ private:
     void InsertPath(Index index, std::wstring_view path);
     void RemovePath(Index index, std::wstring_view oldPath) noexcept;
 
+    void BumpMetadataEpoch() noexcept { ++metadataEpoch_; }
+    // Bumps the epoch and marks the snapshot chunk holding `index` for rebuild.
+    void MarkFactsChanged(Index index) noexcept;
+
     std::vector<PhotoItem> photos_;
+    std::uint64_t metadataEpoch_ = 1;
+    mutable CatalogSnapshotPtr snapshot_;
+    // Incremental snapshot state (UI thread only): last built chunks + dirty flags.
+    mutable std::vector<std::shared_ptr<const CatalogSnapshot::Chunk>> snapshotChunks_;
+    mutable std::vector<std::uint8_t> snapshotChunkDirty_;
     std::unordered_multimap<std::uint64_t, Index> pathIndex_;
     std::vector<Index> visibleIndices_;
     std::vector<Index> visiblePositions_;

@@ -93,6 +93,7 @@ Start with the first matching row.
 | Reusable native controls, component painting, dropdowns, toasts, alerts, cards, badges, and title bar | `src/ui/framework/macos_ui_framework*` |
 | UI colors, contrast, DPI conversion, and low-level drawing primitives | `src/ui/ui_design_system.*` |
 | UI spacing, dimensions, radii | `src/ui/ui_layout_metrics.h` |
+| Design tokens (radius/spacing/motion/type scale, glass, accessibility policy) | `src/ui/ui_design_tokens.h` (`docs/DESIGN_SYSTEM.md`) |
 | Stable command/control IDs | `src/ui/ui_command_ids.h` |
 | Persistent main-window buttons and membership | `src/ui/ui_control_catalog.h` |
 | Window messages, timers, subclass IDs, class names | `src/ui/../app/application_support.h` |
@@ -302,11 +303,22 @@ Code reaches a useful context boundary
 Unhandled crash
   -> re-entry-safe crash handler
   -> text report + minidump + recent in-memory log entries
-  -> queued disk entries are flushed when the log lock is available
+  -> subsystem state (priority demand snapshot) from lock-free atomics
+  -> queued disk entries are flushed when the log locks are available (try-lock only)
   -> LATEST_CRASH.txt points to the newest report
 ```
 
 Use QS_LOG_EVENT for structured diagnostics. Include operation, job kind, priority, generation/epoch, durations, cache hit/miss, dimensions, and relevant Win32 error codes at context boundaries. Avoid logging credentials, image pixels, or full paths unless the path itself is required to reproduce the issue. The logger is asynchronous on disk so high-volume image workloads do not serialize on file I/O. Log once where the operation, path, and Windows error still have meaning; do not spam the same low-level error at every stack level.
+
+Rules added in 0.9.4.0 (polishing pass):
+
+- **Categories** come from `diagnostics/log_categories.h`: `Search`, `MetadataStore`, `Batch`, `RatingsIO`, `FaceLock`, `ViewLane`, `ThumbReliability`, `Scheduler`, `WriteLane`, `DbMigration`, plus the existing `Metadata`, `Worker`, `UI`, `Lifecycle`, `Catalog`. Use the constant, not a new string.
+- **Paths**: log `file=` (`LogFileName`, the file name only) and `path_id=` (`LogPathId`, an FNV-1a hash of the case-folded full path, stable within and across sessions so events about one file can be correlated). Never log the full path or user text (search queries, comments): log their shape instead (`clauses=`, `chars=`).
+- **Error codes**: user-visible failures use `core/user_error_catalog.h`. Each `UserErrorCode` maps, in one table, to a stable event name (`write.in_use.waiting`, `cache.db.busy`, …) logged as `error_code=`, and to the English title/message keys that the UI shows through `Tr()`. Add the Vietnamese pair to `src/localization.cpp`; `check-localization.py` and `localization_checks.cpp` fail otherwise.
+- **Rate limiting**: anything that can repeat per file or per frame goes through a function-local `static core::LogRateLimiter limiter(burst, window)`; pass the `suppressed=` count it returns. Terminal outcomes (gave up, marked failed) are always logged.
+- **Hot paths** (dequeue loops, per-frame code) log only at `Trace` and only behind `diagnostics::VerboseLogging()`, so arguments are not even built otherwise.
+- **The logger never does disk I/O on the calling thread.** Producers only append to the in-memory ring and queue under the state mutex. A Warning or Error asks the writer thread to flush the OS buffer on its next pass; only `Critical` drains synchronously (so the line is on disk if a crash follows). Disk writes happen under a separate stream mutex (lock order: stream mutex → state mutex).
+- **Crash reports** include a "Subsystem state" block read from lock-free atomics: the priority demand snapshot (highest tier, pending metadata writes, interactive write queued, view decodes, search active/focused).
 
 ---
 

@@ -155,6 +155,7 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::RotateView(int degrees) {
+        ClearFaceZoomToggle();
         ViewState state = EditableViewState();
         state.rotation = ((state.rotation + degrees) % 360 + 360) % 360;
         StoreEditableViewState(state);
@@ -309,6 +310,11 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::OnTimer(UINT_PTR timer) {
+        // Lost-wake backstop (0.9.4.0 polish): a finished ratings / batch worker whose
+        // WM_APP completion post failed would otherwise never be consumed (and the
+        // dialog would stay busy). Both completion handlers are idempotent.
+        if (ratingsWorker_.joinable() && !RatingsWorkerBusy()) OnRatingsWorkerCompleted();
+        if (batchWorker_.joinable() && !BatchWorkerBusy()) OnBatchWorkerCompleted();
         if (!ThumbnailScrollPrefersPlaceholders()) {
             UpdateAnimations();
             if (completionQueue_.Size() != 0) DrainBackgroundCompletions();
@@ -317,6 +323,15 @@ namespace quicksift::app {
         } else {
             // Keep animation clock advancing lightly; skip heavy completion drain.
             UpdateAnimations();
+        }
+        if (timer == ID_TIMER_COMPLETION_PUMP) {
+            // One-shot continuation. A drain above has already killed (and, if work
+            // remains, possibly re-armed) this timer; only clean up when no drain ran.
+            if (ThumbnailScrollPrefersPlaceholders() || completionQueue_.Size() == 0) {
+                KillTimer(hwnd_, ID_TIMER_COMPLETION_PUMP);
+                completionPumpTimerActive_ = false;
+            }
+            return;
         }
         if (timer == ID_TIMER_DRAG_RENDER || timer == ID_TIMER_SCROLL_FRAME) {
             // Shared virtualized scroll frame pump (scrollbar drag + wheel/keyboard).
@@ -339,12 +354,21 @@ namespace quicksift::app {
             KillTimer(hwnd_, ID_TIMER_SCROLL_SETTLE);
             thumbnailScrollSettlePending_ = false;
             if (thumbnailScrollDragging_ || IsActivelyInteracting()) {
-                // Motion resumed during debounce — do not dump Interactive work.
+                // Motion resumed during debounce — do not dump Interactive work yet,
+                // but re-arm the debounce. 0.9.4.0: this used to return without
+                // re-arming, so if the last input event landed inside the debounce
+                // window and nothing else followed, the visible cells cancelled during
+                // the fling were never requested again (blank until the next scroll).
+                ArmThumbnailScrollSettle();
                 return;
             }
             if (!thumbnailScrollDragging_) ClearThumbnailScrollMotionAdmission();
             PublishThumbnailViewportForCurrentPlan(true);
             SchedulePredictivePrefetch(0);
+            // Post-settle reconciliation: anything visible that is neither cached nor
+            // in flight (cancelled during the fling, capped out of this pass, dropped
+            // by a stale-target/viewport check) is re-enqueued now.
+            ReconcileVisibleThumbnails(L"settle");
             InvalidateCanvas();
             return;
         }
@@ -361,6 +385,33 @@ namespace quicksift::app {
         if (timer == ID_TIMER_PERFORMANCE_HUD) {
             if (performanceHudVisible_) InvalidateCanvas();
             else KillTimer(hwnd_, ID_TIMER_PERFORMANCE_HUD);
+            return;
+        }
+        if (timer == ID_TIMER_SEARCH_DEBOUNCE) {
+            OnSearchDebounceTimer();
+            return;
+        }
+        if (timer == ID_TIMER_METADATA_WRITE_LANE) {
+            PollMetadataWriteLane();
+            return;
+        }
+        if (timer == ID_TIMER_USER_COMMENT_RETRY) {
+            KillTimer(hwnd_, ID_TIMER_USER_COMMENT_RETRY);
+            RefreshUserComment();
+            return;
+        }
+        if (timer == ID_TIMER_LIBRARY_LIST_RETRY) {
+            KillTimer(hwnd_, ID_TIMER_LIBRARY_LIST_RETRY);
+            RefreshLibraryList();
+            return;
+        }
+        if (timer == ID_TIMER_BATCH_GLASS_WATCH) {
+            CheckBatchGlassWatch();
+            return;
+        }
+        if (timer == ID_TIMER_RATINGS_PROGRESS) {
+            if (!RatingsWorkerBusy() && ratingsImportToken_ == 0) KillTimer(hwnd_, ID_TIMER_RATINGS_PROGRESS);
+            UpdateStatus();
             return;
         }
         if (timer == ID_TIMER_FILE_PROGRESS) {
@@ -413,34 +464,18 @@ namespace quicksift::app {
         }
         if (timer == ID_TIMER_THUMBNAIL_RETRY_COOLDOWN) {
             KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
-            if (!IsActivelyInteracting()) {
-                ScheduleVisibleWork();
-                InvalidateCanvas();
-            }
-            // One timer services all cooldown entries. Re-arm it for the next earliest
-            // expiration so a later-failing thumbnail cannot remain stuck indefinitely.
-            const auto now = std::chrono::steady_clock::now();
-            auto nextCooldown = std::chrono::steady_clock::time_point::max();
-            for (const auto& [path, expiresAt] : thumbnailRetryCooldown_) {
-                (void)path;
-                if (expiresAt < nextCooldown) nextCooldown = expiresAt;
-            }
-            if (nextCooldown != std::chrono::steady_clock::time_point::max()) {
-                const auto remaining = std::max(
-                    std::chrono::milliseconds(1),
-                    std::chrono::duration_cast<std::chrono::milliseconds>(nextCooldown - now));
-                const auto bounded = std::min<std::int64_t>(
-                    remaining.count(), static_cast<std::int64_t>(std::numeric_limits<UINT>::max()));
-                StartUiTimer(ID_TIMER_THUMBNAIL_RETRY_COOLDOWN,
-                    static_cast<UINT>(std::max<std::int64_t>(1, bounded)),
-                    L"thumbnail retry cooldown");
-            }
+            // A decode-retry backoff expired: thumbnails retry through the visible
+            // sweep, Single/Compare re-request on the next paint.
+            if (reviewState_.Mode() == ViewMode::Thumbnails) ReconcileVisibleThumbnails(L"retry-backoff");
+            InvalidateCanvas();
+            // Re-arm for the next future deadline only (no 1 ms spin on stale entries).
+            ArmDecodeRetryTimer();
             return;
         }
-        if (timer == ID_TIMER_TOAST) {
-            const bool visible = uiFramework_.Toasts().Tick();
-            if (!visible) KillTimer(hwnd_, ID_TIMER_TOAST);
-            InvalidateCanvas();
+        if (timer == ID_TIMER_THUMBNAIL_RECONCILE) {
+            KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RECONCILE);
+            thumbnailReconcileTimerActive_ = false;
+            ReconcileVisibleThumbnails(L"backstop");
             return;
         }
     }
@@ -480,6 +515,8 @@ namespace quicksift::app {
             thumbValues[restoredThumbnailSizeIndex]);
         reviewState_.RestorePreferences(readInt(L"Sync", 1) != 0,
             readInt(L"FaceLock", 0) != 0);
+        // Right-click face-outline pin (0.9.4.0): persistent preference, default auto-hide.
+        faceOutlineFade_.SetPinned(readInt(L"FaceOutlinesPinned", 0) != 0, std::chrono::steady_clock::now());
         badgeStars_ = readInt(L"BadgeStars", 1) != 0;
         badgeColor_ = readInt(L"BadgeColor", 1) != 0;
         badgePick_ = readInt(L"BadgePick", 1) != 0;
@@ -545,6 +582,7 @@ namespace quicksift::app {
         appendInt(L"ThumbSize", reviewState_.Thumbnails().sizeIndex);
         appendInt(L"Sync", reviewState_.SyncCompareView() ? 1 : 0);
         appendInt(L"FaceLock", reviewState_.FaceLockEnabled() ? 1 : 0);
+        appendInt(L"FaceOutlinesPinned", faceOutlineFade_.Pinned() ? 1 : 0);
         appendInt(L"BadgeStars", badgeStars_ ? 1 : 0);
         appendInt(L"BadgeColor", badgeColor_ ? 1 : 0);
         appendInt(L"BadgePick", badgePick_ ? 1 : 0);
@@ -669,6 +707,10 @@ namespace quicksift::app {
             return;
         }
 
+        // Click-to-zoom inputs are captured BEFORE Compare slot activation, which can
+        // move views (ApplyFaceLockForActive) and must not break the revert check.
+        faceTogglePress_ = {};
+        if (const auto preActivationHit = HitFaceOutline(x, y)) CaptureFaceTogglePress(*preActivationHit);
         if (reviewState_.Mode() == ViewMode::Compare) {
             if (const auto slot = HitCompareSlot(x, y)) {
                 const bool changed = reviewState_.SetActiveCompareSlot(*slot);
@@ -682,15 +724,45 @@ namespace quicksift::app {
                 }
             }
         }
+        // A press on a face outline (hit-tested from current state; hit boxes stay
+        // clickable while the outlines are faded) is a click candidate. Panning is
+        // deferred until the press leaves the system drag rectangle, so a click never
+        // nudges the view; other presses pan immediately as before.
+        pendingFaceClick_ = HitFaceOutline(x, y);
+        if (!pendingFaceClick_) faceTogglePress_ = {};
+        canvasPress_.Begin({ x, y }, GetTickCount64(), CanvasDragThreshold());
+        facePanDeferred_ = pendingFaceClick_.has_value();
         dragging_ = true;
         SetCapture(canvas_);
         InvalidateCanvas();
     }
 
-    void QuickSiftApplicationImpl::OnCanvasLeftUp(float, float) {
+    void QuickSiftApplicationImpl::OnCanvasLeftUp(float x, float y) {
+        std::optional<FaceOutlineHit> faceClick = std::move(pendingFaceClick_);
+        pendingFaceClick_.reset();
+        // Evaluate the click BEFORE ReleaseCapture (WM_CAPTURECHANGED cancels the
+        // press). A click needs: an active press that never became a drag, and a
+        // release over the SAME face it started on (current-state hit test).
+        bool isClick = false;
+        if (canvasPress_.Active()) {
+            bool releasedInside = false;
+            if (faceClick && reviewState_.Mode() != ViewMode::Thumbnails) {
+                const auto releaseHit = HitFaceOutline(x, y);
+                releasedInside = releaseHit && releaseHit->path == faceClick->path &&
+                    releaseHit->faceIndex == faceClick->faceIndex;
+            }
+            isClick = canvasPress_.Release({ x, y }, releasedInside) && faceClick.has_value();
+        }
+        facePanDeferred_ = false;
         if (dragging_) {
             dragging_ = false;
             ReleaseCapture();
+        }
+        if (isClick && faceClick) {
+            HandleFaceOutlineClick(*faceClick);
+            lastFaceClickTick_ = GetTickCount64();
+        } else {
+            faceTogglePress_ = {};
         }
     }
 
@@ -705,12 +777,33 @@ namespace quicksift::app {
                 ResetView();
             }
         } else {
+            // The first click of a double-click on a face outline already selected and
+            // framed that face; do not let the double-click undo it with Fit/100%.
+            if (lastFaceClickTick_ != 0 &&
+                GetTickCount64() - lastFaceClickTick_ <= static_cast<ULONGLONG>(GetDoubleClickTime())) {
+                lastFaceClickTick_ = 0;
+                return;
+            }
             const ViewState state = EditableViewState();
             SetZoomMode(state.mode == ZoomMode::ActualPixels ? ZoomMode::Fit : ZoomMode::ActualPixels);
         }
     }
 
     void QuickSiftApplicationImpl::OnCanvasMouseMove(float x, float y, WPARAM keys) {
+        if (canvasPress_.Active() && canvasPress_.Move({ x, y })) {
+            // The press became a drag: never a click; a deferred face press starts
+            // panning from the press origin so no travel is lost. A real pan is a
+            // meaningful manual change, so the click-to-zoom revert target is dropped.
+            pendingFaceClick_.reset();
+            faceTogglePress_ = {};
+            if (facePanDeferred_) {
+                facePanDeferred_ = false;
+                lastMouse_ = mouseDown_;
+            }
+            if (reviewState_.Mode() != ViewMode::Thumbnails)
+                faceZoomToggle_.Clear(FaceZoomKeyForPath(EditableViewPath()));
+        }
+        if (facePanDeferred_) return;
         if (dragging_ && (keys & MK_LBUTTON) && reviewState_.Mode() != ViewMode::Thumbnails) {
             const std::wstring path = EditableViewPath();
             const D2D1_RECT_F area = ViewAreaForPath(path);
@@ -769,13 +862,21 @@ namespace quicksift::app {
             if (reviewState_.FaceLockEnabled() &&
                 (reviewState_.Mode() == ViewMode::Single || reviewState_.Mode() == ViewMode::Compare)) {
                 if (const auto faceCenter = PrimaryFaceCenter(path)) {
-                    zoomPoint.x = faceCenter->x * (area.right - area.left) + area.left;
-                    zoomPoint.y = faceCenter->y * (area.bottom - area.top) + area.top;
+                    // Pivot on where the target face actually is on screen (accounts
+                    // for letterboxing, pan and rotation), kept inside the pane.
+                    const auto geometry = ViewGeometryForPath(path, area);
+                    const auto onScreen = quicksift::review::transform::SourceToScreen(
+                        quicksift::review::transform::ResolveView(EditableViewState(), geometry),
+                        geometry, { faceCenter->x, faceCenter->y });
+                    zoomPoint.x = std::clamp(onScreen.x, area.left, area.right);
+                    zoomPoint.y = std::clamp(onScreen.y, area.top, area.bottom);
                 }
             }
             ViewState state = quicksift::review::transform::ZoomViewAt(EditableViewState(),
                 ViewGeometryForPath(path, area), zoomPoint, factor);
             StoreEditableViewState(state);
+            // Manual zoom: the click-to-zoom revert target no longer applies.
+            faceZoomToggle_.Clear(FaceZoomKeyForPath(path));
             const auto interactionEpoch = viewInteractionEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
             worker_.SetViewInteractionEpoch(interactionEpoch);
             // Zoom uses a dedicated interaction epoch so stale high-resolution work is cancelled. A
@@ -788,6 +889,8 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::OnKeyDown(UINT key, bool ctrl, bool shift) {
+        // Escape during a canvas press cancels the press (no click, no mode change).
+        if (key == VK_ESCAPE && CancelCanvasPress()) return;
         if (ctrl && key == L'Z') { Undo(); return; }
         if (ctrl && key == L'Y') { Redo(); return; }
         if (ctrl && key == L'5') { ApplyColorLabel(5); return; }
@@ -803,6 +906,8 @@ namespace quicksift::app {
         if (key >= L'6' && key <= L'9') { ApplyColorLabel(static_cast<int>(key - L'5')); return; }
         if (key == L'F') { SetZoomMode(ZoomMode::Fit); return; }
         if (key == L'Z') { SetZoomMode(ZoomMode::ActualPixels); return; }
+        // 0.9.4.0 manual retry of failed image loads (thumbnails and Single/Compare).
+        if ((ctrl && shift && key == L'R') || key == VK_F5) { RetryFailedImageLoads(); return; }
         if (key == L'R') { RotateView(90); return; }
         if (key == VK_F7) { ToggleFilmstrip(); return; }
         switch (key) {
@@ -1042,6 +1147,7 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::ResetView() {
+        ClearFaceZoomToggle();
         const std::wstring path = EditableViewPath();
         if (reviewState_.FaceLockEnabled()) ResetFaceOffsetForPath(path);
         ViewState state = EditableViewState();
@@ -1085,6 +1191,13 @@ namespace quicksift::app {
         worker_.SetInteractiveVisualFocus(mode == ViewMode::Single || mode == ViewMode::Compare);
         if (mode == ViewMode::Compare) PrioritizeCompareLoads(reviewState_.ActiveComparePath());
         else worker_.SetVisualPriorityPaths({});
+        if (mode != ViewMode::Single) {
+            // Neighbour prefetch is a Single View concept; drop it (queued and running)
+            // so the view lane is idle outside Single/Compare foreground work.
+            worker_.SetViewPrefetchPaths({});
+            lastViewPrefetchSignature_.clear();
+        }
+        if (mode == ViewMode::Thumbnails) ArmThumbnailReconcile(400);
         ScheduleViewResourceTrim();
         RequestExifForActive();
         UpdateStatus();
@@ -1148,11 +1261,12 @@ namespace quicksift::app {
         const D2D1_SIZE_F canvas = CanvasSizeInDips();
         const int target = std::max(2048, static_cast<int>(std::max(canvas.width, canvas.height) *
             CanvasPixelScale()));
-        const uint64_t epoch = reviewState_.Epochs().navigation;
-        const uint64_t interaction = viewInteractionEpoch_.load(std::memory_order_acquire);
+        // 0.9.4.0: Compare decodes run on the dedicated view lane (focus first; the
+        // lane is FIFO for foreground work). Bucketed so the result is found by the
+        // same cache key paint requests.
         for (const std::wstring& path : ordered) {
-            worker_.EnqueueFull(fs::path(path), target, generation_, JobPriority::Interactive,
-                CacheClass::Full, epoch, 0, 0, false, false, interaction);
+            RequestViewDecode(fs::path(path), JobKind::DecodeFull, target,
+                CacheClass::Full, JobPriority::Interactive);
         }
     }
 

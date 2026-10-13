@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import io
 import re
+from contextlib import redirect_stdout
 from pathlib import Path
 
 OBSOLETE_SUFFIXES = (".inl",)
@@ -16,6 +19,7 @@ REQUIRED_MODULES = (
     "src/core/path_identity.cpp",
     "src/core/performance_policy.cpp",
     "src/core/face_policy.cpp",
+    "src/core/face_quality_policy.cpp",
     "src/core/face_detection_policy.cpp",
     "src/core/selection_store.cpp",
     "src/core/history_store.cpp",
@@ -60,6 +64,12 @@ REQUIRED_MODULES = (
     "src/transactions/transaction_coordinator.cpp",
     "src/transactions/verified_file_operations_windows.cpp",
     "src/transactions/verified_file_move_windows.cpp",
+    # 0.9.4.0 polish: priority model, write lane, error catalog, localized write lane UI.
+    "src/core/priority_policy.cpp",
+    "src/core/write_retry_policy.cpp",
+    "src/core/metadata_edit_queue.cpp",
+    "src/core/user_error_catalog.cpp",
+    "src/ui/metadata_write_lane_controller.cpp",
 )
 
 
@@ -451,14 +461,24 @@ def verify(root: Path) -> None:
     if ("platform::CacheDirectoryPath()" not in persistent_cache or
             ": baseDirectory_(quicksift::platform::CacheDirectoryPath())" not in persistent_cache):
         fail("persistent cache is not exclusively rooted below the canonical runtime data root")
-    for forbidden in ("ALTER TABLE image_records", "TryMigrateLegacyDirectory", "PreviousQuickSiftUserCacheDirectory"):
+    for forbidden in ("TryMigrateLegacyDirectory", "PreviousQuickSiftUserCacheDirectory"):
         if forbidden in persistent_cache:
             fail(f"obsolete cache/database compatibility remains: {forbidden}")
-    for token in ("kDatabaseSchemaVersion = 1", 'PRAGMA user_version;',
+    # Schema v2 (0.9.4.0): the only permitted in-place upgrade is the explicit,
+    # versioned v1 -> v2 step in MigrateSchema; every other mismatch rebuilds.
+    migrate_start = persistent_cache.find("bool PersistentCache::MigrateSchema(int fromVersion)")
+    migrate_end = persistent_cache.find("bool PersistentCache::InitializeSchema()", max(migrate_start, 0))
+    if migrate_start < 0 or migrate_end < 0:
+        fail("versioned cache schema migration (MigrateSchema before InitializeSchema) is missing")
+    outside_migration = persistent_cache[:migrate_start] + persistent_cache[migrate_end:]
+    if "ALTER TABLE image_records" in outside_migration:
+        fail("unversioned cache/database compatibility remains: ALTER TABLE image_records outside MigrateSchema")
+    for token in ("kDatabaseSchemaVersion = 2", 'PRAGMA user_version;',
                   '"PRAGMA user_version=" + std::to_string(kDatabaseSchemaVersion)',
-                  "error != SQLITE_SCHEMA"):
+                  "error != SQLITE_SCHEMA", "fromVersion != 1", "MigrateSchema(storedVersion)",
+                  "face_quality_version", "face_selection", "core::kFaceQualityAnalysisVersion"):
         if token not in persistent_cache:
-            fail(f"current-only database schema contract is missing: {token}")
+            fail(f"versioned database schema contract is missing: {token}")
     if "platform::SessionFilePath()" not in session_controller:
         fail("session persistence is not rooted below the canonical runtime data root")
     if ("if (!quicksift::diagnostics::Initialize())" not in main_entry or
@@ -646,8 +666,15 @@ def verify(root: Path) -> None:
             fail(f"metadata stale-read or storage-history contract is missing {token}")
     if "ReadPhotoMetadata(image)" not in application_support:
         fail("sidecar compare-and-swap does not use effective metadata")
-    if catalog_policy.count("MetadataKnowledge::Known") < 4:
+    # Filters and search share one predicate engine (core/photo_predicate.cpp); the
+    # Known-knowledge requirement lives there for rating/pick/label clauses and in
+    # catalog_policy.cpp for the rating sort.
+    photo_predicate = read(root, "src/core/photo_predicate.cpp")
+    if catalog_policy.count("MetadataKnowledge::Known") < 2 or \
+            photo_predicate.count("MetadataKnowledge::Known") < 3:
         fail("metadata filters or rating sort no longer require authoritative values")
+    if "MatchesFilter(FactsOf(item)" not in catalog_policy:
+        fail("metadata filters no longer evaluate through the shared predicate engine")
     if "intentionally keeps selection scoped to visible results" not in read(root, "USER_GUIDE.md"):
         fail("intentional visible-selection scope is not documented")
 
@@ -873,6 +900,22 @@ def verify(root: Path) -> None:
         fail("small-face sharpness is incorrectly marked complete without analysis")
     if "FaceAnchorComesBefore" not in face_policy:
         fail("primary-face selection lacks deterministic tie breaking")
+    for token in ("RankFacesForAnchor", "MatchFaceSelection", "HitTestFaceBoxes",
+                  "kFaceClickFillFraction", "IsNoiseFace"):
+        if token not in face_policy + read(root, "src/core/face_policy.h"):
+            fail(f"multi-face FaceLock policy is missing: {token}")
+    face_quality = read(root, "src/core/face_quality_policy.cpp") + read(root, "src/core/face_quality_policy.h")
+    for token in ("AnalyzeFaceQualityBgra", "kFaceQualityAnalysisVersion", "FaceQualityThresholds",
+                  "RequiredFaceQualityDecodeEdge", "FaceQualityFlagged"):
+        if token not in face_quality:
+            fail(f"per-face quality policy is missing: {token}")
+    for token in ("AnalyzeFaceQualitiesBgra", "core::RankFacesForAnchor", "faceSelectionKnown"):
+        if token not in worker:
+            fail(f"worker multi-face analysis is missing: {token}")
+    if "ResolveTargetFaceIndex" not in view_state or "FrameSourceRect" not in view_state:
+        fail("FaceLock target/click-to-frame adapter is missing")
+    if "SourceToScreen" not in navigation:
+        fail("FaceLock wheel pivot must use the resolved on-screen face position")
 
     face_retry = read(root, "src/core/face_detection_policy.cpp")
     face_controller = read(root, "src/ui/face_analysis_controller.cpp")
@@ -898,6 +941,202 @@ def verify(root: Path) -> None:
     for document in ("README.md", "DEVELOPER_GUIDE.md", "ARCHITECTURE.md", "TESTING.md"):
         if "CODE_GUIDE.md" not in read(root, document):
             fail(f"{document} does not link to CODE_GUIDE.md")
+
+    verify_localization(root)
+    verify_polish_contracts(root)
+    verify_ui_polish_contracts(root)
+    verify_animation_contracts(root)
+    verify_pane_frost_and_overlay_contracts(root)
+
+
+def verify_localization(root: Path) -> None:
+    """Runs scripts/check-localization.py (self-test first, then the tree)."""
+    script = root / "scripts" / "check-localization.py"
+    if not script.exists():
+        fail("scripts/check-localization.py is missing")
+    spec = importlib.util.spec_from_file_location("quicksift_check_localization", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        self_test = module.self_test()
+        status = module.run(root)
+    if self_test != 0:
+        fail("localization checker self-test failed:\n" + buffer.getvalue())
+    if status != 0:
+        fail("localization check failed:\n" + buffer.getvalue())
+
+
+def verify_polish_contracts(root: Path) -> None:
+    """0.9.4.0 polish-pass contracts (priority model, write lane, logging)."""
+    log = read(root, "src/diagnostics/diagnostic_log.cpp")
+    if "FlushDiskQueueLocked" in log:
+        fail("diagnostic log still writes to disk while holding the producer lock")
+    for token in ("DrainToDisk", "streamMutex", "SubsystemStateText", "Level::Critical"):
+        if token not in log:
+            fail(f"non-blocking diagnostic log contract is missing: {token}")
+    service = read(root, "src/transactions/metadata_transaction_service.cpp")
+    for token in ("SubmitUrgent", "WriteWithRetry", "SkipWaiting"):
+        if token not in service + read(root, "src/transactions/metadata_transaction_execution.cpp"):
+            fail(f"metadata write lane is missing: {token}")
+    lane = read(root, "src/ui/metadata_write_lane_controller.cpp")
+    for token in ("QueueMetadataEdit", "FlushPendingMetadataEdits", "PollMetadataWriteLane",
+                  "RetryInUseMetadataChanges", "SkipInUseMetadataChanges"):
+        if token not in lane:
+            fail(f"metadata write-lane controller is missing: {token}")
+    engine = read(root, "src/work/background_work_engine.cpp")
+    for token in ("ViewForegroundActiveLocked", "SearchPausesBackgroundAnalysis"):
+        if token not in engine:
+            fail(f"background engine priority admission is missing: {token}")
+    localization = read(root, "src/localization.cpp")
+    if "std::stable_sort(built.fragments.begin()" not in localization:
+        fail("Localizer fragments are not applied longest-first")
+    for check in ("write_lane_checks.cpp", "priority_policy_checks.cpp", "lock_order_checks.cpp",
+                  "localization_checks.cpp"):
+        if not (root / "scripts" / "checks" / check).exists():
+            fail(f"portable check program is missing: scripts/checks/{check}")
+
+
+def verify_ui_polish_contracts(root: Path) -> None:
+    """0.9.4.0 UI polish contracts (design tokens, glass, accessibility, motion)."""
+    tokens = read(root, "src/ui/ui_design_tokens.h")
+    for token in ("kRadiusSmall", "kRadiusXLarge", "kSpace5", "kMotionFastMs", "kMotionStandardMs",
+                  "kMotionSlowMs", "EaseOutCubic", "StepToward", "GlassMaterial", "VisualEffects"):
+        if token not in tokens:
+            fail(f"design tokens are missing {token}")
+    if "src/ui/ui_design_tokens.h" not in read(root, "CMakeLists.txt"):
+        fail("ui_design_tokens.h is not registered in CMake")
+    design = read(root, "src/ui/ui_design_system.cpp")
+    for token in ("SPI_GETHIGHCONTRAST", "SPI_GETCLIENTAREAANIMATION", "EnableTransparency",
+                  "ResolveThemePalette", "HighContrastPalette", "ApplyAccentToPalette", "UiFontFamily"):
+        if token not in design:
+            fail(f"design system accessibility/accent contract is missing {token}")
+    framework = read(root, "src/ui/framework/macos_ui_framework.cpp")
+    if "ApplyWindowChrome" not in framework or "ClearButtonHot" not in framework or \
+            "GetCaretBlinkTime" not in framework:
+        fail("framework window-chrome / button hot-state / caret contract is missing")
+    d2d = read(root, "src/ui/framework/macos_ui_framework_d2d.cpp")
+    for token in ("PaintGlassSurface", "SnapToDevicePixels", "PaintFocusRing"):
+        if token not in d2d:
+            fail(f"glass renderer is missing {token}")
+    # DWM attributes are owned by MacOsUiFramework::ApplyWindowChrome only.
+    offenders = []
+    for path in (root / "src").rglob("*.cpp"):
+        if path.name == "macos_ui_framework.cpp":
+            continue
+        if re.search(r"\bDwmSetWindowAttribute\s*\(", strip_cpp(path.read_text(encoding="utf-8"))):
+            offenders.append(path.relative_to(root).as_posix())
+    if offenders:
+        fail("DWM window attributes set outside ApplyWindowChrome: " + ", ".join(sorted(offenders)))
+    theme = strip_cpp(read(root, "src/ui/app_theme_documents_and_localization.cpp"))
+    apply_theme = theme[theme.find("void QuickSiftApplicationImpl::ApplyTheme()"):]
+    if apply_theme.count("RDW_UPDATENOW") != 1:
+        fail("ApplyTheme must flush with exactly one RDW_UPDATENOW")
+    messages = read(root, "src/ui/main_window_chrome_and_messages.cpp")
+    for token in ("SIZE_MINIMIZED", "WM_SETTINGCHANGE", "WM_DWMCOLORIZATIONCOLORCHANGED", "lastFocusedChild_"):
+        if token not in messages:
+            fail(f"main window message contract is missing {token}")
+    if not (root / "scripts" / "checks" / "design_tokens_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/design_tokens_checks.cpp")
+    if not (root / "docs" / "DESIGN_SYSTEM.md").exists():
+        fail("docs/DESIGN_SYSTEM.md is missing")
+
+
+def verify_pane_frost_and_overlay_contracts(root: Path) -> None:
+    """0.9.4.0 bug-fix round: frosted, flicker-free left pane; search field; toast wrap."""
+    cmake = read(root, "CMakeLists.txt")
+    for token in ("src/ui/framework/ui_frost.cpp", "src/ui/framework/ui_frost.h"):
+        if token not in cmake:
+            fail(f"{token} is not registered in CMake")
+    if not (root / "scripts" / "checks" / "overlay_and_frost_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/overlay_and_frost_checks.cpp")
+    pane = strip_cpp(read(root, "src/ui/main_window_controls_layout_and_painting.cpp"))
+    # Backdrop z-slot: above the canvas. hWndInsertAfter = canvas_ puts it BELOW the canvas.
+    if re.search(r"SetWindowPos\s*\(\s*flyoutBackdrop_\s*,\s*canvas_\b", pane) or \
+            re.search(r"insertAfter\s*=\s*canvas_\s*\?", pane):
+        fail("left-pane backdrop must be inserted ABOVE the canvas (LeftPaneBackdropInsertAfter), not after it")
+    if "LeftPaneBackdropInsertAfter()" not in pane:
+        fail("left-pane backdrop placement must use LeftPaneBackdropInsertAfter")
+    layout = pane[pane.find("void QuickSiftApplicationImpl::LayoutControls("):]
+    layout = layout[:layout.find("closeFlyoutLayout();")]
+    if "HideAllLeftPaneSectionContent()" in layout or "HideLeftPaneSectionContentExcept(" not in layout:
+        fail("LayoutControls must hide only the inactive pane sections (no hide-all/re-show churn)")
+    erase = pane[pane.find("void QuickSiftApplicationImpl::EraseLeftPaneBackdropFully()"):]
+    erase = erase[:erase.find("\n    }")]
+    if "RDW_ERASE" in erase or "RDW_UPDATENOW" in erase:
+        fail("EraseLeftPaneBackdropFully must only invalidate (no erase pass, no UPDATENOW)")
+    backdrop_proc = pane[pane.find("FlyoutBackdropSubclassProc(HWND hwnd"):]
+    backdrop_proc = backdrop_proc[:backdrop_proc.find("LibraryListSubclassProc(HWND hwnd")]
+    if "PaintSolidSurface" in backdrop_proc:
+        fail("the backdrop must not paint in WM_ERASEBKGND (solid erase frame before the frost)")
+    if "PaintItemBuffered" not in pane or "IsLeftPaneSurface" not in pane:
+        fail("left-pane owner-draw surfaces must paint buffered over the frost (PaintItemBuffered)")
+    list_spec = pane[pane.find("libraryListSpec.style"):]
+    list_spec = list_spec[:list_spec.find(";")]
+    if "WS_VSCROLL" in list_spec:
+        fail("the library list must not use the native scrollbar (white strip); use the overlay scrollbar")
+    if "MaybeCaptureLeftPaneFrost" not in read(root, "src/ui/canvas_rendering_and_overlays.cpp"):
+        fail("Render must feed the left-pane frost (MaybeCaptureLeftPaneFrost)")
+    d2d = read(root, "src/ui/framework/macos_ui_framework_d2d.cpp")
+    toast = d2d[d2d.find("void MacOsUiFramework::PaintToast"):d2d.find("float MacOsUiFramework::DevicePixelDip")]
+    if "ComputeToastGeometry" not in toast or "SetMaxWidth" in toast:
+        fail("PaintToast must size the body from ComputeToastGeometry and never re-wrap the measured layout")
+    if "ComputeAlertCardGeometry" not in d2d:
+        fail("PaintAlert must size the card from ComputeAlertCardGeometry")
+    field = d2d[d2d.find("void MacOsUiFramework::PaintFloatingField"):]
+    field = field[:field.find("void MacOsUiFramework::PaintAlert")]
+    if "glass.sheen = false" not in field:
+        fail("the search field body must be flat (no sheen) so the native input child matches it")
+
+
+def verify_animation_contracts(root: Path) -> None:
+    """0.9.4.0 central animation system: one Animator, presets, no ad-hoc timers/tweens."""
+    header = read(root, "src/ui/framework/ui_animation.h")
+    for token in ("class Animator", "AnimateTo", "Tick(", "FinishAll", "SetActivationHook",
+                  "DropDownReveal", "PopScale", "SlideFade", "Crossfade", "Toggle", "SpringLite"):
+        if token not in header:
+            fail(f"animation system is missing {token}")
+    cmake = read(root, "CMakeLists.txt")
+    for token in ("src/ui/framework/ui_animation.cpp", "src/ui/framework/ui_animation.h"):
+        if token not in cmake:
+            fail(f"{token} is not registered in CMake")
+    if not (root / "scripts" / "checks" / "animation_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/animation_checks.cpp")
+    framework = read(root, "src/ui/framework/macos_ui_framework.cpp")
+    for token in ("TickAnimations", "SyncOverlayTransitions", "FadeOutAndDestroyWindow", "ShutdownAnimations"):
+        if token not in framework:
+            fail(f"framework animation driver is missing {token}")
+    # The framework's only timers are the caret blink and the dropdown maintenance pump.
+    framework_code = strip_cpp(framework)
+    if re.search(r"\bSetTimer\s*\((?![^;]*kD2DTextInputTimer)", framework_code):
+        fail("macos_ui_framework.cpp creates a timer other than the caret blink (hover/animation timers belong to the Animator)")
+    popup = strip_cpp(read(root, "src/ui/framework/macos_ui_framework_popup.cpp"))
+    if len(re.findall(r"\bSetTimer\s*\(", popup)) != 1 or "kPopupMaintenanceTimerId" not in popup:
+        fail("the dropdown may only own its maintenance timer (reveal frames are pumped by its loop)")
+    # Feature code never owns tweens, easing math, window fades or animation timers.
+    banned = re.compile(r"\b(?:StepToward|EaseToward|Smoothstep01|EaseOutCubic|EaseInOutCubic|"
+                        r"AnimateWindow|SetLayeredWindowAttributes)\s*\(")
+    timer_call = re.compile(r"\b(?:SetTimer|StartUiTimer)\s*\(\s*(?:hwnd_\s*,\s*)?(ID_TIMER_[A-Z_]+)")
+    offenders = []
+    timer_offenders = []
+    feature_files = list((root / "src/ui").glob("*.cpp")) + list((root / "src/app").glob("*.cpp"))
+    for path in feature_files:
+        code = strip_cpp(path.read_text(encoding="utf-8"))
+        if banned.search(code):
+            offenders.append(path.relative_to(root).as_posix())
+        for match in timer_call.finditer(code):
+            name = match.group(1)
+            if name == "ID_TIMER_TOAST" or (("ANIM" in name or "FADE" in name or "HOVER" in name) and
+                                            name != "ID_TIMER_ANIMATION"):
+                timer_offenders.append(f"{path.name}:{name}")
+    if offenders:
+        fail("feature code animates outside the central Animator: " + ", ".join(sorted(offenders)))
+    if timer_offenders:
+        fail("feature code creates its own animation timers: " + ", ".join(sorted(timer_offenders)))
+    app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
+    if "TickAnimations" not in app or "SetActivationHook" not in app or "UpdateAnimationCadence" not in app:
+        fail("UpdateAnimations must drive the central Animator on the shared animation timer")
 
 
 def main() -> int:

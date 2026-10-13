@@ -3,17 +3,33 @@
 #include "app/application_support.h"
 #include "core/selection_store.h"
 #include "core/face_detection_policy.h"
+#include "core/face_policy.h"
+#include "core/face_quality_policy.h"
 #include "review/thumbnail_layout.h"
 #include "review/review_state_model.h"
 #include "review/review_async_policy.h"
+#include "review/face_interaction_policy.h"
+#include "core/ratings_exchange.h"
+#include "core/batch_match_policy.h"
+#include "core/search_query.h"
+#include "core/image_metadata.h"
+#include "core/metadata_edit_queue.h"
+#include "core/user_error_catalog.h"
 #include "work/background_work_engine.h"
 #include "work/folder_scanner.h"
 #include "transactions/transaction_coordinator.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 namespace quicksift::app {
+
+// Invariant-locale upper-case fold mirroring NTFS case-insensitive name matching
+// (non-ASCII letters included). Shared by Ratings Import and Batch Processing.
+// Thread-safe (used on worker threads).
+std::wstring WindowsNameFold(std::wstring_view name);
 
 class QuickSiftApplicationImpl {
 public:
@@ -40,7 +56,11 @@ private:
 
     void ApplyDocumentTheme(HWND window, DocumentWindowState* state);
 
-    void ShowDocumentWindow(const std::wstring& title, const std::wstring& body, DocumentKind kind);
+    // Returns the new owned document window (nullptr on failure).
+    // titleKey: English key re-translated on language change (MissingFiles windows;
+    // empty = "Missing files").
+    HWND ShowDocumentWindow(const std::wstring& title, const std::wstring& body, DocumentKind kind,
+        std::wstring_view titleKey = {});
 
     void ShowHelp();
 
@@ -53,6 +73,9 @@ private:
     static bool HasFaceFocusWarning(const PhotoItem& photo) noexcept;
 
     std::wstring FaceWarningTooltipText() const;
+
+    // Per-photo red-border reason, e.g. "Face 2: eyes closed; Face 1: motion blur".
+    std::wstring FaceWarningReasonText(const PhotoItem& photo) const;
 
     void RefreshFaceWarningTooltipText();
 
@@ -255,6 +278,11 @@ private:
     // Keep backdrop under pane children (siblings). Raising the backdrop to HWND_TOP
     // every animation frame was burying tabs/buttons until hover invalidated them.
     void PlaceLeftPaneBackdrop(const RECT& pane, bool show);
+    // One quantized (2-DIP steps) radius for the backdrop region AND its painter.
+    int LeftPaneBackdropRadiusDip() const noexcept;
+    // WM_SETTINGCHANGE / WM_THEMECHANGED / WM_SYSCOLORCHANGE / DWM colorization:
+    // re-reads accessibility + accent (RefreshVisualEffects) and re-themes once.
+    void OnSystemVisualSettingsChanged();
 
     // Raise every currently-visible left-pane child above the backdrop without
     // ShowWindow churn (show/hide only happens in LayoutControls on open/close).
@@ -277,6 +305,28 @@ private:
     void DrawFlyoutTab(DRAWITEMSTRUCT* draw, FlyoutPanel panel);
 
     void DrawFlyoutBackdrop(DRAWITEMSTRUCT* draw);
+    // ---- Left-pane frost + flicker-free pane painting (0.9.4.0 bug-fix round) ----
+    // Backdrop z-slot: directly above the canvas (and the search input that sits on
+    // it), below every pane content sibling. Returns the hWndInsertAfter to use, or
+    // nullptr when the backdrop already is in that slot.
+    HWND LeftPaneBackdropInsertAfter() const;
+    bool LeftPaneFrostEnabled() const noexcept;
+    // Called by Render after EndDraw: reads the canvas pixels under the open pane
+    // back (only when dirty / after the refresh interval, never during scroll motion)
+    // and rebuilds the frost; repaints the pane only when the frost changed.
+    void MaybeCaptureLeftPaneFrost();
+    void MarkLeftPaneFrostDirty() noexcept { leftPaneFrostDirty_ = true; }
+    // Pending capture that was throttled: re-render the canvas once (timer tick).
+    void ServiceLeftPaneFrost();
+    // Frost-image coordinates of a pane window's top-left.
+    POINT LeftPaneFrostSourceFor(HWND window) const;
+    bool IsLeftPaneSurface(HWND window) const;
+    void PaintLeftPaneFrostBehind(HWND window, HDC dc, const RECT& local) const;
+    bool LeftPaneWindowBelongsTo(HWND window, int id, FlyoutPanel panel) const;
+    void HideLeftPaneSectionContentExcept(FlyoutPanel keep);
+    void PaintLibraryList(HWND hwnd);
+    RECT LibraryListThumbRect(HWND list) const;
+    HBRUSH LibraryListBrush();
 
     void RedrawActiveFlyoutContents();
 
@@ -320,6 +370,8 @@ private:
 // tree population, visible-catalog rebuilding, status text, and invalidation.
 
     int TrackDropdownMenu(HWND anchor, std::vector<MenuItem> items);
+    // Shared nested-loop pump for framework dropdowns (main window and form dialogs).
+    std::function<void()> DropdownMaintenancePump();
 
     void OnCommand(int id, int notifyCode, HWND source);
     void RefreshUserComment();
@@ -331,7 +383,10 @@ private:
 
     void RefreshLibraryList();
 
+    // Filter tab (format, date, rating/pick/label) AND the applied thumbnail search.
     bool CullAllowed(const PhotoItem& item) const;
+    // Filter tab only (the search box's "of N" total).
+    bool FilterAllowed(const PhotoItem& item) const;
 
     std::optional<size_t> CatalogIndexForPath(std::wstring_view path) const;
 
@@ -376,6 +431,10 @@ private:
 #endif
 
     void DrainBackgroundCompletions();
+    // Schedules the next completion slice without starving input/paint (0.9.4.0).
+    void ScheduleBackgroundCompletionContinuation();
+    // Posts at most one coalesced wake for queued completions (0.9.4.0).
+    void RequestBackgroundCompletionWake();
     void DrainPostedWorkerMessages();
 
     void CompleteMetadataJob();
@@ -529,6 +588,30 @@ private:
 
     void DrawGlassAlertOverlay();
 
+    // Pre-localized variants (no Tr lookup) for dynamic text (counts, names).
+    // token: optional PendingGlassAction recorded on the notice so ResolveGlassAlert
+    // can react to its dismissal (notices never dispatch an action).
+    void ShowGlassAlertText(const std::wstring& title, const std::wstring& message,
+        GlassAlertKind kind, PendingGlassAction token = PendingGlassAction::None);
+    // Confirmation with an optional third, left-aligned button. Pre-localized text.
+    void ShowGlassChoice(const std::wstring& title, const std::wstring& message,
+        const std::wstring& primaryText, PendingGlassAction primaryAction,
+        const std::wstring& secondaryText, GlassAlertKind kind,
+        const std::wstring& tertiaryText = {},
+        PendingGlassAction tertiaryAction = PendingGlassAction::None,
+        bool tertiaryKeepsOpen = false);
+    void DispatchGlassAction(PendingGlassAction action);
+    void ActivateGlassAlertTertiary();
+    // In-canvas alert keyboard: Esc dismisses, Enter/Space activate the focused
+    // (default: primary) button, Tab/Shift+Tab and Left/Right move the focus ring.
+    void HandleGlassAlertKey(UINT key, bool shift);
+    // AA rounded canvas corners painted in the parent's background colour (the
+    // canvas HWND region is a few pixels larger; see ApplyAntialiasedControlRegion).
+    void DrawCanvasCornerUnderlay();
+    // Face outline reveal/fade opacity (0..1) for a pane; records the pane as
+    // displayed this frame.
+    float FaceOutlineOpacityForPath(const std::wstring& path);
+
     void DrawCanvasBackground();
     void DrawPerformanceHudOverlay();
     D2D1_RECT_F ThumbnailScrollbarThumbRect() const;
@@ -558,7 +641,14 @@ private:
     void DrawThumbnailBadges(const PhotoItem& photo, D2D1_RECT_F area);
 
     void DrawBitmapFit(BitmapEntry* bitmap, D2D1_RECT_F area,
-        const quicksift::review::transform::ResolvedView& view, bool clip);
+        const quicksift::review::transform::ResolvedView& view, bool clip, float opacity = 1.0f);
+    // Placeholder -> image crossfade bookkeeping (central Animator; skipped in motion).
+    void NoteThumbnailPlaceholder(const std::wstring& path);
+    float ThumbnailRevealOpacity(const std::wstring& path);
+
+    // Faint image-space outlines on every detected face (FaceLock on).
+    void DrawFaceOutlines(const PhotoItem& photo, D2D1_RECT_F area,
+        const quicksift::review::transform::ResolvedView& view);
 
     void RenderVisibleTiles(const PhotoItem& photo, const D2D1_RECT_F& area,
         const quicksift::review::transform::ResolvedView& view, const BitmapEntry* baseBitmap);
@@ -584,6 +674,41 @@ private:
         int fallbackHeight = 0) const;
 
     std::optional<D2D1_POINT_2F> PrimaryFaceCenter(const std::wstring& path) const;
+
+    // FaceLock target index: matched persisted/user selection, otherwise faces[0].
+    std::optional<std::size_t> TargetFaceIndexForPath(const std::wstring& path) const;
+
+    struct FaceOutlineHit {
+        std::wstring path;
+        std::size_t faceIndex = 0;
+    };
+    // Hit-tests face outlines from CURRENT layout/view state (never paint-time
+    // rectangles): pane under the pointer -> resolved view -> inflated face boxes.
+    std::optional<FaceOutlineHit> HitFaceOutline(float x, float y) const;
+
+    // Makes the face the FaceLock target for its photo (session + persisted) and
+    // frames it at kFaceClickFillFraction of the pane.
+    void SelectFaceAndFrame(const std::wstring& path, std::size_t faceIndex);
+
+    // Click-to-zoom toggle (face_interaction::FaceZoomToggle). Key: the pane path,
+    // or one shared key in Compare with Sync on (all panes share one view).
+    std::wstring FaceZoomKeyForPath(const std::wstring& path) const;
+    bool PathDisplayedInReview(const std::wstring& path) const;
+    // Current visible view + pane rect of a displayed pane (nullopt otherwise).
+    std::optional<quicksift::review::face_interaction::PaneViewSnapshot>
+        PaneSnapshotForPath(const std::wstring& path) const;
+    // Captures the toggle inputs at mouse-down (before Compare slot activation can
+    // move views) for a press on a face outline.
+    void CaptureFaceTogglePress(const FaceOutlineHit& hit);
+    // A confirmed click (not a drag) on a face outline: lock-zoom or revert.
+    void HandleFaceOutlineClick(const FaceOutlineHit& hit);
+    void ClearFaceZoomToggle() noexcept;
+    // Cancels an in-progress canvas press (Escape / capture loss). Returns true
+    // when a press was active.
+    bool CancelCanvasPress();
+    quicksift::review::face_interaction::DragThreshold CanvasDragThreshold() const;
+    // Right-click on a photo with FaceLock on: pin/unpin face outlines.
+    bool ToggleFaceOutlinesPinned(float x, float y);
 
     D2D1_POINT_2F FaceOffsetForPath(const std::wstring& path) const;
 
@@ -626,6 +751,105 @@ private:
     void RenderFilmstrip(const D2D1_RECT_F& bounds);
     void ToggleFilmstrip();
     void UpdateAnimations();
+    // 16 ms while the central Animator has work, the 33 ms idle poll otherwise.
+    void UpdateAnimationCadence();
+
+// OWNER: Import / Export Ratings (src/ui/ratings_exchange_commands.cpp). Format,
+// parser and reconciliation live in core/ratings_exchange (portable, checked).
+    void ShowRatingsExchangeChooser();
+    void BeginRatingsExport();
+    void BeginRatingsImport();
+    // UI-thread completion of the ratings worker (WM_APP_RATINGS_WORKER_DONE).
+    void OnRatingsWorkerCompleted();
+    // Import confirmation chain: count mismatch -> missing files -> final confirm.
+    void ContinueRatingsImport(PendingGlassAction step);
+    void ShowRatingsMissingFilesWindow();
+    void CloseRatingsMissingFilesWindow();
+    void ApplyRatingsImport();
+    void CancelRatingsImport();
+    void StopRatingsWorker() noexcept;
+    bool RatingsWorkerBusy() const noexcept;
+    std::wstring RatingsStatusLine() const;
+    // Builds and submits the import through the existing metadata transaction
+    // pipeline (metadata_history_and_file_safety.cpp). Returns the token (0 = none).
+    // Fields left empty are not changed (Batch Processing "No change").
+    struct RatingsImportItem {
+        fs::path path;
+        std::optional<int> starRating;
+        std::optional<int> pickState;
+        std::optional<int> colorLabel;
+    };
+    struct RatingsImportCounts {
+        std::size_t submitted = 0;
+        std::size_t skipped = 0;   // already matching / missing-and-ignored / unsupported-neutral
+        std::size_t failed = 0;    // could not be prepared (not in catalog)
+    };
+    std::uint64_t SubmitRatingsImport(const std::vector<RatingsImportItem>& items,
+        RatingsImportCounts& counts, std::wstring_view label = L"Ratings import");
+    // Called by FinishMetadataTransaction for the import token. Returns true when
+    // the completion was handled (summary toast/alert shown).
+    bool FinishRatingsImportTransaction(
+        const quicksift::transactions::MetadataTransactionResult& result, bool changed);
+
+// OWNER: Batch Processing (src/ui/batch_processing_commands.cpp). Name-list parsing,
+// extension validation and matching live in core/batch_match_policy (portable,
+// checked by scripts/checks/batch_match_checks.cpp). The dialog is the reusable
+// framework form dialog; the apply step reuses SubmitRatingsImport.
+    void OpenBatchProcessingDialog();
+    void OnBatchFormEvent(HWND dialog, int id, quicksift::ui::framework::FormEvent event);
+    void CaptureBatchSettings();
+    bool ValidateBatchExtensions();
+    void BeginBatchFolderLoad();
+    void BeginBatchPreflight();
+    void OnBatchWorkerCompleted();
+    void ApplyBatchProcessing();
+    void ReturnToBatchDialog();
+    void CloseBatchDialog();
+    void CancelBatchPending();
+    void ShowBatchUnmatchedWindow();
+    void CloseBatchUnmatchedWindow();
+    void CheckBatchGlassWatch();
+    void StopBatchWorker() noexcept;
+    bool BatchWorkerBusy() const noexcept;
+
+    // ---- Thumbnail search (thumbnail_search_controller.cpp) ----
+    // Floating field shown only in Thumbnail view; queries compile to the shared
+    // predicate clauses and AND with the Filter tab inside CullAllowed().
+    bool CreateSearchField();
+    bool SearchFieldAvailable() const;
+    D2D1_RECT_F SearchFieldFrameDip() const;
+    float ThumbnailSearchLaneDip() const;
+    void LayoutSearchField();
+    void UpdateSearchFieldTheme();
+    // Search field fade on the central Animator (target sync before the tick, value
+    // read-back after it), then the per-tick layout/focus/demand upkeep.
+    void SyncSearchFieldTransition(std::chrono::steady_clock::time_point now);
+    void ApplySearchFieldTransition();
+    void UpdateSearchFieldAnimation();
+    bool SearchFieldAnimating() const noexcept;
+    void DrawSearchFieldOverlay();
+    bool HandleSearchFieldMouseDown(float x, float y);
+    bool SearchFieldContains(float x, float y) const;
+    void UpdateSearchFieldHover(float x, float y);
+    void ClearSearchFieldHover();
+    bool HandleSearchKey(const MSG& message);
+    void FocusSearchField();
+    void OnSearchTextChanged();
+    void OnSearchDebounceTimer();
+    void ApplySearchText();
+    void ClearSearch();
+    void RequestSearchEvaluation(bool resetScroll);
+    void ApplySearchResult(std::uint64_t serial, std::uint64_t epoch, std::vector<std::uint8_t> matches);
+    void OnSearchWorkerMessage();
+    void EnsureSearchFactsHydrated();
+    void ApplySearchFactUpdates();
+    void OnSearchFolderChanged();
+    void StopSearchWorker() noexcept;
+    bool StartSearchWorker();
+    void SearchWorkerLoop() noexcept;
+    bool SearchAllows(const PhotoItem& item) const;
+    std::wstring SearchCountText() const;
+    bool BatchApplyActive() const noexcept { return ratingsImportToken_ != 0 && ratingsImportIsBatch_; }
 // CODE GUIDE: See CODE_GUIDE.md -> "Scrolling thumbnails".
 // OWNER: Translate viewport plans into ordered decode requests; do not duplicate prediction math.
 
@@ -639,6 +863,27 @@ private:
     void ApplyDynamicCacheBudgets(size_t targetBudget);
     void ReconcileEvictedThumbnails();
     void DispatchIdlePrefetch();
+    // 0.9.4.0 thumbnail reliability: re-enqueue visible (+1 row margin) cells that
+    // have no cached bitmap and no pending/in-flight job; arms the backstop timer
+    // while anything visible is still missing.
+    void ReconcileVisibleThumbnails(const wchar_t* reason);
+    void ArmThumbnailReconcile(UINT delayMs);
+    void StopThumbnailReconcile();
+    // Retry policy (3 attempts, escalating worker timeouts, short backoff).
+    bool ThumbnailDecodeAdmissible(const PhotoItem& photo, const std::wstring& key,
+        std::chrono::steady_clock::time_point now, int& retryAttempt, bool& forceWic);
+    void RecordThumbnailDecodeFailure(const WorkResult& result);
+    void RecordViewDecodeFailure(const WorkResult& result);
+    bool ViewDecodeAdmissible(const fs::path& path, int& retryAttempt);
+    bool ViewDecodeTerminallyFailed(const fs::path& path);
+    void ArmDecodeRetryTimer();
+    void RetryFailedImageLoads();
+    // Single/Compare decode routing: the dedicated view lane in view modes, the
+    // shared pool otherwise. Never decodes on the UI thread.
+    void RequestViewDecode(const fs::path& path, JobKind kind, int target,
+        CacheClass cacheClass, JobPriority priority, bool prefetch = false);
+    void PublishViewPrefetchNeighbours(int direction);
+    bool ViewBitmapSettled(const BitmapEntry* bitmap, const PhotoItem& photo, int displayDesired) const;
     void HandleNavigationEvent(int stepDirection);
 
     void ScheduleVisibleWork();
@@ -760,8 +1005,33 @@ std::vector<fs::path> ActivePaths() const;
 
     void PushHistory(HistoryEntry entry);
 
-    bool PreflightMetadataStorage(const std::vector<MetadataSnapshot>& targets,
+    // Pure (no UI): cumulative free-space check, run on the transaction thread.
+    static std::optional<quicksift::transactions::MetadataStorageShortfall>
+        MetadataStorageShortfallFor(const std::vector<MetadataSnapshot>& targets);
+    void ShowMetadataStorageShortfall(
+        const quicksift::transactions::MetadataStorageShortfall& shortfall,
         const std::wstring& operation);
+    static quicksift::transactions::MetadataChange::FileStamps MetadataFileStampsFor(
+        const fs::path& path);
+    static void ApplyMetadataFileStamps(PhotoItem& item,
+        const quicksift::transactions::MetadataChange::FileStamps& stamps) noexcept;
+
+    // ---- Metadata write lane (metadata_write_lane_controller.cpp) ----
+    // Interactive edits typed while a write runs are coalesced here (last value wins
+    // per file and field) and flushed on the urgent lane / after the running plan.
+    void QueueMetadataEdit(const std::vector<fs::path>& targets, MetadataFieldId field,
+        int value, const std::wstring& label);
+    void FlushPendingMetadataEdits();
+    void EnsureMetadataWriteLaneTimer();
+    void PollMetadataWriteLane();
+    void RetryInUseMetadataChanges();
+    void SkipInUseMetadataChanges();
+    // Localized message for a user-facing error; {file} is replaced by `file`.
+    std::wstring UserErrorText(quicksift::core::UserErrorCode code,
+        const std::wstring& file = {}) const;
+    std::wstring UserErrorTitle(quicksift::core::UserErrorCode code) const;
+    void ShowToastText(const std::wstring& localizedText);
+    static std::wstring MetadataFieldLabel(MetadataFieldId field);
 
     static quicksift::transactions::MetadataWriteOutcome WriteMetadataPatchFile(
         const fs::path& path, const MetadataPatch& patch, MetadataStorageKind storage,
@@ -867,6 +1137,15 @@ void ShowColorLabelMenu();
     void UpdateDateFilterButton();
 
     void ShowDateFilterMenu();
+    void ShowIsoFilterMenu();
+    void ShowApertureFilterMenu();
+    void ShowFocalFilterMenu();
+    void ShowShutterFilterMenu();
+    void ShowCameraFilterMenu();
+    void ShowHourFilterMenu();
+    // Pull indexed camera settings and capture time from the cache into the catalog
+    // so filter dropdowns show the values present in the folder.
+    void HydrateMetadataForFilters();
 
     void UpdateSortButton();
 
@@ -949,7 +1228,32 @@ void ShowColorLabelMenu();
     int leftPaneBackdropLastW_ = -1;
     int leftPaneBackdropLastH_ = -1;
     int leftPaneBackdropLastRadiusDip_ = -1;
+    // Left-pane frost (ui_frost): dirty on open/resize/theme; built from a canvas
+    // read-back; the DIB itself lives in the framework (SetPaneFrost).
+    bool leftPaneFrostDirty_ = true;
+    bool leftPaneFrostPending_ = false;
+    bool leftPaneFrostValid_ = false;
+    std::uint64_t leftPaneFrostSignature_ = 0;
+    COLORREF leftPaneFrostTint_ = CLR_INVALID;
+    POINT leftPaneFrostOrigin_{};   // open-pane top-left (main client) the frost maps to
+    std::chrono::steady_clock::time_point leftPaneFrostCapturedAt_{};
+    ComPtr<ID2D1Bitmap1> leftPaneFrostReadback_;
+    D2D1_SIZE_U leftPaneFrostReadbackSize_{};
+    HBRUSH libraryListBrush_ = nullptr;
+    COLORREF libraryListBrushColor_ = CLR_INVALID;
+    bool paneItemBuffering_ = false; // OnDrawItem re-entry guard (buffered pane surfaces)
+    bool libraryScrollDragging_ = false;
+    int libraryScrollDragOffset_ = 0;
     std::chrono::steady_clock::time_point lastAnimationTick_{};
+    // Current ID_TIMER_ANIMATION period (tokens::kIdlePollMs or kAnimationFrameMs).
+    UINT animationTimerIntervalMs_ = 33;
+    // Child that owned keyboard focus when the main window was deactivated; restored
+    // on WA_ACTIVE / WA_CLICKACTIVE (DefWindowProc would focus the frame itself).
+    HWND lastFocusedChild_ = nullptr;
+    // Measured badge widths (DIP) per text for the current smallText_ format.
+    std::unordered_map<std::wstring, float> badgeTextWidthCache_;
+    // Paths painted as placeholders since their last real image (crossfade trigger).
+    std::unordered_set<std::wstring> thumbnailPlaceholderShown_;
     std::chrono::steady_clock::time_point fullscreenLeaveSince_{};
     FlyoutPanel activeFlyout_ = FlyoutPanel::None;
     // Remembered section restored when the left hit-strip reopens the pane.
@@ -966,6 +1270,11 @@ void ShowColorLabelMenu();
     bool thumbnailScrollMotionActive_ = false;
     bool thumbnailViewportNeedsUpdate_ = false;
     bool thumbnailDragRenderTimerActive_ = false;
+    bool completionPumpTimerActive_ = false;
+    // Paint-time Shell thumbnail creation budget (0.9.4.0): at most one synchronous
+    // Shell fallback per frame and only for definitively failed decodes.
+    int shellFallbackFrameBudget_ = 0;
+    bool shellFallbackDeferred_ = false;
     // Shared frame pump for scrollbar drag AND wheel/keyboard flings: one layout/paint
     // (and at most one viewport publish) per frame while motion is active.
     bool thumbnailScrollFrameTimerActive_ = false;
@@ -1000,6 +1309,13 @@ void ShowColorLabelMenu();
     RatingFilter ratingFilter_ = RatingFilter::All;
     PickFilter pickFilter_ = PickFilter::All;
     ColorLabelFilter colorLabelFilter_ = ColorLabelFilter::All;
+    // Camera-settings filters (0 / empty / -1 = All). Options come from indexed values.
+    int isoFilter_ = -1;
+    double apertureFilter_ = 0.0;
+    double focalFilter_ = 0.0;
+    double shutterFilter_ = 0.0;
+    std::wstring cameraFilter_;
+    int hourFilter_ = -1;
     quicksift::review::prefetch::PrefetchPlanner thumbnailPrefetchPlanner_;
     quicksift::core::FaceAnalysisRetryPolicy faceAnalysisRetryPolicy_;
     bool badgeStars_ = true;
@@ -1018,6 +1334,190 @@ void ShowColorLabelMenu();
     bool sessionRestored_ = false;
     D2D1_POINT_2F mouseDown_{};
     D2D1_POINT_2F lastMouse_{};
+    // A press on a face outline becomes a click on release unless it left the
+    // drag rectangle (max(SM_CXDRAG/SM_CYDRAG, kFaceClickMaxTravelDip); then a pan).
+    std::optional<FaceOutlineHit> pendingFaceClick_;
+    ULONGLONG lastFaceClickTick_ = 0;
+    // Click-vs-drag tracking for canvas presses in Single/Compare (system drag
+    // rectangle, DPI-scaled, >= 4 DIP). Face-outline presses defer panning until
+    // the press becomes a drag so a click never nudges the view.
+    quicksift::review::face_interaction::PressGesture canvasPress_;
+    bool facePanDeferred_ = false;
+    quicksift::review::face_interaction::FaceZoomToggle faceZoomToggle_;
+    struct FaceTogglePressCapture {
+        bool valid = false;
+        std::wstring key;
+        std::optional<quicksift::review::face_interaction::PaneViewSnapshot> framedNow;
+        std::wstring prePath;
+        quicksift::review::face_interaction::PaneViewSnapshot pre{};
+    };
+    FaceTogglePressCapture faceTogglePress_;
+    // Face outline reveal (1 s) + fade (250 ms); right-click pins (session only).
+    quicksift::review::face_interaction::FaceOutlineFade faceOutlineFade_;
+
+    // ---- Import / Export Ratings state ----
+    struct RatingsWorkerResult {
+        bool import = false;
+        bool ok = false;
+        std::wstring error;          // localized failure text (empty when ok)
+        fs::path file;
+        std::uint64_t generation = 0;
+        std::size_t totalFiles = 0;  // export
+        std::size_t exportedEntries = 0;
+        quicksift::core::ratings_exchange::ParseResult parse; // import
+    };
+    std::thread ratingsWorker_;
+    std::atomic<bool> ratingsWorkerCancel_{ false };
+    std::atomic<bool> ratingsWorkerRunning_{ false };
+    std::atomic<std::size_t> ratingsWorkerDone_{ 0 };
+    std::atomic<std::size_t> ratingsWorkerTotal_{ 0 };
+    mutable std::mutex ratingsWorkerMutex_;
+    std::optional<RatingsWorkerResult> ratingsWorkerResult_;
+    struct PendingRatingsImport {
+        fs::path file;
+        fs::path folder;
+        std::uint64_t generation = 0;
+        quicksift::core::ratings_exchange::ExportDocument document;
+        quicksift::core::ratings_exchange::ImportReconciliation reconciliation;
+        std::wstring missingText;
+    };
+    std::optional<PendingRatingsImport> pendingRatingsImport_;
+    HWND ratingsMissingFilesWindow_ = nullptr;
+    std::uint64_t ratingsImportToken_ = 0;
+    RatingsImportCounts ratingsImportCounts_{};
+    // The bulk metadata token above belongs to Batch Processing (summary wording).
+    bool ratingsImportIsBatch_ = false;
+
+    // ---- Batch Processing ----
+    struct BatchSettings {
+        std::wstring names;
+        int starRating = 0;  // dropdown index; 0 = No change, 1.. = 0..5 stars
+        int pickState = 0;   // 0 = No change, 1 Pick, 2 Reject, 3 Unmark
+        int colorLabel = 0;  // 0 = No change, 1.. = None, Red, ... Purple
+        std::wstring extensions;
+        int matchingMethod = 0; // 0 = Partial, 1 = Complete
+    };
+    BatchSettings batchSettings_{};   // remembered for the session
+    HWND batchDialog_ = nullptr;
+    quicksift::Language batchDialogLanguage_ = quicksift::Language::English;
+    bool batchAwaitingGlass_ = false; // dialog hidden while a glass alert is up
+    struct BatchWorkerResult {
+        bool folderLoad = false;
+        std::uint64_t serial = 0;
+        std::uint64_t generation = 0;
+        bool ok = false;
+        std::wstring error;
+        // Folder load
+        std::wstring folder;
+        quicksift::core::batch_match::MergeResult merge;
+        std::size_t filesSeen = 0;
+        // Preflight
+        std::vector<quicksift::core::batch_match::NameEntry> entries;
+        quicksift::core::batch_match::MatchResult match;
+        std::vector<fs::path> matchedPaths;
+    };
+    // Runs work on the single batch worker thread (folder load or preflight).
+    bool StartBatchWorker(bool folderLoad, std::function<void(BatchWorkerResult&)> work);
+    std::thread batchWorker_;
+    std::atomic<bool> batchWorkerCancel_{ false };
+    std::atomic<bool> batchWorkerRunning_{ false };
+    std::uint64_t batchWorkerSerial_ = 0;
+    mutable std::mutex batchWorkerMutex_;
+    std::optional<BatchWorkerResult> batchWorkerResult_;
+    struct PendingBatch {
+        fs::path folder;
+        std::uint64_t generation = 0;
+        std::vector<fs::path> paths;
+        std::optional<int> starRating;
+        std::optional<int> pickState;
+        std::optional<int> colorLabel;
+        std::wstring unmatchedText;
+        std::size_t unmatchedCount = 0;
+    };
+    std::optional<PendingBatch> pendingBatch_;
+
+    // ---- Thumbnail search state ----
+    HWND searchInput_ = nullptr;
+    std::wstring searchText_;                 // live field text
+    std::wstring searchAppliedText_;          // text of the applied query
+    quicksift::core::search::SearchQuery searchQuery_; // applied (parsed) query
+    bool searchActive_ = false;               // applied query has clauses
+    bool searchDebounceArmed_ = false;
+    bool searchResetScrollPending_ = false;
+    std::vector<std::uint8_t> searchMatches_; // by catalog index, for searchMatchesEpoch_
+    std::uint64_t searchMatchesEpoch_ = 0;
+    std::uint64_t searchSerial_ = 0;          // latest requested evaluation
+    std::uint64_t searchInFlightSerial_ = 0;  // worker evaluation outstanding (0 = none)
+    std::optional<float> searchSavedScroll_;  // view to restore when the search clears
+    std::wstring searchSavedFocus_;
+    float searchFieldOpacity_ = 0.0f;
+    bool searchClearHot_ = false;
+    bool searchInputShown_ = false;
+    bool searchFocusPainted_ = false;
+    std::size_t searchBaseCount_ = 0;         // photos passing the Filter tab alone
+    RECT searchInputPixels_{};
+    // Hydration bookkeeping (UI thread): bit 1 = capture time queued, bit 2 = comment, bit 4 = camera settings.
+    std::vector<std::uint8_t> searchHydrateQueued_;
+    std::uint64_t searchHydrateGeneration_ = 0;
+    std::size_t searchHydrateCheckedCount_ = 0;
+    bool searchHydrateNeedCapture_ = false;
+    bool searchHydrateNeedComments_ = false;
+    bool searchHydrateNeedCamera_ = false;
+    std::atomic<std::size_t> searchHydrateDone_{ 0 };
+    std::atomic<std::size_t> searchHydrateTotal_{ 0 };
+    // Worker (one thread; evaluation jobs pre-empt hydration between files).
+    struct SearchHydrateItem {
+        std::size_t index = 0;
+        fs::path path;
+        bool capture = false;
+        bool comment = false;
+        bool camera = false;
+    };
+    struct SearchFactUpdate {
+        std::size_t index = 0;
+        fs::path path;
+        bool hasCapture = false;
+        quicksift::core::predicate::LocalDateTime capture{};
+        quicksift::core::predicate::CaptureTimeSource source =
+            quicksift::core::predicate::CaptureTimeSource::Unknown;
+        bool hasComment = false;
+        std::wstring comment;
+        bool hasCamera = false;
+        int iso = -1;
+        double aperture = 0.0;
+        double focalLength = 0.0;
+        double shutterSpeed = 0.0;
+        std::wstring camera;
+        std::wstring lens;
+        bool cameraKnown = false;
+    };
+    struct SearchEvalJob {
+        std::uint64_t serial = 0;
+        quicksift::core::CatalogSnapshotPtr snapshot;
+        std::vector<quicksift::core::predicate::Clause> clauses;
+    };
+    struct SearchEvalResult {
+        std::uint64_t serial = 0;
+        std::uint64_t epoch = 0;
+        std::vector<std::uint8_t> matches;
+    };
+    std::thread searchWorker_;
+    std::mutex searchMutex_;
+    std::condition_variable searchCv_;
+    bool searchWorkerStop_ = false;                         // guarded by searchMutex_
+    std::optional<SearchEvalJob> searchEvalJob_;            // guarded
+    std::deque<SearchHydrateItem> searchHydrateQueue_;      // guarded
+    std::uint64_t searchWorkerGeneration_ = 0;              // guarded
+    std::vector<SearchFactUpdate> searchFactUpdates_;       // guarded
+    std::uint64_t searchFactGeneration_ = 0;                // guarded
+    std::optional<SearchEvalResult> searchEvalResult_;      // guarded
+    std::atomic<bool> searchMessagePosted_{ false };
+    // Set by the search worker whenever it stores a result / fact batch; cleared by
+    // OnSearchWorkerMessage. The animation tick consumes it if a wake post was lost.
+    std::atomic<bool> searchUnconsumed_{ false };
+    bool searchDemandPublishedActive_ = false;
+    bool searchDemandPublishedFocused_ = false;
+    HWND batchUnmatchedWindow_ = nullptr;
     std::vector<ColorBlob> backgroundBlobs_;
     std::vector<std::uint32_t> backgroundPixels_;
     int backgroundCacheWidth_ = 0;
@@ -1028,6 +1528,13 @@ void ShowColorLabelMenu();
     quicksift::core::HistoryStore historyStore_;
     size_t historyMemoryLimit_ = 96ull * kMebibyte;
     bool replayingHistory_ = false;
+    quicksift::core::PendingMetadataEdits pendingMetadataEdits_;
+    // Apply-mode changes that stayed locked by another app (Retry / Skip choice).
+    std::vector<quicksift::transactions::MetadataChange> inUseRetryChanges_;
+    std::wstring inUseRetryLabel_;
+    std::uint64_t metadataWaitingToastSerial_ = 0;
+    ULONGLONG metadataWaitingToastTick_ = 0;
+    bool metadataWriteLaneTimerActive_ = false;
     std::vector<fs::path> pendingExternalMetadataReconcilePaths_;
     std::optional<HistoryDirection> pendingExternalMetadataReconcileHistory_;
     uint64_t generation_ = 0;
@@ -1095,6 +1602,8 @@ void ShowColorLabelMenu();
     ComPtr<ID2D1SolidColorBrush> overlayBrush_;
     ComPtr<ID2D1SolidColorBrush> glassBorderBrush_;
     ComPtr<ID2D1SolidColorBrush> glassHighlightBrush_;
+    ComPtr<ID2D1SolidColorBrush> faceOutlineBrush_;
+    ComPtr<ID2D1SolidColorBrush> faceOutlineShadowBrush_;
     ComPtr<IDWriteTextFormat> smallText_;
     ComPtr<IDWriteTextFormat> mediumText_;
     ComPtr<IDWriteTextFormat> largeText_;
@@ -1117,10 +1626,24 @@ void ShowColorLabelMenu();
     std::unordered_map<std::wstring, std::wstring> pathKeyCache_;
     size_t exifCacheLimit_ = 128;
     std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> failedDecodes_;
+    // Terminal thumbnail failures (failed placeholder shown). Keyed by NormalizedPathKey.
     std::unordered_set<std::wstring> failedThumbnailPaths_;
-    std::unordered_map<std::wstring, int> thumbnailRetryAttempts_;
-    std::unordered_map<std::wstring, std::chrono::steady_clock::time_point> thumbnailRetryCooldown_;
-    std::unordered_map<std::wstring, std::uint64_t> thumbnailFailureRetryViewportEpochs_;
+    // 0.9.4.0 per-path retry state (NormalizedPathKey). failedAttempts counts worker
+    // attempts that produced no pixels; nextRetryAt is the backoff deadline; terminal
+    // entries remember the file stamp so a changed file resets automatically.
+    struct DecodeRetryState {
+        int failedAttempts = 0;
+        quicksift::core::DecodeFailureKind lastFailure = quicksift::core::DecodeFailureKind::None;
+        std::chrono::steady_clock::time_point nextRetryAt{};
+        bool terminal = false;
+        std::uint64_t fileSize = 0;
+        std::int64_t modifiedStamp = 0;
+    };
+    static constexpr int kMaxDecodeAttempts = 3;
+    std::unordered_map<std::wstring, DecodeRetryState> thumbnailRetryState_;
+    std::unordered_map<std::wstring, DecodeRetryState> viewRetryState_;
+    bool thumbnailReconcileTimerActive_ = false;
+    std::wstring lastViewPrefetchSignature_;
     std::uint64_t lastScheduledThumbnailViewportEpoch_ = 0;
     static constexpr std::chrono::milliseconds kDecodeRetryBackoff{250};
     bool HasRecentDecodeFailure(const std::wstring& key) noexcept;

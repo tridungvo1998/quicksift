@@ -30,6 +30,11 @@ struct EmbeddedMetadataWriteResult {
     EmbeddedMetadataFailure failure = EmbeddedMetadataFailure::WriteFailed;
     std::uint64_t requiredBytes = 0;
     std::uint64_t availableBytes = 0;
+    // Win32 error behind a failure that happened BEFORE the original was touched
+    // (handle open / rename refused). 0 otherwise. The write lane classifies it
+    // (sharing violation -> retry; see core/write_retry_policy.h). Failures after
+    // publication started never carry a code, so they are never retried.
+    std::uint32_t win32Error = 0;
     std::wstring detail;
     quicksift::core::PhotoMetadataValues before;
     quicksift::core::PhotoMetadataValues after;

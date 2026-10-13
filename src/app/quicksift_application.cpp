@@ -75,6 +75,9 @@ int QuickSiftApplication::Run(HINSTANCE instance, int showCommand) {
 QuickSiftApplicationImpl::~QuickSiftApplicationImpl() {
     deferredStartupCancel_.store(true, std::memory_order_release);
     if (deferredStartupThread_.joinable()) deferredStartupThread_.join();
+    StopRatingsWorker();
+    StopBatchWorker();
+    StopSearchWorker();
 }
 
     int QuickSiftApplicationImpl::Run(HINSTANCE instance, int showCommand) {
@@ -92,15 +95,17 @@ QuickSiftApplicationImpl::~QuickSiftApplicationImpl() {
         worker_.SetNotify(hwnd_);
         StartDeferredStartup();
         scanner_.SetNotify(hwnd_);
+        // The sinks run on transaction threads: capture the window handle by value
+        // instead of reading the UI-owned hwnd_ member concurrently (data race).
+        // A lost post is harmless: the animation tick and the metadata write-lane
+        // timer drain results too.
         transactions_.SetCompletionSinks(
-            [this] {
-                const HWND target = hwnd_;
+            [target = hwnd_] {
                 if (target && IsWindow(target)) {
                     PostMessageW(target, WM_APP_FILE_TRANSACTION_COMPLETION, 0, 0);
                 }
             },
-            [this] {
-                const HWND target = hwnd_;
+            [target = hwnd_] {
                 if (target && IsWindow(target)) {
                     PostMessageW(target, WM_APP_METADATA_TRANSACTION_COMPLETION, 0, 0);
                 }
@@ -109,7 +114,13 @@ QuickSiftApplicationImpl::~QuickSiftApplicationImpl() {
         StartUiTimer(ID_TIMER_CACHE_FLUSH, 5000, L"cache-flush");
         StartUiTimer(ID_TIMER_BACKGROUND_ANALYSIS, 1200, L"background-analysis");
         StartUiTimer(ID_TIMER_LOG_PERFORMANCE, 5000, L"performance logging");
-        StartUiTimer(ID_TIMER_ANIMATION, 33, L"UI animation");
+        // Idle cadence; UpdateAnimations switches to kAnimationFrameMs only while a
+        // chrome animation is in flight (same timer id, no extra timers).
+        animationTimerIntervalMs_ = quicksift::ui::tokens::kIdlePollMs;
+        StartUiTimer(ID_TIMER_ANIMATION, animationTimerIntervalMs_, L"UI animation");
+        // Any transition started between ticks (toast, alert, hover, dropdown fade-out,
+        // thumbnail crossfade) switches the same timer to frame cadence at once.
+        uiFramework_.Motion().SetActivationHook([this] { UpdateAnimationCadence(); });
         UpdatePerformanceHudTimer();
         QS_LOG_INFO(L"Lifecycle", L"Main window is visible; deferred startup is running asynchronously");
 
@@ -164,53 +175,90 @@ QuickSiftApplicationImpl::~QuickSiftApplicationImpl() {
 
     void QuickSiftApplicationImpl::UpdateAnimations() {
         const auto now = std::chrono::steady_clock::now();
-        if (lastAnimationTick_.time_since_epoch().count() == 0) lastAnimationTick_ = now;
-        float delta = std::chrono::duration<float>(now - lastAnimationTick_).count();
-        delta = std::clamp(delta, 0.0f, 0.1f);
         lastAnimationTick_ = now;
 
-        using quicksift::ui::framework::EaseToward;
-        constexpr float kAnimationSpeed = 12.0f;
-        bool filmstripChanged = false;
-        bool tabBlendChanged = false;
+        // Every chrome transition runs on the framework's central Animator (one
+        // registry, token durations/curves, reversible from the current value,
+        // instant when Windows animations are off, finished at once while minimized).
+        // This timer is its only driver; values are read back below and each
+        // surface is invalidated at most once per frame.
+        namespace anim = quicksift::ui::animation;
+        namespace tokens = quicksift::ui::tokens;
+        anim::Animator& motion = uiFramework_.Motion();
+        const bool suspended = !hwnd_ || IsIconic(hwnd_) || !IsWindowVisible(hwnd_);
+        motion.SetEnabled(quicksift::ui::CurrentVisualEffects().Animate());
+        motion.SetSuspended(suspended);
 
-        const float targetFilmstrip = filmstripVisible_ ? 1.0f : 0.0f;
-        const float nextFilmstrip = EaseToward(filmstripOpacity_, targetFilmstrip, delta, kAnimationSpeed);
-        if (nextFilmstrip != filmstripOpacity_) {
-            filmstripOpacity_ = nextFilmstrip;
-            filmstripChanged = true;
-        }
-
-        const float targetPane = activeFlyout_ != FlyoutPanel::None ? 1.0f : 0.0f;
-        const float nextPane = EaseToward(leftPaneOpenBlend_, targetPane, delta, kAnimationSpeed);
-        if (nextPane != leftPaneOpenBlend_) {
-            leftPaneOpenBlend_ = nextPane;
-            // Drive real width animation via a light backdrop reposition; full
-            // child layout runs only when the content-reveal threshold is crossed.
-            // Do NOT InvalidateCanvas here — D2D full-frame repaints every tick were
-            // a primary open/draw/close flicker source under the opaque pane.
-            LayoutLeftPaneAnimationFrame();
-        }
-
+        // Targets (idempotent while in flight). Pane and tabs are linear Toggle
+        // channels: their consumers keep applying the symmetric Smoothstep, so the
+        // pane geometry, region quantization and reveal hysteresis are unchanged.
+        const auto toggle = [&](anim::ElementId id, bool on, int durationMs, anim::SurfaceMask surfaceMask,
+            float current) {
+            anim::Animator::Options options{};
+            options.durationMs = durationMs;
+            options.curve = anim::Curve::Linear;
+            options.surface = surfaceMask;
+            motion.AnimateTo(id, on ? 1.0f : 0.0f, options, now, {}, current);
+        };
+        toggle(anim::element::kLeftPane, activeFlyout_ != FlyoutPanel::None, tokens::kMotionStandardMs,
+            anim::surface::kLeftPane, leftPaneOpenBlend_);
         const std::array<FlyoutPanel, 6> panels{{ FlyoutPanel::Folders, FlyoutPanel::File, FlyoutPanel::Cull,
             FlyoutPanel::Filter, FlyoutPanel::Info, FlyoutPanel::Settings }};
         for (size_t i = 0; i < flyoutTabActiveBlend_.size(); ++i) {
-            const float target = activeFlyout_ == panels[i] ? 1.0f : 0.0f;
-            float& blend = flyoutTabActiveBlend_[i];
-            const float next = EaseToward(blend, target, delta, kAnimationSpeed);
-            if (next == blend) continue;
-            blend = next;
+            toggle(anim::element::FlyoutTab(i), activeFlyout_ == panels[i], tokens::kMotionFastMs,
+                anim::surface::kFlyoutTabs, flyoutTabActiveBlend_[i]);
+        }
+        if (!motion.Contains(anim::element::kFilmstrip))
+            motion.Snap(anim::element::kFilmstrip, filmstripOpacity_, anim::surface::kCanvas);
+        motion.SetShown(anim::element::kFilmstrip, filmstripVisible_,
+            MacOsUiFramework::kFilmstripTransition, anim::surface::kCanvas, now);
+        SyncSearchFieldTransition(now);
+
+        const anim::SurfaceMask dirty = uiFramework_.TickAnimations(now, suspended);
+
+        // Read back. Pane: geometry frame only (no canvas invalidate: full D2D frames
+        // every tick were a primary open/close flicker source under the opaque pane).
+        const float pane = motion.Value(anim::element::kLeftPane, leftPaneOpenBlend_);
+        if (pane != leftPaneOpenBlend_) {
+            leftPaneOpenBlend_ = pane;
+            LayoutLeftPaneAnimationFrame();
+        }
+        bool tabBlendChanged = false;
+        for (size_t i = 0; i < flyoutTabActiveBlend_.size(); ++i) {
+            const float blend = motion.Value(anim::element::FlyoutTab(i), flyoutTabActiveBlend_[i]);
+            if (blend == flyoutTabActiveBlend_[i]) continue;
+            flyoutTabActiveBlend_[i] = blend;
             tabBlendChanged = true;
         }
+        filmstripOpacity_ = motion.Value(anim::element::kFilmstrip, filmstripOpacity_);
+        ApplySearchFieldTransition();
 
-        if (filmstripChanged) {
+        // Canvas: toast, alert, search field, filmstrip and thumbnail crossfades share
+        // ONE invalidate per frame. Face outline fades stay on the idle cadence (their
+        // hold/fade policy lives in review::face_interaction).
+        if ((dirty & anim::surface::kCanvas) != 0 || faceOutlineFade_.NeedsRepaint(now)) {
             InvalidateCanvas();
         }
-        if (tabBlendChanged) {
+        if (tabBlendChanged || (dirty & anim::surface::kFlyoutTabs) != 0) {
             for (HWND tab : flyoutTabs_) {
                 if (tab && IsWindowVisible(tab))
                     RedrawWindow(tab, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
             }
+        }
+        UpdateSearchFieldAnimation();
+        ServiceLeftPaneFrost(); // pending/dirty frost: one canvas frame, not per tick
+        UpdateAnimationCadence();
+    }
+
+    void QuickSiftApplicationImpl::UpdateAnimationCadence() {
+        // Adaptive cadence on the SAME timer: ~60 fps only while the Animator has
+        // work, back to the idle poll (focus / search demand / toast hold / lost-wake
+        // backstop) as soon as every value sits exactly on its target.
+        namespace tokens = quicksift::ui::tokens;
+        const UINT cadence = uiFramework_.Motion().AnyActive() ? tokens::kAnimationFrameMs : tokens::kIdlePollMs;
+        if (cadence != animationTimerIntervalMs_ && hwnd_) {
+            if (SetTimer(hwnd_, ID_TIMER_ANIMATION, cadence, nullptr) != 0)
+                animationTimerIntervalMs_ = cadence;
         }
     }
 
@@ -271,17 +319,13 @@ QuickSiftApplicationImpl::~QuickSiftApplicationImpl() {
         // Filmstrip cells are small. Request the thumbnail lane and ignore the
         // grid viewport filter, otherwise Single View drops these jobs and the
         // strip stays empty. Rendering stays cache-only.
-        // Clear only this window's failure marks so a prior grid miss can retry
-        // without wiping the global failure map or creating a paint-time loop.
+        // 0.9.4.0: failures go through the shared bounded retry policy
+        // (GetOrRequestBitmap checks ThumbnailDecodeAdmissible). The former code
+        // erased this window's failure marks on every call, which re-requested a
+        // permanently undecodable file on every filmstrip paint.
         const int target = 256;
         for (size_t i = layout.firstIndex; i < layout.lastIndex; ++i) {
-            const fs::path& path = VisiblePhoto(i).path;
-            const std::wstring key = NormalizedPathKey(path);
-            failedThumbnailPaths_.erase(key);
-            thumbnailRetryCooldown_.erase(key);
-            thumbnailRetryAttempts_.erase(key);
-            thumbnailFailureRetryViewportEpochs_.erase(key);
-            GetOrRequestBitmap(path, target, JobPriority::Interactive,
+            GetOrRequestBitmap(VisiblePhoto(i).path, target, JobPriority::Interactive,
                 false, CacheClass::Thumbnail, 0, true);
         }
     }

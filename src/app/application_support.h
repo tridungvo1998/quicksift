@@ -179,6 +179,12 @@ inline constexpr UINT WM_APP_METADATA_TRANSACTION_COMPLETION = WM_APP + 12;
 
 inline constexpr UINT WM_APP_RESOURCE_PRESSURE = WM_APP + 13;
 inline constexpr UINT WM_APP_STARTUP_READY = WM_APP + 14;
+// Import / Export Ratings worker finished (read/parse or export write).
+inline constexpr UINT WM_APP_RATINGS_WORKER_DONE = WM_APP + 15;
+// Batch Processing worker finished (folder name load or match preflight).
+inline constexpr UINT WM_APP_BATCH_WORKER_DONE = WM_APP + 16;
+// Thumbnail search worker has facts (capture time / comments) or an evaluation result.
+inline constexpr UINT WM_APP_SEARCH_WORKER = WM_APP + 17;
 
 
 inline constexpr UINT_PTR ID_TIMER_IDLE_QUALITY = 1;
@@ -187,6 +193,8 @@ inline constexpr UINT_PTR ID_TIMER_CACHE_FLUSH = 2;
 
 inline constexpr UINT_PTR ID_TIMER_AUTOHIDE = 3;
 
+// Retired (0.9.4.0): toasts run on the central Animator via ID_TIMER_ANIMATION.
+// The id stays reserved so no other timer reuses it.
 inline constexpr UINT_PTR ID_TIMER_TOAST = 4;
 
 inline constexpr UINT_PTR ID_TIMER_METADATA_UI = 5;
@@ -206,6 +214,28 @@ inline constexpr UINT_PTR ID_TIMER_THROTTLED_SCHEDULE = 15;
 inline constexpr UINT_PTR ID_TIMER_SCROLL_FRAME = 16;
 // Settle debounce before visible decode enqueue after fling/coast ends.
 inline constexpr UINT_PTR ID_TIMER_SCROLL_SETTLE = 17;
+// One-shot continuation for a time-budgeted background-completion drain. WM_TIMER is
+// the lowest-priority queue message, so pending input and WM_PAINT always run between
+// completion slices (0.9.4.0 UI-thread/worker separation).
+inline constexpr UINT_PTR ID_TIMER_COMPLETION_PUMP = 18;
+// 0.9.4.0 thumbnail reliability backstop: while any visible thumbnail cell is still
+// missing (no cached bitmap, not terminally failed), a low-rate sweep re-enqueues
+// cells that have neither a bitmap nor an in-flight job. Stops once all are present.
+inline constexpr UINT_PTR ID_TIMER_THUMBNAIL_RECONCILE = 19;
+// Import / Export Ratings progress line refresh (export read / import apply).
+inline constexpr UINT_PTR ID_TIMER_RATINGS_PROGRESS = 20;
+// Batch Processing: restores the hidden dialog if its glass alert was replaced.
+inline constexpr UINT_PTR ID_TIMER_BATCH_GLASS_WATCH = 21;
+// Thumbnail search: ~150 ms debounce between typing (or a metadata change) and evaluation.
+inline constexpr UINT_PTR ID_TIMER_SEARCH_DEBOUNCE = 22;
+// Metadata write lane (200 ms while a write runs or edits are queued): drains results
+// if a completion post was lost, flushes coalesced edits, shows the "waiting for
+// <file>" toast while another app holds a file. Stops itself when the lane is idle.
+inline constexpr UINT_PTR ID_TIMER_METADATA_WRITE_LANE = 23;
+// One-shot retries for UI reads of the cache database that found it busy (the UI
+// waits at most PersistentCache::kUiDatabaseWait, then retries from these timers).
+inline constexpr UINT_PTR ID_TIMER_USER_COMMENT_RETRY = 24;
+inline constexpr UINT_PTR ID_TIMER_LIBRARY_LIST_RETRY = 25;
 
 inline constexpr UINT_PTR kFaceWarningTooltipId = 1;
 
@@ -234,6 +264,10 @@ struct DocumentWindowState {
     HFONT semiboldFont = nullptr;
     bool titleCloseHot = false;
     bool titleClosePressed = false;
+    // MissingFiles windows: English title key re-translated on language change.
+    std::wstring titleKey;
+    // Translator for messages the window raises itself (diagnostic export result).
+    std::function<std::wstring(std::wstring_view)> Tr;
 };
 
 class QuickSiftApplicationImpl;
@@ -247,6 +281,10 @@ void AppendRtfEscaped(std::string& output, std::wstring_view text);
 std::string BuildDocumentRtf(std::wstring_view text, bool helpDocument, const ThemePalette& theme);
 DWORD CALLBACK StreamDocumentRtf(DWORD_PTR cookie, LPBYTE buffer, LONG requested, LONG* written) noexcept;
 void SetDocumentControlText(HWND edit, std::wstring_view text, bool helpDocument, bool richEdit,
+    const ThemePalette& theme);
+// Verbatim plain text (no RTF formatting, trimming or bullet handling): every line is
+// shown and copied exactly as given. Used by the "missing files" list.
+void SetDocumentPlainText(HWND edit, std::wstring_view text, bool richEdit,
     const ThemePalette& theme);
 bool EnsureRichEditLoaded();
 LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARAM wParam,
@@ -314,6 +352,10 @@ using quicksift::metadata::UpdateXmpSimpleValue;
 struct SidecarMetadataWriteResult {
     bool ok = false;
     bool conflict = false;
+    // Pre-publication refusal (handle open / rename) with the original untouched;
+    // classified by the write lane (sharing violation -> retry).
+    std::uint32_t win32Error = 0;
+    bool lowStorage = false;
     PhotoMetadataValues before;
     PhotoMetadataValues after;
     std::wstring detail;
@@ -331,6 +373,15 @@ bool IsJpegPath(const fs::path& path);
 bool UsesDirectMetadata(const fs::path& path);
 std::int64_t MetadataStampFor(const fs::path& path);
 std::wstring FormatFileSize(uintmax_t bytes);
+// Replaces every `token` (e.g. L"{file}") in an already-localized template.
+inline std::wstring FillToken(std::wstring text, std::wstring_view token, const std::wstring& value) {
+    if (token.empty()) return text;
+    for (std::size_t position = text.find(token); position != std::wstring::npos;
+        position = text.find(token, position + value.size())) {
+        text.replace(position, token.size(), value);
+    }
+    return text;
+}
 std::optional<std::uint64_t> FreeBytesForPath(const fs::path& path);
 bool HasStorageHeadroom(const fs::path& path, std::uint64_t requiredBytes,
     std::uint64_t reserveBytes, std::uint64_t* availableOut = nullptr);
@@ -351,8 +402,14 @@ bool CaptureAtomicFileSnapshot(const fs::path& path, AtomicFileSnapshot& snapsho
 std::uint64_t WicFileIdentity(const fs::path& path);
 bool SameAtomicFileSnapshot(const AtomicFileSnapshot& left, const AtomicFileSnapshot& right);
 bool WriteAllBytes(HANDLE handle, const std::vector<char>& bytes);
+// Why WriteTextFile refused (all fields zero/false on success or other failures).
+struct TextFileWriteStatus {
+    bool destinationChanged = false; // destination differs from the expected snapshot
+    bool lowStorage = false;
+    std::uint32_t win32Error = 0;    // refusal before the original was touched
+};
 bool WriteTextFile(const fs::path& path, const std::wstring& text, TextFileEncoding encoding,
-    const AtomicFileSnapshot& expectedDestination);
+    const AtomicFileSnapshot& expectedDestination, TextFileWriteStatus* status = nullptr);
 fs::path SidecarPathFor(const fs::path& image);
 int RatingFromShellValue(ULONG value);
 bool WriteXmpProperties(const fs::path& image, std::initializer_list<XmpPropertyUpdate> updates);
@@ -430,6 +487,9 @@ struct WicImageSourceEntry {
     ComPtr<IWICBitmapFrameDecode> frame;
     ComPtr<ID2D1ImageSourceFromWic> imageSource;
     std::uint64_t identity = 0;
+    // 0.9.4.0: last time the on-disk identity was re-verified. Paint reuses a
+    // recently verified source instead of opening the file on every frame.
+    std::chrono::steady_clock::time_point identityVerifiedAt{};
     std::uint64_t lastUse = 0;
     std::chrono::steady_clock::time_point lastUseTime = std::chrono::steady_clock::now();
     UINT width = 0;
@@ -486,11 +546,26 @@ enum class PendingGlassAction {
     RelinquishRedoHistory,
     // Accept current on-disk metadata/identity as the catalog baseline after a
     // rating/pick/label write was refused due to external change.
-    RefreshMetadataFromDisk
+    RefreshMetadataFromDisk,
+    // Import / Export Ratings chooser and import confirmation chain.
+    RatingsExport,
+    RatingsImport,
+    RatingsImportCountMismatchContinue,
+    RatingsImportMissingContinue,
+    RatingsImportShowMissing,
+    RatingsImportFinalConfirm,
+    // Batch Processing: final confirmation, "See unmatched names", and the
+    // no-matching-files notice (dismissal returns to the dialog).
+    BatchConfirm,
+    BatchShowUnmatched,
+    BatchNoMatches,
+    // Write lane: a file stayed locked by another app for ~30 s. Retry resubmits the
+    // affected edits; Skip keeps the rolled-back values.
+    MetadataRetryInUse
 };
 
 inline constexpr size_t kInvalidVisiblePosition = quicksift::core::CatalogStore::InvalidVisiblePosition;
-enum class DocumentKind : ULONG_PTR { Help = 1, About = 2, DiagnosticLog = 3 };
+enum class DocumentKind : ULONG_PTR { Help = 1, About = 2, DiagnosticLog = 3, MissingFiles = 4 };
 struct AdaptivePrefetchPolicy {
     int extraThumbnailRows = 1;
     int depth = 2;

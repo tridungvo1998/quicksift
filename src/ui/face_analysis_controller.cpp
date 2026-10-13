@@ -1,5 +1,7 @@
 // OWNER: Face-detector capability UI, scheduling gates, and bounded retry handling.
 #include "app/quicksift_application_internal.h"
+#include "core/log_rate_limiter.h"
+#include "diagnostics/log_categories.h"
 #include "face_detector.h"
 
 namespace quicksift::app {
@@ -8,7 +10,7 @@ std::wstring QuickSiftApplicationImpl::FaceLockAvailabilityTooltipText() const {
     using quicksift::core::FaceDetectorCapability;
     switch (faceAnalysisRetryPolicy_.Capability()) {
     case FaceDetectorCapability::Available:
-        return Tr(L"Face Lock centers the view on the largest detected face. Detection runs locally through Windows Media FaceAnalysis.");
+        return Tr(L"Face Lock centers the view on the face closest to the image centre, or on the face you click. Detection runs locally through Windows Media FaceAnalysis.");
     case FaceDetectorCapability::Unavailable:
         return Tr(L"Face Lock is unavailable because Windows reports that face detection is not supported on this device.");
     case FaceDetectorCapability::TemporarilyFailed:
@@ -110,10 +112,18 @@ void QuickSiftApplicationImpl::HandleFaceAnalysisOutcome(const WorkResult& resul
     faceAnalysisRetryPolicy_.RecordOutcome(path, result.faceAnalysisOutcome, now);
     if (result.faceAnalysisOutcome == quicksift::core::FaceAnalysisOutcome::TransientFailure) {
         const unsigned failures = faceAnalysisRetryPolicy_.FailureCount(path);
-        QS_LOG_WARNING(L"FaceDetection", L"Face analysis failed for " + path +
-            L"; transient failure count " + std::to_wstring(failures));
-        if (faceAnalysisRetryPolicy_.Exhausted(path)) {
-            QS_LOG_WARNING(L"FaceDetection", L"Automatic face-analysis retries exhausted for " + path);
+        // Structured, privacy-respecting (file name + path id), rate-limited: a flaky
+        // detector on a large folder must not flood the log.
+        static quicksift::core::LogRateLimiter limiter(10, std::chrono::seconds(30));
+        std::uint64_t suppressed = 0;
+        const bool exhausted = faceAnalysisRetryPolicy_.Exhausted(path);
+        if (exhausted || limiter.Allow(&suppressed)) {
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kFaceLock,
+                exhausted ? L"face_analysis_retries_exhausted" : L"face_analysis_transient_failure",
+                { L"file", quicksift::diagnostics::LogFileName(result.path) },
+                { L"path_id", quicksift::diagnostics::LogPathId(result.path) },
+                { L"failures", std::to_wstring(failures) },
+                { L"suppressed", std::to_wstring(suppressed) });
         }
     }
     if (faceAnalysisRetryPolicy_.Capability() != previousCapability) {

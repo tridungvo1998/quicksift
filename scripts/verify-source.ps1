@@ -685,6 +685,16 @@ if (-not $WorkerText.Contains('result->faceBlurScanned = sharpness.scanned')) {
 if (-not $FacePolicyText.Contains('FaceAnchorComesBefore')) {
     throw 'Primary-face selection lacks deterministic tie breaking.'
 }
+foreach ($Token in @('RankFacesForAnchor', 'MatchFaceSelection', 'HitTestFaceBoxes', 'kFaceClickFillFraction', 'IsNoiseFace')) {
+    if (-not ($FacePolicyText + (Read-SourceText 'src\core\face_policy.h')).Contains($Token)) { throw "Multi-face FaceLock policy is missing: $Token" }
+}
+$FaceQualityText = (Read-SourceText 'src\core\face_quality_policy.cpp') + (Read-SourceText 'src\core\face_quality_policy.h')
+foreach ($Token in @('AnalyzeFaceQualityBgra', 'kFaceQualityAnalysisVersion', 'FaceQualityThresholds', 'RequiredFaceQualityDecodeEdge', 'FaceQualityFlagged')) {
+    if (-not $FaceQualityText.Contains($Token)) { throw "Per-face quality policy is missing: $Token" }
+}
+foreach ($Token in @('AnalyzeFaceQualitiesBgra', 'core::RankFacesForAnchor', 'faceSelectionKnown')) {
+    if (-not $WorkerText.Contains($Token)) { throw "Worker multi-face analysis is missing: $Token" }
+}
 
 $FaceRetryText = Read-SourceText 'src\core\face_detection_policy.cpp'
 $FaceRetryHeaderText = Read-SourceText 'src\core\face_detection_policy.h'
@@ -736,12 +746,25 @@ if (-not $PersistentCacheText.Contains('platform::CacheDirectoryPath()') -or
         -not $PersistentCacheText.Contains(': baseDirectory_(quicksift::platform::CacheDirectoryPath())')) {
     throw 'Persistent cache must live exclusively below the canonical runtime data root.'
 }
-foreach ($Forbidden in @('ALTER TABLE image_records', 'TryMigrateLegacyDirectory', 'PreviousQuickSiftUserCacheDirectory')) {
+foreach ($Forbidden in @('TryMigrateLegacyDirectory', 'PreviousQuickSiftUserCacheDirectory')) {
     if ($PersistentCacheText.Contains($Forbidden)) { throw "Obsolete cache/database compatibility remains: $Forbidden" }
 }
-foreach ($Token in @('kDatabaseSchemaVersion = 1', 'PRAGMA user_version;',
-        '"PRAGMA user_version=" + std::to_string(kDatabaseSchemaVersion)', 'error != SQLITE_SCHEMA')) {
-    if (-not $PersistentCacheText.Contains($Token)) { throw "Current-only database schema contract is missing: $Token" }
+# Schema v3 (0.9.4.0): in-place upgrades are v1 -> v2 (face quality) and v2 -> v3 (camera settings).
+$MigrateStart = $PersistentCacheText.IndexOf('bool PersistentCache::MigrateSchema(int fromVersion)')
+$MigrateEnd = if ($MigrateStart -ge 0) { $PersistentCacheText.IndexOf('bool PersistentCache::InitializeSchema()', $MigrateStart) } else { -1 }
+if ($MigrateStart -lt 0 -or $MigrateEnd -lt 0) {
+    throw 'Versioned cache schema migration (MigrateSchema before InitializeSchema) is missing.'
+}
+$OutsideMigration = $PersistentCacheText.Substring(0, $MigrateStart) + $PersistentCacheText.Substring($MigrateEnd)
+if ($OutsideMigration.Contains('ALTER TABLE image_records')) {
+    throw 'Unversioned cache/database compatibility remains: ALTER TABLE image_records outside MigrateSchema'
+}
+foreach ($Token in @('kDatabaseSchemaVersion = 3', 'PRAGMA user_version;',
+        '"PRAGMA user_version=" + std::to_string(kDatabaseSchemaVersion)', 'error != SQLITE_SCHEMA',
+        'fromVersion < 1', 'MigrateSchema(storedVersion)', 'face_quality_version', 'face_selection',
+        'core::kFaceQualityAnalysisVersion', 'camera_settings_known', 'LookupCameraSettings',
+        'UpdateCameraSettings')) {
+    if (-not $PersistentCacheText.Contains($Token)) { throw "Versioned database schema contract is missing: $Token" }
 }
 if (-not $SessionControllerText.Contains('platform::SessionFilePath()')) {
     throw 'Session persistence must live below the canonical runtime data root.'

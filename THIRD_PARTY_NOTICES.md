@@ -1,4 +1,4 @@
-# Third-party Dependency Inventory — QuickSift 0.9.3.0 RC
+# Third-party Dependency Inventory — QuickSift 0.9.4.0 RC
 
 QuickSift's release build uses the dependency set pinned by `vcpkg.json`:
 

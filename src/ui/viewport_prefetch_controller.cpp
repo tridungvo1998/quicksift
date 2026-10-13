@@ -178,14 +178,6 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
 
         std::vector<std::wstring> desiredPaths;
         std::vector<std::wstring> visiblePaths;
-        std::unordered_set<std::wstring> residentThumbnailKeys;
-        if (enqueueDecodes && !budget.placeholdersOnly) {
-            residentThumbnailKeys.reserve(bitmapCache_.size());
-            for (const auto& entry : bitmapCache_) {
-                if (entry.first.cacheClass == CacheClass::Thumbnail && entry.first.size == target)
-                    residentThumbnailKeys.insert(entry.first.path);
-            }
-        }
         desiredPaths.reserve(plan.requests.size());
         visiblePaths.reserve(static_cast<std::size_t>(std::max(0, plan.visibleLastRow - plan.visibleFirstRow + 1)) *
             static_cast<std::size_t>(std::max(1, layout.columns)));
@@ -206,8 +198,13 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
 
         if (!enqueueDecodes || budget.placeholdersOnly) return;
 
+        // 0.9.4.0: one worker-lock acquisition for the whole plan instead of one
+        // prefix scan of every pending key per request.
+        const std::unordered_set<std::wstring> inFlightThumbnailPaths =
+            worker_.PendingOrActiveThumbnailPaths();
         unsigned encodedReadAheadQueued = 0;
         int enqueuedThisPass = 0;
+        const auto retryNow = std::chrono::steady_clock::now();
         const int enqueueCap = std::max(0, budget.maxVisibleEnqueue);
         for (const auto& request : plan.requests) {
             if (request.index >= catalog_.VisibleCount()) continue;
@@ -232,52 +229,29 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
                 break;
             }
             const std::wstring thumbnailKey = NormalizedPathKey(photo.path);
+            const std::wstring photoPath = photo.path.wstring();
             int retryAttempt = 0;
             bool forceWic = false;
             const bool visibleRequest = request.tier == quicksift::review::prefetch::PrefetchTier::Visible;
-            const bool inCache = residentThumbnailKeys.contains(thumbnailKey);
-            const bool inFlight = worker_.IsThumbnailJobPendingOrActive(photo.path);
-
-            if (!inCache && !inFlight) {
-                if (const auto retry = thumbnailRetryAttempts_.find(thumbnailKey);
-                    retry != thumbnailRetryAttempts_.end()) {
-                    retryAttempt = retry->second;
-                    forceWic = retryAttempt == 3;
-                }
-            }
-
-            if (failedThumbnailPaths_.contains(thumbnailKey)) {
-                if (!visibleRequest) continue;
-                const auto cooldownNow = std::chrono::steady_clock::now();
-                if (const auto cooldown = thumbnailRetryCooldown_.find(thumbnailKey);
-                    cooldown != thumbnailRetryCooldown_.end()) {
-                    if (cooldownNow < cooldown->second) continue;
-                    thumbnailRetryCooldown_.erase(cooldown);
-                    thumbnailRetryAttempts_.erase(thumbnailKey);
-                    failedThumbnailPaths_.erase(thumbnailKey);
-                    retryAttempt = 0;
-                    forceWic = false;
-                } else {
-                    const auto prior = thumbnailFailureRetryViewportEpochs_.find(thumbnailKey);
-                    if (prior == thumbnailFailureRetryViewportEpochs_.end() || prior->second != viewportEpoch) {
-                        thumbnailFailureRetryViewportEpochs_[thumbnailKey] = viewportEpoch;
-                        failedThumbnailPaths_.erase(thumbnailKey);
-                        thumbnailRetryAttempts_.erase(thumbnailKey);
-                        retryAttempt = 0;
-                        forceWic = false;
-                    } else {
-                        continue;
-                    }
-                }
-            }
+            // 0.9.4.0: O(1) residency probe with the exact bitmap-cache key. The former
+            // code copied every cached thumbnail path into a temporary set on every
+            // publish and then probed it with the *normalized* (absolute, lower-case)
+            // key while the set held raw paths, so on most real paths cached
+            // thumbnails were never recognised and were re-decoded and re-uploaded
+            // after every scroll settle.
+            const bool inCache = bitmapCache_.contains(
+                CacheKey{ photoPath, target, CacheClass::Thumbnail });
+            const bool inFlight = inFlightThumbnailPaths.contains(photoPath);
             const bool shouldEnqueueThumbnail = !inCache && !inFlight;
-            if (visibleRequest) {
-                if (const auto retry = thumbnailRetryAttempts_.find(thumbnailKey);
-                    retry != thumbnailRetryAttempts_.end()) {
-                    retryAttempt = retry->second;
-                    forceWic = retryAttempt == 3;
-                }
-            }
+
+            // 0.9.4.0 bounded retry policy (see catalog_loading_and_result_integration):
+            // terminal failures stay failed until file change / reload / manual retry;
+            // a backing-off path waits for its deadline (the retry timer re-sweeps).
+            // The former logic reset a failed path's attempts on every new viewport
+            // epoch, i.e. every scroll re-decoded known-bad files without bound.
+            if (shouldEnqueueThumbnail &&
+                !ThumbnailDecodeAdmissible(photo, thumbnailKey, retryNow, retryAttempt, forceWic)) continue;
+            if (!visibleRequest && retryAttempt > 0) continue; // retries are visible-only
             if (shouldEnqueueThumbnail) {
                 if (enqueuedThisPass >= enqueueCap) break;
                 if (IsActivelyInteracting() && budget.phase == quicksift::review::prefetch::ScrollMotionPhase::Settled &&
@@ -397,6 +371,15 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
             return;
         }
         PublishThumbnailViewport(0, {});
+        if (reviewState_.Mode() == ViewMode::Single || reviewState_.Mode() == ViewMode::Compare) {
+            // 0.9.4.0: Single/Compare decoding is owned by the dedicated view lane.
+            // The current image is requested by paint (foreground, latest-wins);
+            // this only publishes low-priority neighbour prefetch on the same lane.
+            RefreshPerformancePolicy();
+            PublishViewPrefetchNeighbours(direction);
+            InvalidateCanvas();
+            return;
+        }
         const std::wstring base = reviewState_.ActivePath();
         const auto current = IndexForPath(base);
         if (!current) return;
@@ -474,6 +457,216 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
                     photo.facesScanned ? kFaceSharpnessDecodeSize : kFaceDecodeSize);
             }
         }
+    }
+
+    void QuickSiftApplicationImpl::PublishViewPrefetchNeighbours(int direction) {
+        const ViewMode mode = reviewState_.Mode();
+        if (mode != ViewMode::Single || catalog_.VisibleEmpty()) {
+            // Compare panes are all foreground work (PrioritizeCompareLoads); there is
+            // no meaningful "next" image to prefetch.
+            worker_.SetViewPrefetchPaths({});
+            lastViewPrefetchSignature_.clear();
+            return;
+        }
+        const std::wstring base = reviewState_.ActivePath();
+        const auto current = IndexForPath(base);
+        if (!current) {
+            worker_.SetViewPrefetchPaths({});
+            return;
+        }
+        // Read the already-refreshed policy directly. CurrentPrefetchPolicy() refreshes
+        // the governor -> UpdateAppState() -> DispatchIdlePrefetch() -> here, which
+        // would recurse.
+        AdaptivePrefetchPolicy policy;
+        policy.depth = performancePolicy_.prefetchDepth;
+        policy.prefetchTarget = performancePolicy_.prefetchDecodeTarget;
+
+        // Neighbours are decoded at the zoom-matched display size of the current
+        // image (clamped to each neighbour's native edge) in the Preview lane, so a
+        // navigation can be satisfied by FindBestViewBitmap without a new decode.
+        int zoomMatchedTarget = policy.prefetchTarget;
+        if (mode == ViewMode::Single) {
+            const PhotoItem& activePhoto = VisiblePhoto(*current);
+            const D2D1_RECT_F activeArea = ViewAreaForPath(base);
+            const auto activeView = ResolveViewForPath(base, activeArea, BaseViewForPath(base),
+                activePhoto.sourceWidth, activePhoto.sourceHeight);
+            const float baseEdge = std::max(1.0f, std::max(activeArea.right - activeArea.left,
+                activeArea.bottom - activeArea.top) * CanvasPixelScale() * 1.25f);
+            const float zoomFactor = std::max(1.0f, activeView.relativeZoom);
+            zoomMatchedTarget = std::max(policy.prefetchTarget,
+                static_cast<int>(baseEdge * zoomFactor * 1.10f));
+        }
+
+        // Modest window: two ahead in the travel direction and one behind (or
+        // +1/-1/+2 when stationary). Storage-aware depth can only shrink it.
+        int ahead = 2;
+        if (storageProfile_.remote) ahead = 1;
+        std::vector<int> offsets;
+        if (direction < 0) {
+            for (int distance = 1; distance <= ahead; ++distance) offsets.push_back(-distance);
+            offsets.push_back(1);
+        } else if (direction > 0) {
+            for (int distance = 1; distance <= ahead; ++distance) offsets.push_back(distance);
+            offsets.push_back(-1);
+        } else {
+            offsets = { 1, -1 };
+            if (ahead > 1) offsets.push_back(2);
+        }
+        if (policy.depth <= 1 && offsets.size() > 2) offsets.resize(2);
+
+        struct Neighbour { fs::path path; int target; bool raw; };
+        std::vector<Neighbour> neighbours;
+        std::vector<std::wstring> allowed;
+        allowed.reserve(offsets.size() + 1);
+        // The current image stays in the allowed set so a prefetch that is already
+        // running for it (the user just navigated onto a neighbour) is not
+        // cancelled before paint adopts it as the foreground request.
+        allowed.push_back(VisiblePhoto(*current).path.wstring());
+        for (const int offset : offsets) {
+            const long long index = static_cast<long long>(*current) + offset;
+            if (index < 0 || index >= static_cast<long long>(catalog_.VisibleCount())) continue;
+            const PhotoItem& photo = VisiblePhoto(static_cast<size_t>(index));
+            int target = zoomMatchedTarget;
+            if (photo.sourceWidth > 0 && photo.sourceHeight > 0)
+                target = std::min(target, std::max(photo.sourceWidth, photo.sourceHeight));
+            neighbours.push_back({ photo.path, std::max(1, target), IsRawExtension(photo.extension) });
+            allowed.push_back(photo.path.wstring());
+        }
+        worker_.SetViewPrefetchPaths(allowed);
+        for (std::size_t order = 0; order < neighbours.size(); ++order) {
+            const Neighbour& neighbour = neighbours[order];
+            if (order < static_cast<std::size_t>(storageProfile_.readAheadFiles))
+                worker_.QueueEncodedReadAhead(neighbour.path);
+            const int bucket = BucketFor(neighbour.target);
+            if (BitmapSatisfiesDisplay(FindBitmapNoTouch(neighbour.path, bucket, CacheClass::Preview),
+                    std::min(bucket, neighbour.target), !neighbour.raw)) continue;
+            // Only the active RAW is demosaiced; neighbours keep the embedded preview.
+            RequestViewDecode(neighbour.path,
+                neighbour.raw ? JobKind::DecodePreview : JobKind::DecodeFull,
+                neighbour.target, CacheClass::Preview, JobPriority::Interactive, true);
+        }
+        for (const Neighbour& neighbour : neighbours) {
+            const auto index = IndexForPath(neighbour.path.wstring());
+            if (!index) continue;
+            const PhotoItem& photo = VisiblePhoto(*index);
+            if (reviewState_.FaceLockEnabled() && (!photo.facesScanned || (!photo.faces.empty() && !photo.faceBlurScanned))) {
+                EnqueueFaceAnalysis(photo.path, reviewState_.Epochs().navigation, JobPriority::Idle,
+                    photo.facesScanned ? kFaceSharpnessDecodeSize : kFaceDecodeSize);
+            }
+        }
+        lastViewPrefetchSignature_ = base + L"|" + std::to_wstring(direction) + L"|" +
+            std::to_wstring(generation_) + L"|" + std::to_wstring(zoomMatchedTarget);
+    }
+
+    void QuickSiftApplicationImpl::ArmThumbnailReconcile(UINT delayMs) {
+        if (!hwnd_) return;
+        if (thumbnailReconcileTimerActive_ && delayMs != 0) return;
+        thumbnailReconcileTimerActive_ = true;
+        StartUiTimer(ID_TIMER_THUMBNAIL_RECONCILE, std::max<UINT>(delayMs, 15u), L"visible reconcile");
+    }
+
+    void QuickSiftApplicationImpl::StopThumbnailReconcile() {
+        if (hwnd_ && thumbnailReconcileTimerActive_) KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RECONCILE);
+        thumbnailReconcileTimerActive_ = false;
+    }
+
+    void QuickSiftApplicationImpl::ReconcileVisibleThumbnails(const wchar_t* reason) {
+        constexpr UINT kReconcileIntervalMs = 400;
+        if (!hwnd_ || catalog_.VisibleEmpty()) {
+            StopThumbnailReconcile();
+            return;
+        }
+        const ViewMode mode = reviewState_.Mode();
+        if (mode == ViewMode::Single || mode == ViewMode::Compare) {
+            // View backstop: RenderSingle/RenderCompare arm this while the displayed
+            // image is not yet at full quality. Repainting re-issues the (deduped)
+            // foreground request, recovering from a cancelled/dropped view decode.
+            StopThumbnailReconcile();
+            InvalidateCanvas();
+            return;
+        }
+        if (mode != ViewMode::Thumbnails) {
+            StopThumbnailReconcile();
+            return;
+        }
+        const auto budget = CurrentThumbnailScrollLoadBudget();
+        if (thumbnailScrollDragging_ || thumbnailScrollMotionActive_ ||
+            ThumbnailScrollPrefersPlaceholders() ||
+            budget.phase != quicksift::review::prefetch::ScrollMotionPhase::Settled) {
+            // Never enqueue mid-gesture; check again once motion has settled.
+            StopThumbnailReconcile();
+            ArmThumbnailReconcile(kReconcileIntervalMs);
+            return;
+        }
+
+        const auto layout = CurrentThumbnailLayout();
+        if (layout.columns <= 0 || layout.cellHeight <= 0.0f) {
+            StopThumbnailReconcile();
+            return;
+        }
+        const float scroll = reviewState_.Thumbnails().scrollDip;
+        // Viewport plus a one-row margin above and below (matches RenderThumbnails).
+        const int firstRow = std::max(0, static_cast<int>(scroll / layout.cellHeight) - 1);
+        const int lastRow = std::min(std::max(0, layout.rows - 1),
+            static_cast<int>((scroll + layout.canvasHeight) / layout.cellHeight) + 1);
+        const std::size_t firstIndex = static_cast<std::size_t>(firstRow) * static_cast<std::size_t>(layout.columns);
+        const std::size_t endIndex = std::min(catalog_.VisibleCount(),
+            static_cast<std::size_t>(lastRow + 1) * static_cast<std::size_t>(layout.columns));
+        if (firstIndex >= endIndex) {
+            StopThumbnailReconcile();
+            return;
+        }
+
+        // The worker cancels thumbnail jobs for paths outside its viewport mirror.
+        // If any cell in range is not in the published plan (resize, filter/sort
+        // change, folder batch), republish first so the re-enqueued jobs survive.
+        bool republish = false;
+        for (std::size_t index = firstIndex; index < endIndex && !republish; ++index) {
+            if (!reviewState_.IsThumbnailPathDesired(VisiblePhoto(index).path.wstring())) republish = true;
+        }
+        if (republish) PublishThumbnailViewportForCurrentPlan(true);
+
+        const int target = ThumbnailDecodeTarget();
+        const uint64_t viewportEpoch = reviewState_.Epochs().thumbnailViewport;
+        const std::unordered_set<std::wstring> inFlight = worker_.PendingOrActiveThumbnailPaths();
+        const auto now = std::chrono::steady_clock::now();
+        constexpr int kMaximumRequeuePerSweep = 96;
+        int missing = 0;
+        int requeued = 0;
+        for (std::size_t index = firstIndex; index < endIndex; ++index) {
+            const PhotoItem& photo = VisiblePhoto(index);
+            const std::wstring photoPath = photo.path.wstring();
+            // Visible items are pinned against eviction on every sweep as well as
+            // every paint (the fling paint path used not to pin at all).
+            protectedThumbnailPaths_.insert(photoPath);
+            const auto cached = bitmapCache_.find(CacheKey{ photoPath, target, CacheClass::Thumbnail });
+            if (cached != bitmapCache_.end() && cached->second.bitmap) continue;
+            if (inFlight.contains(photoPath)) {
+                ++missing; // will complete (or fail into the retry policy)
+                continue;
+            }
+            const std::wstring key = NormalizedPathKey(photo.path);
+            int retryAttempt = 0;
+            bool forceWic = false;
+            if (!ThumbnailDecodeAdmissible(photo, key, now, retryAttempt, forceWic)) {
+                // Terminal failures show the failed placeholder and need no backstop;
+                // a path inside its backoff is serviced by the retry timer.
+                continue;
+            }
+            ++missing;
+            if (requeued >= kMaximumRequeuePerSweep) continue;
+            worker_.EnqueuePreview(photo.path, target, generation_, JobPriority::Interactive,
+                CacheClass::Thumbnail, 0, viewportEpoch, retryAttempt, forceWic);
+            ++requeued;
+        }
+        if (requeued > 0 && quicksift::diagnostics::VerboseLogging()) {
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Trace, L"Thumbnails", L"reconcile_requeue",
+                {L"reason", std::wstring(reason ? reason : L"")},
+                {L"requeued", std::to_wstring(requeued)},
+                {L"missing", std::to_wstring(missing)});
+        }
+        StopThumbnailReconcile();
+        if (missing > 0) ArmThumbnailReconcile(kReconcileIntervalMs);
     }
 
 } // namespace quicksift::app

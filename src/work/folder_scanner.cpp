@@ -109,7 +109,10 @@ void FolderScanner::Start(const fs::path& folder, uint64_t generation) {
                 generation, quicksift::work::ScanCompletionStatus::Failed,
                 ERROR_NOT_ENOUGH_MEMORY,
                 L"QuickSift could not create the folder-scanner thread."))) {
-            PostScannerWakeWithRetry(notify);
+            // Terminal failure always posts (and refreshes the claim) so the UI can
+            // leave its pending state even if a previous wake was lost.
+            (void)completionQueue_->TryClaimWake();
+            if (!PostScannerWakeWithRetry(notify)) completionQueue_->ReleaseWake();
         }
         return;
     }
@@ -163,7 +166,9 @@ void FolderScanner::RunScan(const ScanRequest& request) {
         const bool queued = completionQueue_->PushTerminal(
             quicksift::work::BackgroundCompletion::ForScanCompletion(
                 generation, status, error, std::move(detail)), &transitionedFromEmpty);
-        if (queued && transitionedFromEmpty) PostScannerWakeWithRetry(notify);
+        (void)transitionedFromEmpty;
+        if (queued && completionQueue_->TryClaimWake() && !PostScannerWakeWithRetry(notify))
+            completionQueue_->ReleaseWake();
         return queued;
     };
 
@@ -196,7 +201,9 @@ void FolderScanner::RunScan(const ScanRequest& request) {
                         quicksift::work::BackgroundCompletion::ForScanBatch(posted),
                         &transitionedFromEmpty)) {
                     reservation.Release();
-                    if (transitionedFromEmpty) PostScannerWakeWithRetry(notify);
+                    (void)transitionedFromEmpty;
+                    if (completionQueue_->TryClaimWake() && !PostScannerWakeWithRetry(notify))
+                        completionQueue_->ReleaseWake();
                     return true;
                 }
                 Sleep(5);

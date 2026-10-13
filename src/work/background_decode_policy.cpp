@@ -28,6 +28,9 @@ namespace quicksift::app {
             removeStaleRawPolicy(faceQueue_);
             removeStaleRawPolicy(idleQueue_);
             removeStaleRawPolicy(analysisQueue_);
+            removeStaleRawPolicy(viewQueue_);
+            removeStaleRawPolicy(viewPrefetchQueue_);
+            viewForegroundQueued_.store(static_cast<unsigned>(viewQueue_.size()), std::memory_order_release); NoteViewForegroundChanged();
             for (auto it = cacheWriteQueue_.begin(); it != cacheWriteQueue_.end();) {
                 if (IsRawExtension(ExtensionLower(it->path))) {
                     cacheWriteBytes_ = it->bytes > cacheWriteBytes_ ? 0 : cacheWriteBytes_ - it->bytes;
@@ -43,6 +46,7 @@ namespace quicksift::app {
         }
         RequestDecoderSessionTrim();
         if (decodeBudget_) decodeBudget_->NotifyWaiters();
+        if (viewDecodeBudget_) viewDecodeBudget_->NotifyWaiters();
         cv_.notify_all();
     }
 
@@ -68,13 +72,22 @@ namespace quicksift::app {
     }
 
     bool Worker::SameDecodeFamily(const WorkJob& a, const WorkJob& b) {
-        const bool aRawJpegOnly = IsRawExtension(ExtensionLower(a.path)) && a.rawJpegPreviewOnly;
-        const bool bRawJpegOnly = IsRawExtension(ExtensionLower(b.path)) && b.rawJpegPreviewOnly;
-        return IsCoalescibleVisualJob(a) && IsCoalescibleVisualJob(b) &&
-            a.kind == b.kind && a.cacheClass == b.cacheClass && a.path == b.path &&
-            a.generation == b.generation && a.requestEpoch == b.requestEpoch &&
-            aRawJpegOnly == bRawJpegOnly &&
-            (a.cacheClass == CacheClass::Thumbnail || a.viewportEpoch == b.viewportEpoch);
+        // 0.9.4.0: identical predicate, cheapest tests first. Enqueue() evaluates this
+        // against every queued job while holding mutex_ (on the UI thread for paint and
+        // viewport requests); the former version lower-cased and allocated both file
+        // extensions before rejecting on kind/class/path.
+        if (!IsCoalescibleVisualJob(a) || !IsCoalescibleVisualJob(b)) return false;
+        if (a.kind != b.kind || a.cacheClass != b.cacheClass ||
+            a.generation != b.generation || a.requestEpoch != b.requestEpoch) return false;
+        if (a.cacheClass != CacheClass::Thumbnail && a.viewportEpoch != b.viewportEpoch) return false;
+        if (!(a.path == b.path)) return false;
+        // Equal paths share an extension, so RAW-JPEG-only mode can only differ when
+        // the flags differ and the file is RAW.
+        if (a.rawJpegPreviewOnly == b.rawJpegPreviewOnly) return true;
+        const bool isRaw = IsRawExtension(ExtensionLower(a.path));
+        const bool aRawJpegOnly = isRaw && a.rawJpegPreviewOnly;
+        const bool bRawJpegOnly = isRaw && b.rawJpegPreviewOnly;
+        return aRawJpegOnly == bRawJpegOnly;
     }
 
 

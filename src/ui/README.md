@@ -41,7 +41,9 @@ Specialized photo work remains in `canvas_rendering_and_overlays.cpp`: bitmap co
 - `ui_command_ids.h` — authoritative stable command/control IDs.
 - `ui_control_catalog.h` — authoritative persistent main-window button definitions and memberships.
 - `ui_layout_metrics.h` — shared device-independent geometry.
+- `ui_design_tokens.h` — design tokens (radii, spacing, strokes, type, motion, glass material, accessibility policy); see `docs/DESIGN_SYSTEM.md`.
 - `ui_design_system.h/.cpp` — semantic palettes, contrast, DPI helpers, and low-level failure-safe drawing primitives used by the framework.
+- `framework/ui_animation.h/.cpp` — the central Animator (element registry, motion presets, easing curves, completions). Every slide/fade/drop-down/pop goes through it; feature code never runs its own animation timer (see "Animation system" in `docs/DESIGN_SYSTEM.md`).
 - `../app/application_support.h/.cpp` — registered application classes, private messages, timer IDs, and application-specific subclass/property keys.
 - `document_and_menu_models.cpp` — help, about, and diagnostics document models.
 
@@ -82,6 +84,7 @@ UI modules submit immutable plans and integrate results. They must not perform l
 | Change | Primary owner |
 |---|---|
 | Add/change a reusable component or its interaction behavior | `framework/macos_ui_framework*` and, when portable state is involved, `framework/ui_models.*` |
+| Add/change an animation or transition | a preset in `framework/ui_animation.h`, wired through `MacOsUiFramework::TickAnimations` |
 | Add/change a color or semantic visual role | `ui_design_system.*` |
 | Change shared spacing or pane dimensions | `ui_layout_metrics.h` |
 | Add a command/control ID | `ui_command_ids.h` |
