@@ -3,6 +3,7 @@
 
 #include "face_detector.h"
 #include "core/face_policy.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +30,9 @@ namespace quicksift {
 namespace {
 #if defined(QS_HAS_WINDOWS_FACE_ANALYSIS)
 constexpr std::uint32_t kMaximumFacesPerImage = 512;
+// Created on first use per face-analysis thread. Deliberately not one shared instance:
+// concurrent DetectFacesAsync on a single FaceDetector is not documented as safe, and
+// a mutex would serialize every face worker. Released at thread exit / on failure.
 thread_local winrt::Windows::Media::FaceAnalysis::FaceDetector gThreadFaceDetector{ nullptr };
 // Set once if the Gray8 input path ever throws on this machine; every later call goes
 // straight to the original Bgra8 path instead of paying for a failing attempt.
@@ -58,6 +62,7 @@ core::FaceDetectorCapability QueryFaceDetectorCapability(bool refresh) noexcept 
         gCapability = winrt::Windows::Media::FaceAnalysis::FaceDetector::IsSupported() ?
             core::FaceDetectorCapability::Available : core::FaceDetectorCapability::Unavailable;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Faces", L"QueryFaceDetectorCapability");
         gCapability = core::FaceDetectorCapability::TemporarilyFailed;
     }
 #else
@@ -75,6 +80,7 @@ void ReleaseThreadFaceDetector() noexcept {
     try {
         gThreadFaceDetector = nullptr;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Faces", L"ReleaseThreadFaceDetector");
         // Releasing an expendable cached detector must never prevent thread teardown.
     }
 #endif
@@ -129,6 +135,7 @@ core::FaceAnalysisOutcome DetectFacesFastBgra(
                     faces = gThreadFaceDetector.DetectFacesAsync(grayBitmap).get();
                 }
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Faces", L"DetectFacesFastBgra");
                 faces = nullptr;
                 gGray8InputRejected.store(true, std::memory_order_relaxed);
             }
@@ -177,10 +184,12 @@ core::FaceAnalysisOutcome DetectFacesFastBgra(
             static_cast<float>(static_cast<double>(width) / static_cast<double>(height)));
         return core::FaceAnalysisOutcome::Completed;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Faces", L"DetectFacesFastBgra [2]");
         output.clear();
         try {
             gThreadFaceDetector = nullptr;
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Faces", L"DetectFacesFastBgra [3]");
         }
         return core::FaceAnalysisOutcome::TransientFailure;
     }

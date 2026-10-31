@@ -21,6 +21,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Plain-language failure message (scripts\build-failure-help.ps1): every error that
+# stops this script prints "Build failed / What to do / Technical detail" and exits 1.
+. (Join-Path $PSScriptRoot 'build-failure-help.ps1')
+trap {
+    if (Get-Command Write-QuickSiftFailure -ErrorAction SilentlyContinue) {
+        Write-QuickSiftFailure $_ 'Build' (Get-Variable -Name BuildLogPath -ValueOnly -ErrorAction SilentlyContinue)
+    } else {
+        Write-Host "Build failed: $_" -ForegroundColor Red
+    }
+    exit 1
+}
+
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
     throw 'QuickSift is a native Windows application. Run this script on Windows 10 or Windows 11.'
 }
@@ -61,7 +73,9 @@ function Invoke-Native {
         # Stream native output live. Start-Transcript above captures every line
         # without retaining the full build transcript in PowerShell memory.
         & $FilePath @Arguments 2>&1 | ForEach-Object {
-            Write-Host $_.ToString()
+            $Line = $_.ToString()
+            Write-Host $Line
+            Add-QuickSiftFailureHint $Line
         }
         $ExitCode = $LASTEXITCODE
         if ($ExitCode -ne 0) {

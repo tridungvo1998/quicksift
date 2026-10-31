@@ -4,6 +4,7 @@
 //       build/libQuickSiftCore.a -pthread
 #include "localization.h"
 #include "core/user_error_catalog.h"
+#include "core/blocking_wait.h"
 
 #include <cstdio>
 #include <string>
@@ -85,5 +86,29 @@ int main() {
     Check(helpVi.find(L"bằng tiếng Anh") != std::wstring::npos, "Vietnamese help explains the English export format");
 
     std::printf("localization_checks: %d checks, %d failures\n", gChecks, gFailures);
+    // 0.9.5.0: every blocking-wait title / reason / detail and the new UI captions
+    // have a distinct Vietnamese text.
+    {
+        namespace bw = quicksift::core::blocking_wait;
+        using C = bw::Command; using R = bw::Reason;
+        for (C c : { C::Close, C::RatingsImport, C::RatingsExport, C::Batch }) {
+            const std::wstring key(bw::CommandKey(c));
+            Check(vi.Text(key) != key, "blocking-wait title is translated");
+        }
+        for (R r : { R::FileLockedByOtherApp, R::WriteRetry, R::MetadataWrite, R::FileOperation,
+                 R::RatingsWorker, R::BatchWorker, R::UnsavedEdits }) {
+            const std::wstring key(bw::ReasonKey(r));
+            Check(vi.Text(key) != key, "blocking-wait reason is translated");
+        }
+        for (const wchar_t* key : { L"File: {file}", L"{left} of {total} left", L"Waiting for {elapsed}",
+                 L"Nothing is blocking any more.", L"Force quit", L"Cancel operation", L"Stop waiting",
+                 L"Save", L"Auto refresh", L"Verbose logging", L"Remove from library" }) {
+            Check(vi.Text(key) != key, "new 0.9.5.0 caption is translated");
+        }
+        const std::wstring body = bw::Describe(C::Close, { bw::Blocker{ R::FileLockedByOtherApp, L"a.jpg", 2, 5,
+            std::chrono::milliseconds(65000) } }, [&](std::wstring_view k) { return vi.Text(std::wstring(k)); });
+        Check(body.find(L"a.jpg") != std::wstring::npos && body.find(L"{") == std::wstring::npos,
+            "Vietnamese blocking-wait body fills every placeholder");
+    }
     return gFailures == 0 ? 0 : 1;
 }

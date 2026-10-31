@@ -14,10 +14,13 @@
 #define NOMINMAX
 #endif
 
+#include "core/metadata_gate_policy.h"
 #include "embedded_metadata.h"
 #include "core/metadata_vocabulary.h"
+#include "metadata/jpeg_xmp_locator.h"
 #include "metadata/metadata_value_parser.h"
 #include "platform/locked_file_publication_windows.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <windows.h>
 #include <wincodec.h>
@@ -31,6 +34,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cwctype>
+#include <span>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -52,6 +57,10 @@ struct EmbeddedMetadataGate {
     int writeInterest = 0;
 };
 
+// Set by EmbeddedMetadataWriterScope on the metadata service thread while it runs
+// a write; its own reads are admitted past the write preference (no self-deadlock).
+thread_local int tEmbeddedMetadataWriterDepth = 0;
+
 EmbeddedMetadataGate& MetadataGate() {
     static EmbeddedMetadataGate gate;
     return gate;
@@ -61,9 +70,9 @@ void AcquireEmbeddedMetadataAccess(bool write) {
     EmbeddedMetadataGate& gate = MetadataGate();
     std::unique_lock lock(gate.mutex);
     if (write) ++gate.writeInterest;
+    const bool writerThread = tEmbeddedMetadataWriterDepth > 0;
     gate.cv.wait(lock, [&] {
-        if (gate.holders != 0) return false;
-        return write || gate.writeInterest == 0;
+        return quicksift::core::metadata_gate::Admit(write, writerThread, gate.holders, gate.writeInterest);
     });
     ++gate.holders;
 }
@@ -76,6 +85,7 @@ void ReleaseEmbeddedMetadataAccess(bool write) noexcept {
         if (write && gate.writeInterest > 0) --gate.writeInterest;
         gate.cv.notify_all();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"ReleaseEmbeddedMetadataAccess");
     }
 }
 
@@ -93,6 +103,11 @@ private:
 
 } // namespace
 
+EmbeddedMetadataWriterScope::EmbeddedMetadataWriterScope() noexcept { ++tEmbeddedMetadataWriterDepth; }
+EmbeddedMetadataWriterScope::~EmbeddedMetadataWriterScope() {
+    if (tEmbeddedMetadataWriterDepth > 0) --tEmbeddedMetadataWriterDepth;
+}
+
 void PreferEmbeddedMetadataWrites() noexcept {
     try {
         EmbeddedMetadataGate& gate = MetadataGate();
@@ -100,6 +115,7 @@ void PreferEmbeddedMetadataWrites() noexcept {
         ++gate.writeInterest;
         gate.cv.notify_all();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"PreferEmbeddedMetadataWrites");
     }
 }
 
@@ -110,6 +126,7 @@ void ReleaseEmbeddedMetadataWritePreference() noexcept {
         if (gate.writeInterest > 0) --gate.writeInterest;
         gate.cv.notify_all();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"ReleaseEmbeddedMetadataWritePreference");
     }
 }
 
@@ -119,6 +136,7 @@ bool EmbeddedMetadataWritePreferred() noexcept {
         std::lock_guard lock(gate.mutex);
         return gate.writeInterest > 0;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"EmbeddedMetadataWritePreferred");
         return true;
     }
 }
@@ -334,31 +352,6 @@ bool SameIdentity(const FileIdentity& left, const FileIdentity& right) {
         left.fileIndexHigh == right.fileIndexHigh && left.fileIndexLow == right.fileIndexLow;
 }
 
-bool FilesAreByteIdentical(const fs::path& left, const fs::path& right) {
-    std::error_code ec;
-    const std::uintmax_t leftSize = fs::file_size(left, ec);
-    if (ec) return false;
-    const std::uintmax_t rightSize = fs::file_size(right, ec);
-    if (ec || leftSize != rightSize) return false;
-
-    std::ifstream a(left, std::ios::binary);
-    std::ifstream b(right, std::ios::binary);
-    if (!a || !b) return false;
-    constexpr std::size_t kBufferSize = 1024 * 1024;
-    std::vector<char> aBuffer(kBufferSize);
-    std::vector<char> bBuffer(kBufferSize);
-    while (a && b) {
-        a.read(aBuffer.data(), static_cast<std::streamsize>(aBuffer.size()));
-        b.read(bBuffer.data(), static_cast<std::streamsize>(bBuffer.size()));
-        const std::streamsize aCount = a.gcount();
-        const std::streamsize bCount = b.gcount();
-        if (aCount != bCount) return false;
-        if (aCount == 0) break;
-        if (!std::equal(aBuffer.begin(), aBuffer.begin() + static_cast<std::size_t>(aCount), bBuffer.begin())) return false;
-    }
-    return a.eof() && b.eof();
-}
-
 std::optional<std::uint64_t> FreeBytes(const fs::path& path) {
     fs::path probe = path;
     std::error_code ec;
@@ -548,11 +541,38 @@ EmbeddedMetadataWriteResult Failure(EmbeddedMetadataFailure failure, std::wstrin
 
 } // namespace
 
+// JPEG fast path: rating/label/pick come from the standard XMP APP1 packet, which
+// always sits in the header segments. One bounded read of the file prefix replaces
+// Exiv2's open + full EXIF/IPTC/XMP (makernote) parse. Any doubt -> nullopt and
+// the caller uses Exiv2 exactly as before.
+static std::optional<EmbeddedMetadataValues> TryReadJpegXmpFast(const fs::path& image) {
+    std::wstring extension = image.extension().wstring();
+    for (wchar_t& c : extension) c = static_cast<wchar_t>(std::towlower(c));
+    if (extension != L".jpg" && extension != L".jpeg" && extension != L".jpe") return std::nullopt;
+    constexpr DWORD kPrefixBytes = 256u * 1024u; // APP segments are <= 64 KB each
+    HANDLE file = CreateFileW(image.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return std::nullopt;
+    thread_local std::vector<std::uint8_t> buffer; // reused per worker thread
+    buffer.resize(kPrefixBytes);
+    DWORD total = 0;
+    while (total < kPrefixBytes) {
+        DWORD read = 0;
+        if (!ReadFile(file, buffer.data() + total, kPrefixBytes - total, &read, nullptr) || read == 0) break;
+        total += read;
+    }
+    CloseHandle(file);
+    return metadata::FastJpegXmpFields(std::span<const std::uint8_t>(buffer.data(), total));
+}
+
 std::optional<EmbeddedMetadataValues> ReadEmbeddedMetadata(const fs::path& image) noexcept {
     try {
         EmbeddedMetadataAccessLease exiv2Lease(false);
+        if (auto fast = TryReadJpegXmpFast(image)) return fast;
         return ReadFromImage(image);
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"ReadEmbeddedMetadata");
         return std::nullopt;
     }
 }
@@ -566,6 +586,231 @@ EmbeddedMetadataWriteResult RetryableFailure(EmbeddedMetadataFailure failure,
 }
 
 constexpr DWORD kReadOnlyAttributeError = 6009; // ERROR_FILE_READ_ONLY
+
+// ---- WriteEmbeddedMetadataAtomic stages (0.9.5.0 round 19: split with no
+// behaviour change). Each stage returns the failure to report, or nullopt to go on.
+namespace {
+
+using AtomicWriteFailure = std::optional<EmbeddedMetadataWriteResult>;
+
+// The locked source must be a normal, writable file with room for the verified copy.
+AtomicWriteFailure CheckLockedSource(const fs::path& image, HANDLE source, DWORD sourceOpenError,
+    FileIdentity& originalIdentity) {
+    if (!FingerprintHandle(source, originalIdentity)) {
+        // A writer holding the file (editor, sync client) refuses our
+        // deny-write open with a sharing violation: retryable.
+        return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
+            L"The image is missing, inaccessible, symbolic, or not a normal file.", sourceOpenError);
+    }
+    const DWORD originalAttributes = GetFileAttributesW(image.c_str());
+    if (originalAttributes == INVALID_FILE_ATTRIBUTES ||
+        (originalAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
+        return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
+            L"The image is read-only or its file attributes could not be verified.",
+            originalAttributes == INVALID_FILE_ATTRIBUTES ? 0 : kReadOnlyAttributeError);
+    }
+    const std::uint64_t required = SaturatingAdd64(
+        static_cast<std::uint64_t>(originalIdentity.size), kMetadataGrowthAllowance);
+    const std::uint64_t requiredWithReserve = SaturatingAdd64(required, kMetadataSafetyReserve);
+    if (const auto available = FreeBytes(image); available && *available < requiredWithReserve) {
+        return Failure(EmbeddedMetadataFailure::LowStorage,
+            L"There is not enough free space for QuickSift's verified temporary image copy.",
+            requiredWithReserve, *available);
+    }
+    return std::nullopt;
+}
+
+// The private copy must be byte-identical to the locked original; its container
+// signature and pixel essence become the immutable baseline.
+AtomicWriteFailure VerifyTemporaryBaseline(HANDLE source, const fs::path& temporary,
+    std::optional<ContainerSignature>& originalSignature,
+    std::optional<std::uint64_t>& originalEssence) {
+    if (!FilesAreByteIdentical(source, temporary)) {
+        return Failure(EmbeddedMetadataFailure::VerificationFailed,
+            L"QuickSift could not verify the temporary image as byte-identical to the locked original object.");
+    }
+    // Establish the immutable image baseline from the verified private copy,
+    // not by reopening the source pathname while it still allows rename.
+    originalSignature = ReadContainerSignature(temporary);
+    originalEssence = PixelEssenceHash(temporary);
+    if (!originalSignature || !originalEssence) {
+        return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
+            L"This image could not be decoded strongly enough to verify unchanged pixel content.");
+    }
+    return std::nullopt;
+}
+
+// Exiv2: check the expected values still match, then apply the patch to the copy.
+AtomicWriteFailure ApplyPatchToTemporaryCopy(const fs::path& temporary,
+    const quicksift::core::MetadataPatch& patch,
+    quicksift::core::PhotoMetadataValues& beforeValues, bool& beforeValuesValid) {
+    try {
+        RegisterQuickSiftNamespace();
+        auto copy = OpenImage(temporary);
+        if (!copy || !copy->good()) {
+            return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
+                L"This image format does not expose a writable embedded XMP container.");
+        }
+        const Exiv2::AccessMode xmpMode = copy->checkMode(Exiv2::mdXmp);
+        if ((static_cast<int>(xmpMode) & static_cast<int>(Exiv2::amWrite)) == 0) {
+            return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
+                L"This image format reports that embedded XMP is not writable.");
+        }
+        copy->readMetadata();
+        Exiv2::XmpData& xmp = copy->xmpData();
+        const quicksift::core::PhotoMetadataValues current = ReadMetadataValues(xmp);
+        beforeValues = current;
+        beforeValuesValid = true;
+        quicksift::core::MetadataFieldId conflict{};
+        if (!quicksift::core::MetadataExpectedMatches(current, patch, &conflict)) {
+            return Failure(EmbeddedMetadataFailure::SourceChanged,
+                std::wstring(L"The image's ") +
+                quicksift::core::MetadataFieldDisplayName(conflict) +
+                L" changed outside QuickSift, so the metadata update was stopped.");
+        }
+        ApplyMetadataPatch(xmp, patch);
+        copy->writeMetadata();
+    } catch (const Exiv2::Error& error) {
+        return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
+            L"This file's metadata container could not be updated safely: " + WideFromUtf8(error.what()));
+    } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"ApplyPatchToTemporaryCopy");
+        return Failure(EmbeddedMetadataFailure::WriteFailed,
+            L"The metadata library could not update the temporary image copy.");
+    }
+    return std::nullopt;
+}
+
+// The updated copy must keep the container and pixel essence and carry the patch.
+AtomicWriteFailure VerifyUpdatedTemporary(const fs::path& temporary,
+    const quicksift::core::MetadataPatch& patch, const ContainerSignature& originalSignature,
+    std::uint64_t originalEssence, std::optional<EmbeddedMetadataValues>& verification) {
+    if (!FlushPath(temporary)) {
+        return Failure(EmbeddedMetadataFailure::WriteFailed,
+            L"Windows could not flush the updated temporary image copy to storage.");
+    }
+    const auto updatedSignature = ReadContainerSignature(temporary);
+    const auto updatedEssence = PixelEssenceHash(temporary);
+    verification = ReadFromImage(temporary);
+    if (!updatedSignature || !SameContainerSignature(originalSignature, *updatedSignature) ||
+        !updatedEssence || *updatedEssence != originalEssence) {
+        return Failure(EmbeddedMetadataFailure::VerificationFailed,
+            L"The temporary image's decoded pixel essence changed during metadata writing.");
+    }
+    if (!verification || !PatchWasApplied(*verification, patch)) {
+        return Failure(EmbeddedMetadataFailure::VerificationFailed,
+            L"The temporary image did not contain the requested metadata after writing.");
+    }
+    return std::nullopt;
+}
+
+// Acquire exact-object publication handles only after Exiv2/WIC have released
+// path-based readers. Both handles deny writers and renamers; publication and
+// rollback are therefore bound to the verified objects, not to mutable pathnames.
+AtomicWriteFailure LockForPublication(const fs::path& image, const fs::path& temporary,
+    ScopedWin32Handle& sourceGuard, const FileIdentity& originalIdentity,
+    ScopedWin32Handle& temporaryPublicationGuard, FileIdentity& temporaryIdentity,
+    ScopedWin32Handle& publicationGuard) {
+    temporaryPublicationGuard.reset(CreateFileW(temporary.c_str(),
+        GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    const DWORD temporaryOpenError =
+        temporaryPublicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    if (!FingerprintHandle(temporaryPublicationGuard.get(), temporaryIdentity)) {
+        // Usually an antivirus / indexer scanning the fresh temporary copy.
+        return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+            L"The verified temporary image could not be locked for publication.", temporaryOpenError);
+    }
+
+    sourceGuard.reset();
+    publicationGuard.reset(CreateFileW(image.c_str(),
+        GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    const DWORD publicationOpenError =
+        publicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    FileIdentity currentIdentity{};
+    if (publicationGuard.get() == INVALID_HANDLE_VALUE) {
+        // Not an identity change: another handle (viewer without
+        // FILE_SHARE_DELETE, sync client, scanner) refused DELETE access.
+        // Nothing has been touched; the write lane retries with backoff.
+        return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
+            L"Another app is using the image, so it could not be locked for publication.",
+            publicationOpenError);
+    }
+    if (!FingerprintHandle(publicationGuard.get(), currentIdentity) ||
+        !SameIdentity(currentIdentity, originalIdentity)) {
+        return Failure(EmbeddedMetadataFailure::SourceChanged,
+            L"The original pathname stopped identifying the source while metadata was being prepared.");
+    }
+    return std::nullopt;
+}
+
+// After publication: the published object must still be the verified temporary
+// object, and the canonical pathname must now name exactly that object.
+bool PublishedObjectVerified(const fs::path& image, HANDLE temporaryPublication,
+    const FileIdentity& temporaryIdentity, ScopedWin32Handle& finalPathGuard) {
+    FileIdentity exactPublishedIdentity{};
+    finalPathGuard.reset(CreateFileW(image.c_str(),
+        GENERIC_READ | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    FileIdentity pathIdentity{};
+    const bool exactFingerprintValid =
+        FingerprintHandle(temporaryPublication, exactPublishedIdentity);
+    const bool exactObjectPreserved = exactFingerprintValid &&
+        exactPublishedIdentity.size == temporaryIdentity.size &&
+        CompareFileTime(&exactPublishedIdentity.lastWrite,
+            &temporaryIdentity.lastWrite) == 0 &&
+        exactPublishedIdentity.volumeSerial == temporaryIdentity.volumeSerial &&
+        exactPublishedIdentity.fileIndexHigh == temporaryIdentity.fileIndexHigh &&
+        exactPublishedIdentity.fileIndexLow == temporaryIdentity.fileIndexLow;
+    return exactObjectPreserved &&
+        FingerprintHandle(finalPathGuard.get(), pathIdentity) &&
+        SameIdentity(exactPublishedIdentity, pathIdentity);
+}
+
+// Verification failed after publication: quarantine the published copy and put
+// the original back (or report where the unchanged original was retained).
+EmbeddedMetadataWriteResult RollBackUnverifiedPublication(ScopedWin32Handle& finalPathGuard,
+    ScopedWin32Handle& temporaryPublicationGuard, ScopedWin32Handle& publicationGuard,
+    quicksift::platform::LockedRenameRequest& quarantineFailed,
+    quicksift::platform::LockedRenameRequest& restoreOriginal, const fs::path& backup) {
+    finalPathGuard.reset();
+    bool canonicalPathCleared =
+        quarantineFailed.Apply(temporaryPublicationGuard.get());
+    if (canonicalPathCleared) {
+        static_cast<void>(quicksift::platform::MarkLockedFileForDeletion(
+            temporaryPublicationGuard.get()));
+    } else if (quicksift::platform::MarkLockedFileForDeletion(
+        temporaryPublicationGuard.get())) {
+        temporaryPublicationGuard.reset();
+        canonicalPathCleared = true;
+    }
+    const bool restored = canonicalPathCleared &&
+        restoreOriginal.Apply(publicationGuard.get());
+    return Failure(EmbeddedMetadataFailure::VerificationFailed, restored ?
+        std::wstring(L"The final published image could not be bound to the verified object, so QuickSift restored the original.") :
+        std::wstring(L"The final image binding failed verification. The unchanged original remains at: ") + backup.wstring());
+}
+
+EmbeddedMetadataWriteResult VerifiedPublicationResult(HANDLE publication,
+    const quicksift::core::PhotoMetadataValues& beforeValues, bool beforeValuesValid,
+    const std::optional<EmbeddedMetadataValues>& verification, const fs::path& backup) {
+    const bool retiredBackup =
+        quicksift::platform::MarkLockedFileForDeletion(publication);
+    EmbeddedMetadataWriteResult result;
+    result.ok = true;
+    result.failure = EmbeddedMetadataFailure::None;
+    if (beforeValuesValid) result.before = beforeValues;
+    if (verification) result.after = *verification;
+    if (!retiredBackup) {
+        result.detail = L"The update is verified, but QuickSift retained the unchanged private backup at: " +
+            backup.wstring();
+    }
+    return result;
+}
+
+} // namespace
 
 EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
     const quicksift::core::MetadataPatch& patch) noexcept {
@@ -584,27 +829,8 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
             nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         const DWORD sourceOpenError = sourceGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
         FileIdentity originalIdentity{};
-        if (!FingerprintHandle(sourceGuard.get(), originalIdentity)) {
-            // A writer holding the file (editor, sync client) refuses our
-            // deny-write open with a sharing violation: retryable.
-            return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
-                L"The image is missing, inaccessible, symbolic, or not a normal file.", sourceOpenError);
-        }
-        const DWORD originalAttributes = GetFileAttributesW(image.c_str());
-        if (originalAttributes == INVALID_FILE_ATTRIBUTES ||
-            (originalAttributes & FILE_ATTRIBUTE_READONLY) != 0) {
-            return RetryableFailure(EmbeddedMetadataFailure::UnsafePath,
-                L"The image is read-only or its file attributes could not be verified.",
-                originalAttributes == INVALID_FILE_ATTRIBUTES ? 0 : kReadOnlyAttributeError);
-        }
-        const std::uint64_t required = SaturatingAdd64(
-            static_cast<std::uint64_t>(originalIdentity.size), kMetadataGrowthAllowance);
-        const std::uint64_t requiredWithReserve = SaturatingAdd64(required, kMetadataSafetyReserve);
-        if (const auto available = FreeBytes(image); available && *available < requiredWithReserve) {
-            return Failure(EmbeddedMetadataFailure::LowStorage,
-                L"There is not enough free space for QuickSift's verified temporary image copy.",
-                requiredWithReserve, *available);
-        }
+        if (auto failure = CheckLockedSource(image, sourceGuard.get(), sourceOpenError, originalIdentity))
+            return *failure;
 
         const fs::path temporary = CreatePrivateTemporaryCopy(image, sourceGuard.get());
         if (temporary.empty()) {
@@ -612,108 +838,25 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
                 L"QuickSift could not create a private temporary image copy beside the original.");
         }
         TemporaryFileGuard cleanup(temporary);
-        if (!FilesAreByteIdentical(sourceGuard.get(), temporary)) {
-            return Failure(EmbeddedMetadataFailure::VerificationFailed,
-                L"QuickSift could not verify the temporary image as byte-identical to the locked original object.");
-        }
-        // Establish the immutable image baseline from the verified private copy,
-        // not by reopening the source pathname while it still allows rename.
-        const auto originalSignature = ReadContainerSignature(temporary);
-        const auto originalEssence = PixelEssenceHash(temporary);
-        if (!originalSignature || !originalEssence) {
-            return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
-                L"This image could not be decoded strongly enough to verify unchanged pixel content.");
-        }
+        std::optional<ContainerSignature> originalSignature;
+        std::optional<std::uint64_t> originalEssence;
+        if (auto failure = VerifyTemporaryBaseline(sourceGuard.get(), temporary,
+                originalSignature, originalEssence)) return *failure;
 
         quicksift::core::PhotoMetadataValues beforeValues;
         bool beforeValuesValid = false;
-        try {
-            RegisterQuickSiftNamespace();
-            auto copy = OpenImage(temporary);
-            if (!copy || !copy->good()) {
-                return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
-                    L"This image format does not expose a writable embedded XMP container.");
-            }
-            const Exiv2::AccessMode xmpMode = copy->checkMode(Exiv2::mdXmp);
-            if ((static_cast<int>(xmpMode) & static_cast<int>(Exiv2::amWrite)) == 0) {
-                return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
-                    L"This image format reports that embedded XMP is not writable.");
-            }
-            copy->readMetadata();
-            Exiv2::XmpData& xmp = copy->xmpData();
-            const quicksift::core::PhotoMetadataValues current = ReadMetadataValues(xmp);
-            beforeValues = current;
-            beforeValuesValid = true;
-            quicksift::core::MetadataFieldId conflict{};
-            if (!quicksift::core::MetadataExpectedMatches(current, patch, &conflict)) {
-                return Failure(EmbeddedMetadataFailure::SourceChanged,
-                    std::wstring(L"The image's ") +
-                    quicksift::core::MetadataFieldDisplayName(conflict) +
-                    L" changed outside QuickSift, so the metadata update was stopped.");
-            }
-            ApplyMetadataPatch(xmp, patch);
-            copy->writeMetadata();
-        } catch (const Exiv2::Error& error) {
-            return Failure(EmbeddedMetadataFailure::UnsupportedFormat,
-                L"This file's metadata container could not be updated safely: " + WideFromUtf8(error.what()));
-        } catch (...) {
-            return Failure(EmbeddedMetadataFailure::WriteFailed,
-                L"The metadata library could not update the temporary image copy.");
-        }
+        if (auto failure = ApplyPatchToTemporaryCopy(temporary, patch, beforeValues, beforeValuesValid))
+            return *failure;
 
-        if (!FlushPath(temporary)) {
-            return Failure(EmbeddedMetadataFailure::WriteFailed,
-                L"Windows could not flush the updated temporary image copy to storage.");
-        }
-        const auto updatedSignature = ReadContainerSignature(temporary);
-        const auto updatedEssence = PixelEssenceHash(temporary);
-        const auto verification = ReadFromImage(temporary);
-        if (!updatedSignature || !SameContainerSignature(*originalSignature, *updatedSignature) ||
-            !updatedEssence || *updatedEssence != *originalEssence) {
-            return Failure(EmbeddedMetadataFailure::VerificationFailed,
-                L"The temporary image's decoded pixel essence changed during metadata writing.");
-        }
-        if (!verification || !PatchWasApplied(*verification, patch)) {
-            return Failure(EmbeddedMetadataFailure::VerificationFailed,
-                L"The temporary image did not contain the requested metadata after writing.");
-        }
+        std::optional<EmbeddedMetadataValues> verification;
+        if (auto failure = VerifyUpdatedTemporary(temporary, patch, *originalSignature,
+                *originalEssence, verification)) return *failure;
 
-        // Acquire exact-object publication handles only after Exiv2/WIC have
-        // released path-based readers. Both handles deny writers and renamers;
-        // publication and rollback are therefore bound to the verified objects,
-        // not to mutable pathnames.
-        ScopedWin32Handle temporaryPublicationGuard(CreateFileW(temporary.c_str(),
-            GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        const DWORD temporaryOpenError =
-            temporaryPublicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        ScopedWin32Handle temporaryPublicationGuard;
         FileIdentity temporaryIdentity{};
-        if (!FingerprintHandle(temporaryPublicationGuard.get(), temporaryIdentity)) {
-            // Usually an antivirus / indexer scanning the fresh temporary copy.
-            return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
-                L"The verified temporary image could not be locked for publication.", temporaryOpenError);
-        }
-
-        sourceGuard.reset();
-        ScopedWin32Handle publicationGuard(CreateFileW(image.c_str(),
-            GENERIC_READ | FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ,
-            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        const DWORD publicationOpenError =
-            publicationGuard.get() == INVALID_HANDLE_VALUE ? GetLastError() : 0;
-        FileIdentity currentIdentity{};
-        if (publicationGuard.get() == INVALID_HANDLE_VALUE) {
-            // Not an identity change: another handle (viewer without
-            // FILE_SHARE_DELETE, sync client, scanner) refused DELETE access.
-            // Nothing has been touched; the write lane retries with backoff.
-            return RetryableFailure(EmbeddedMetadataFailure::WriteFailed,
-                L"Another app is using the image, so it could not be locked for publication.",
-                publicationOpenError);
-        }
-        if (!FingerprintHandle(publicationGuard.get(), currentIdentity) ||
-            !SameIdentity(currentIdentity, originalIdentity)) {
-            return Failure(EmbeddedMetadataFailure::SourceChanged,
-                L"The original pathname stopped identifying the source while metadata was being prepared.");
-        }
+        ScopedWin32Handle publicationGuard;
+        if (auto failure = LockForPublication(image, temporary, sourceGuard, originalIdentity,
+                temporaryPublicationGuard, temporaryIdentity, publicationGuard)) return *failure;
 
         const fs::path backup = UniquePrivateMetadataPath(image, L"backup");
         const fs::path failed = UniquePrivateMetadataPath(image, L"failed");
@@ -748,56 +891,17 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataAtomic(const fs::path& image,
         }
         cleanup.release();
 
-        FileIdentity exactPublishedIdentity{};
-        ScopedWin32Handle finalPathGuard(CreateFileW(image.c_str(),
-            GENERIC_READ | FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_DELETE,
-            nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
-        FileIdentity pathIdentity{};
-        const bool exactFingerprintValid =
-            FingerprintHandle(temporaryPublicationGuard.get(), exactPublishedIdentity);
-        const bool exactObjectPreserved = exactFingerprintValid &&
-            exactPublishedIdentity.size == temporaryIdentity.size &&
-            CompareFileTime(&exactPublishedIdentity.lastWrite,
-                &temporaryIdentity.lastWrite) == 0 &&
-            exactPublishedIdentity.volumeSerial == temporaryIdentity.volumeSerial &&
-            exactPublishedIdentity.fileIndexHigh == temporaryIdentity.fileIndexHigh &&
-            exactPublishedIdentity.fileIndexLow == temporaryIdentity.fileIndexLow;
-        const bool verified = exactObjectPreserved &&
-            FingerprintHandle(finalPathGuard.get(), pathIdentity) &&
-            SameIdentity(exactPublishedIdentity, pathIdentity);
-        if (!verified) {
-            finalPathGuard.reset();
-            bool canonicalPathCleared =
-                quarantineFailed.Apply(temporaryPublicationGuard.get());
-            if (canonicalPathCleared) {
-                static_cast<void>(quicksift::platform::MarkLockedFileForDeletion(
-                    temporaryPublicationGuard.get()));
-            } else if (quicksift::platform::MarkLockedFileForDeletion(
-                temporaryPublicationGuard.get())) {
-                temporaryPublicationGuard.reset();
-                canonicalPathCleared = true;
-            }
-            const bool restored = canonicalPathCleared &&
-                restoreOriginal.Apply(publicationGuard.get());
-            return Failure(EmbeddedMetadataFailure::VerificationFailed, restored ?
-                std::wstring(L"The final published image could not be bound to the verified object, so QuickSift restored the original.") :
-                std::wstring(L"The final image binding failed verification. The unchanged original remains at: ") + backup.wstring());
+        ScopedWin32Handle finalPathGuard;
+        if (!PublishedObjectVerified(image, temporaryPublicationGuard.get(), temporaryIdentity,
+                finalPathGuard)) {
+            return RollBackUnverifiedPublication(finalPathGuard, temporaryPublicationGuard,
+                publicationGuard, quarantineFailed, restoreOriginal, backup);
         }
 
-        const bool retiredBackup =
-            quicksift::platform::MarkLockedFileForDeletion(publicationGuard.get());
-        EmbeddedMetadataWriteResult result;
-        result.ok = true;
-        result.failure = EmbeddedMetadataFailure::None;
-        if (beforeValuesValid) result.before = beforeValues;
-        if (verification) result.after = *verification;
-        if (!retiredBackup) {
-            result.detail = L"The update is verified, but QuickSift retained the unchanged private backup at: " +
-                backup.wstring();
-        }
-        return result;
+        return VerifiedPublicationResult(publicationGuard.get(), beforeValues, beforeValuesValid,
+            verification, backup);
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"WriteEmbeddedMetadataAtomic");
         return Failure(EmbeddedMetadataFailure::WriteFailed,
             L"An unexpected metadata error occurred. QuickSift retained or restored the original image.");
     }
@@ -883,6 +987,7 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataInPlace(const fs::path& image,
                 L"The direct JPEG metadata write failed. Because fast mode edits the original file, verify the image before continuing: " +
                 WideFromUtf8(error.what()));
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Metadata", L"WriteEmbeddedMetadataInPlace");
             return Failure(EmbeddedMetadataFailure::WriteFailed,
                 L"The direct JPEG metadata write failed unexpectedly. Because fast mode edits the original file, verify the image before continuing.");
         }
@@ -912,6 +1017,7 @@ EmbeddedMetadataWriteResult WriteEmbeddedMetadataInPlace(const fs::path& image,
         if (verification) result.after = *verification;
         return result;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"WriteEmbeddedMetadataInPlace [2]");
         return Failure(EmbeddedMetadataFailure::WriteFailed,
             L"An unexpected direct JPEG metadata error occurred. Because fast mode edits the original file, verify it before continuing.");
     }

@@ -34,6 +34,9 @@ import sys
 from pathlib import Path
 
 TRANSLATING_SINKS = ("Tr", "ShowToast", "ShowGlassAlert", "ShowGlassConfirmation", "MakeMenuItem",
+                     # 0.9.5.0: captions registered for relocalization are keys too
+                     # ("Save" in Comments had no Vietnamese entry and was never flagged).
+                     "CreateMainWindowButton",
                      "addCause")
 PRELOCALIZED_SINKS = ("ShowGlassAlertText", "ShowGlassChoice", "ShowToastText", "SetWindowTextW",
                       # 0.9.4.0 UI polish: framework painters and message boxes take

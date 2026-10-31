@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
     [string]$SourceDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -6,6 +6,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Plain-language failure message (scripts\build-failure-help.ps1): every error that
+# stops this script prints "Build failed / What to do / Technical detail" and exits 1.
+. (Join-Path $PSScriptRoot 'build-failure-help.ps1')
+trap {
+    if (Get-Command Write-QuickSiftFailure -ErrorAction SilentlyContinue) {
+        Write-QuickSiftFailure $_ 'Source' ''
+    } else {
+        Write-Host "Build failed: $_" -ForegroundColor Red
+    }
+    exit 1
+}
 $SourceDir = (Resolve-Path $SourceDir).Path
 
 function Read-SourceText([string]$RelativePath) {
@@ -14,6 +26,16 @@ function Read-SourceText([string]$RelativePath) {
         throw "Missing required source file: $RelativePath"
     }
     return [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+}
+
+# The QuickSiftApplicationImpl declaration: the internal header plus the plain state
+# structs it inherits (src\app\state\*.h, 0.9.5.0 round 19).
+function Get-AppInternalText {
+    $Text = Read-SourceText 'src\app\quicksift_application_internal.h'
+    foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src\app\state') -File -Filter '*.h' | Sort-Object Name)) {
+        $Text += "`n" + [IO.File]::ReadAllText($File.FullName, [Text.Encoding]::UTF8)
+    }
+    return $Text
 }
 
 $VersionHeader = Read-SourceText 'src\version.h'
@@ -40,6 +62,7 @@ $RequiredFiles = @(
     'CHANGELOG.md', 'SECURITY.md', 'PRE_RELEASE_CHECKLIST.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE', 'SOURCE_CODE.txt',
     'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', '.vsconfig',
     'build.cmd', 'build-release.cmd', 'build.bat', 'package-msix.bat', 'open-in-visual-studio.cmd',
+    'scripts\build-failure-help.ps1',
     'scripts\build.ps1', 'scripts\package-msix.ps1', 'scripts\verify-source-portable.py',
     'packaging\msix\AppxManifest.xml.in', 'packaging\msix\Assets\StoreLogo.png',
     'packaging\msix\Assets\Square44x44Logo.png', 'packaging\msix\Assets\Square150x150Logo.png',
@@ -106,7 +129,7 @@ if (-not $ApplicationHeaderText.Contains('class QuickSiftApplicationImpl;') -or
     throw 'quicksift_application.h is no longer a thin PIMPL facade.'
 }
 if (-not $ApplicationInternalHeaderText.StartsWith('// OWNER:') -or
-    -not $ApplicationInternalHeaderText.Contains('class QuickSiftApplicationImpl {')) {
+    ([regex]::Matches($ApplicationInternalHeaderText, 'class QuickSiftApplicationImpl\s*(?::[^{]*)?\{')).Count -ne 1) {
     throw 'quicksift_application_internal.h lost its private migration boundary.'
 }
 
@@ -283,10 +306,12 @@ $ReleaseWorkerText = (Read-SourceText 'src\work\background_work_engine.cpp') +
 $GraphicsCacheText = Read-SourceText 'src\ui\graphics_resources_and_image_cache.cpp'
 $CanvasRenderingText = Read-SourceText 'src\ui\canvas_rendering_and_overlays.cpp'
 $ReleaseCatalogIntegrationText = Read-SourceText 'src\ui\catalog_loading_and_result_integration.cpp'
-$ReleaseAppInternalText = Read-SourceText 'src\app\quicksift_application_internal.h'
+$ReleaseAppInternalText = Get-AppInternalText
 foreach ($Token in @('Load only JPG previews for RAW', 'ID_SETTING_RAW_JPEG_PREVIEWS_ONLY',
         'SetRawJpegPreviewOnly', 'LoadOnlyRawJpegPreviews')) {
-    if (-not (($ReleaseSettingsText + $SessionControllerText + $ReleaseWorkerHeaderText).Contains($Token))) {
+    # The caption lives in the pane control catalog (the old Settings popup menu was dead code).
+    if (-not (($ReleaseSettingsText + $SessionControllerText + $ReleaseWorkerHeaderText +
+            (Read-SourceText 'src\ui\ui_control_catalog.h')).Contains($Token))) {
         throw "RAW JPG-preview-only setting contract is missing: $Token"
     }
 }
@@ -349,14 +374,21 @@ foreach ($Token in @('FileOperationStatusLine', 'complete files', 'minutes remai
 if (-not (($ApplicationSupportHeaderText + $NavigationTimerText + $ReleaseSettingsText).Contains('ID_TIMER_FILE_PROGRESS'))) {
     throw 'File-operation status line lacks a bounded UI refresh timer.'
 }
-foreach ($Token in @('File operations are still running', 'Close anyway', 'L"Wait"',
-        'CloseWithPendingOperations', 'closingAfterTransactionCancellation_')) {
-    if (-not (($ChromeText + $CanvasRenderingText + $ReleaseAppInternalText).Contains($Token))) {
+# 0.9.5.0: close goes through the live blocking-wait dialog (Force quit / Wait).
+$BlockingWaitUiText = Read-SourceText 'src\ui\blocking_wait_controller.cpp'
+foreach ($Token in @('ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::Close)', 'Force quit', 'L"Wait"',
+        'BlockingWaitPrimary', 'closingAfterTransactionCancellation_', 'force_quit_abandoned')) {
+    if (-not (($ChromeText + $CanvasRenderingText + $ReleaseAppInternalText + $BlockingWaitUiText).Contains($Token))) {
         throw "Pending-file-operation close confirmation is missing: $Token"
     }
 }
-if (-not $CanvasRenderingText.Contains('transactions_.RequestCloseAtSafeBoundary()')) {
-    throw 'Close anyway does not cancel transactions at a safe boundary.'
+# Force quit (the only close-with-pending-work path) stops transactions at a safe
+# boundary; the never-raised CloseWithPendingOperations alert was removed in round 18.
+if (-not $BlockingWaitUiText.Contains('transactions_.RequestCloseAtSafeBoundary()')) {
+    throw 'Force quit does not cancel transactions at a safe boundary.'
+}
+if (($ApplicationSupportHeaderText + $CanvasRenderingText).Contains('CloseWithPendingOperations')) {
+    throw 'The dead CloseWithPendingOperations alert action must not come back (close goes through the blocking-wait dialog).'
 }
 $HistoryUiText = Read-SourceText 'src\ui\metadata_history_and_file_safety.cpp'
 $HistoryReconcileText = $HistoryUiText + $CanvasRenderingText + $ApplicationSupportHeaderText + $ReleaseSettingsText
@@ -632,7 +664,7 @@ $ReviewAsyncText = (Read-SourceText 'src\review\review_async_policy.cpp') +
 $ViewTransformText = Read-SourceText 'src\review\view_transform_policy.cpp'
 $ViewStateText = Read-SourceText 'src\ui\view_state_controller.cpp'
 $NavigationText = Read-SourceText 'src\ui\navigation_input_and_session.cpp'
-$AppInternalText = Read-SourceText 'src\app\quicksift_application_internal.h'
+$AppInternalText = Get-AppInternalText
 $WorkerText = Read-SourceText 'src\work\background_work_engine.cpp'
 $FacePolicyText = Read-SourceText 'src\core\face_policy.cpp'
 foreach ($Token in @('ZoomViewAt', 'PanView', 'physicalScale',
@@ -738,7 +770,7 @@ foreach ($Token in @('GetCurrentPackageFullName', 'GetCurrentPackageFamilyName',
         'Never fall back to the executable directory for a packaged process')) {
     if (-not $DataPathText.Contains($Token)) { throw "Portable/MSIX data-root contract is missing: $Token" }
 }
-foreach ($Token in @('kRetainedSessionLogs = 20', 'ProbeDirectoryWriteAccess', 'PruneSessionLogs',
+foreach ($Token in @('CleanupOldDiagnosticFiles', 'core/log_retention.h', 'ProbeDirectoryWriteAccess',
         'platform::DataRootPath()', 'platform::CacheDirectoryPath()')) {
     if (-not $DiagnosticText.Contains($Token)) { throw "Diagnostic data-root/retention contract is missing: $Token" }
 }
@@ -824,6 +856,569 @@ if (-not $ThumbnailRequestText.Contains('reviewState_.Epochs().thumbnailViewport
 $ThumbnailLayoutText = Read-SourceText 'src\review\thumbnail_layout.cpp'
 foreach ($Token in @('cellHeight', 'HitTestThumbnail', 'ScrollToRevealThumbnail', 'ScrollToCenterThumbnail')) {
     if (-not $ThumbnailLayoutText.Contains($Token)) { throw "Shared thumbnail-layout contract is missing: $Token" }
+}
+
+# --- Parity with scripts/verify-source-portable.py (0.9.5.0 rounds 1-11) ---------
+function Remove-CppComments([string]$Text) {
+    # Line and block comments only; string literals are preserved (sufficient for token rules).
+    $NoBlock = [regex]::Replace($Text, '/\*.*?\*/', ' ', 'Singleline')
+    return [regex]::Replace($NoBlock, '(?m)//.*$', '')
+}
+function Get-FunctionBody([string]$Text, [string]$Signature) {
+    $Start = $Text.IndexOf($Signature)
+    if ($Start -lt 0) { throw "Missing function: $Signature" }
+    $Open = $Text.IndexOf('{', $Start)
+    if ($Open -lt 0) { throw "Missing function body: $Signature" }
+    $Depth = 0
+    for ($Index = $Open; $Index -lt $Text.Length; $Index++) {
+        $Char = $Text[$Index]
+        if ($Char -eq '{') { $Depth++ }
+        elseif ($Char -eq '}') { $Depth--; if ($Depth -eq 0) { return $Text.Substring($Open, $Index - $Open + 1) } }
+    }
+    throw "Unterminated function body: $Signature"
+}
+
+# Theme/language are loaded before any window class or window exists (no dark flash).
+$RunBody = Get-FunctionBody (Read-SourceText 'src\app\quicksift_application.cpp') 'int QuickSiftApplicationImpl::Run('
+$EarlyIndex = $RunBody.IndexOf('LoadEarlyPresentationSettings()')
+$RegisterIndex = $RunBody.IndexOf('RegisterClasses()')
+$CreateIndex = $RunBody.IndexOf('CreateMainWindow(')
+if ($EarlyIndex -lt 0 -or -not ($EarlyIndex -lt $RegisterIndex -and $RegisterIndex -lt $CreateIndex)) {
+    throw 'Theme/language must be loaded (LoadEarlyPresentationSettings) before any window class or window is created.'
+}
+
+# Central relocalize pass.
+$ControlsPaintText = Read-SourceText 'src\ui\main_window_controls_layout_and_painting.cpp'
+if (-not (Get-FunctionBody $ControlsPaintText 'bool QuickSiftApplicationImpl::CreateMainWindowButton(').Contains('controlTextKeys_[id]')) {
+    throw 'CreateMainWindowButton must register every caption for the relocalize pass.'
+}
+$ThemeLocalizationText = Read-SourceText 'src\ui\app_theme_documents_and_localization.cpp'
+$RelocalizeBody = Get-FunctionBody $ThemeLocalizationText 'void QuickSiftApplicationImpl::RefreshLocalizedText('
+foreach ($Token in @('controlTextKeys_', 'LayoutControls(', 'RefreshOpenDocumentWindows()', 'UpdateBlockingWaitDialog()',
+        'userCommentLabel_', 'settingsSectionLabels_', 'InvalidateCanvas()')) {
+    if (-not $RelocalizeBody.Contains($Token)) { throw "Central relocalize pass does not cover $Token" }
+}
+$AllSourceFiles = Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src') -Recurse -File -Filter '*.cpp'
+$AllSourceText = ($AllSourceFiles | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+$UpdateButtons = [regex]::Matches($AllSourceText, 'void QuickSiftApplicationImpl::(Update\w+Button)\(\)') |
+    ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+foreach ($Name in $UpdateButtons) {
+    if (-not $RelocalizeBody.Contains("$Name()")) { throw "Central relocalize pass does not refresh $Name" }
+}
+
+# Shared custom-drawn checkbox style; no native Win32 checkboxes.
+foreach ($File in $AllSourceFiles) {
+    if ((Remove-CppComments ([IO.File]::ReadAllText($File.FullName))) -match '\bBS_(AUTO)?CHECKBOX\b') {
+        throw "$($File.FullName): native Win32 checkbox; use the shared custom-drawn PaintCheckbox style."
+    }
+}
+
+# Theme switch redraws everything, including the closed-rail indicator.
+$ApplyThemeBody = Get-FunctionBody $ThemeLocalizationText 'void QuickSiftApplicationImpl::ApplyTheme('
+foreach ($Token in @('flyoutBackdrop_', 'RDW_ALLCHILDREN')) {
+    if (-not $ApplyThemeBody.Contains($Token)) { throw "ApplyTheme does not redraw $Token" }
+}
+
+# Every dropdown anchor draws the popup chevron (single registry).
+$CommandIdsText = Read-SourceText 'src\ui\ui_command_ids.h'
+$RegistryMatch = [regex]::Match($CommandIdsText, 'kPopupMenuButtonIds\{(.*?)\};', 'Singleline')
+$RegisteredIds = @()
+if ($RegistryMatch.Success) { $RegisteredIds = [regex]::Matches($RegistryMatch.Groups[1].Value, 'ID_[A-Z0-9_]+') | ForEach-Object { $_.Value } }
+foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src\ui') -Recurse -File -Filter '*.cpp')) {
+    $Code = Remove-CppComments ([IO.File]::ReadAllText($File.FullName))
+    foreach ($Match in [regex]::Matches($Code, 'TrackDropdownMenu\(controls_\[(ID_[A-Z0-9_]+)\]')) {
+        if ($RegisteredIds -notcontains $Match.Groups[1].Value) {
+            throw "$($Match.Groups[1].Value) opens a dropdown but is missing from kPopupMenuButtonIds (no chevron)."
+        }
+    }
+}
+
+# Filter menus: no UI-thread I/O, incremental FilterValues() index.
+$FiltersCode = Remove-CppComments (Read-SourceText 'src\ui\settings_filters_and_file_commands.cpp')
+$HydrateMatch = [regex]::Match($FiltersCode, 'HydrateMetadataForFilters\(\)\s*\{(.*?)\n    \}', 'Singleline')
+if (-not $HydrateMatch.Success) { throw 'HydrateMetadataForFilters is missing.' }
+if ($HydrateMatch.Groups[1].Value -match 'CreateFileW|ReadFile|ReadExifHeaderFacts|LookupCameraSettings|UpdateCameraSettings') {
+    throw 'HydrateMetadataForFilters performs I/O on the UI thread; queue it with QueueFactHydration.'
+}
+if (-not $FiltersCode.Contains('FilterValues().')) { throw 'Filter menus must read the incremental CatalogStore::FilterValues() index.' }
+if ($FiltersCode -match '(?s)Show(Iso|Aperture|Focal|Shutter|Camera|Hour|Date)FilterMenu\(\)\s*\{[^}]*?PhotoCount\(\)') {
+    throw 'A filter menu scans the whole catalog; use CatalogStore::FilterValues().'
+}
+foreach ($Token in @('camera_settings_known', 'LookupCameraSettings', 'UpdateCameraSettings')) {
+    if (-not $AllSourceText.Contains($Token)) { throw "Persistent cache camera-settings contract is missing: $Token" }
+}
+
+# Deterministic check programs (see TESTING.md).
+foreach ($Check in @('animation_checks', 'batch_match_checks', 'design_tokens_checks', 'face_interaction_checks',
+        'face_policy_checks', 'filter_index_and_queue_checks', 'hydrated_facts_checks', 'jpeg_xmp_checks',
+        'localization_checks', 'lock_order_checks', 'metadata_progress_checks', 'metadata_store_checks',
+        'overlay_and_frost_checks', 'priority_policy_checks', 'ratings_exchange_checks', 'raw_preview_checks',
+        'search_query_checks', 'thumbnail_layout_checks', 'ui_state_checks', 'write_lane_checks',
+        'sidecar_write_checks', 'lifecycle_checks', 'view_load_checks', 'filmstrip_checks')) {
+    [void](Read-SourceText "scripts\checks\$Check.cpp")
+}
+foreach ($Relative in @('src\core\blocking_wait.cpp', 'src\core\blocking_wait.h', 'src\core\presentation_settings.h',
+        'src\core\hud_snapshot.h', 'src\core\pane_scroll_policy.h', 'src\core\sidecar_write_policy.h', 'src\core\metadata_gate_policy.h', 'src\core\metadata_lane_policy.h', 'src\core\metadata_progress.h',
+        'src\ui\blocking_wait_controller.cpp', 'scripts\check-localization.py')) {
+    [void](Read-SourceText $Relative)
+    if (-not $CMakeText.Contains($Relative.Replace('\', '/')) -and $Relative.StartsWith('src')) {
+        throw "CMake does not list $Relative"
+    }
+}
+
+# 0.9.5.0 round 16: no paint at unscrolled layout rects; vacated rects repainted;
+# overflow tooltip is a self-painted, mouse-transparent framework popup.
+$PaneScrollText = Remove-CppComments $ControlsPaintText
+# Round 19: LayoutControls' section helpers sit directly above it, starting at
+# PlacePaneChild; the pre-scroll window covers them and LayoutControls.
+$LayoutStart = $PaneScrollText.IndexOf('void QuickSiftApplicationImpl::PlacePaneChild(')
+$LayoutRest = $PaneScrollText.Substring($LayoutStart)
+$LayoutCut = $LayoutRest.IndexOf('closeFlyoutLayout();')
+$LayoutBodyText = $LayoutRest.Substring(0, $LayoutCut)
+if ($LayoutBodyText.Contains('UpdateLanguageSelectorButton(') -or
+    [regex]::IsMatch($LayoutBodyText, '\bSetWindowTextW\s*\(\s*(?!filmstripToggle_\b)') -or
+    [regex]::IsMatch($LayoutBodyText, '\b(?:UpdateWindow|RDW_UPDATENOW)\b')) {
+    throw 'LayoutControls must not repaint pane children at their unscrolled layout rects (no SetWindowTextW/UpdateWindow/RDW_UPDATENOW before ApplyPaneScroll).'
+}
+$AfterLayout = $LayoutRest.Substring($LayoutCut)
+if (-not $AfterLayout.Substring(0, [Math]::Min(400, $AfterLayout.Length)).Contains('ApplyPaneScroll(flyout)')) {
+    throw 'LayoutControls must apply the pane scroll right after the section layout.'
+}
+$RepositionBody = Remove-CppComments (Get-FunctionBody $ControlsPaintText 'void QuickSiftApplicationImpl::RepositionPaneScroll(')
+if ([regex]::Matches($RepositionBody, 'InvalidateUnderHiddenPaneChild\(').Count -lt 2) {
+    throw 'RepositionPaneScroll must invalidate the vacated rect on every move and hide.'
+}
+if (-not (Remove-CppComments (Get-FunctionBody $ControlsPaintText 'void QuickSiftApplicationImpl::HideLeftPaneSectionContentExcept(')).Contains('InvalidateUnderHiddenPaneChild(')) {
+    throw 'Hiding a pane child must repaint what was under it.'
+}
+if (-not (Remove-CppComments (Get-FunctionBody $ControlsPaintText 'void QuickSiftApplicationImpl::ApplyPaneScroll(')).Contains('InvalidateUnderHiddenPaneChild(')) {
+    throw 'ApplyPaneScroll must repaint the area under children laid out outside the viewport.'
+}
+if (-not (Remove-CppComments (Get-FunctionBody (Read-SourceText 'src\ui\popup_menus_commands_and_folder_tree.cpp') 'void QuickSiftApplicationImpl::UpdateLanguageSelectorButton(')).Contains('wcscmp')) {
+    throw 'UpdateLanguageSelectorButton must only set the caption when it changes.'
+}
+$GdiText = Read-SourceText 'src\ui\framework\macos_ui_framework_gdi.cpp'
+$FrameworkCoreText = Read-SourceText 'src\ui\framework\macos_ui_framework.cpp'
+$OverflowCreate = Remove-CppComments (Get-FunctionBody $GdiText 'HWND MacOsUiFramework::CreateOverflowTooltip(')
+if ($OverflowCreate.Contains('TOOLTIPS_CLASS') -or -not $OverflowCreate.Contains('WS_EX_TRANSPARENT')) {
+    throw "The overflow tooltip must be the framework's own mouse-transparent popup."
+}
+if (-not (Remove-CppComments $GdiText).Contains('HTTRANSPARENT')) { throw 'The overflow tooltip window must be hit-test transparent.' }
+foreach ($TipEvent in @('hover-enter', 'armed', 'timer-fired', 'shown', 'hidden', 'marked-truncated', 'show-skipped')) {
+    if (-not ($GdiText.Contains("L`"$TipEvent`"") -or $FrameworkCoreText.Contains("L`"$TipEvent`""))) {
+        throw "Overflow tooltip trace event is missing: $TipEvent"
+    }
+}
+
+# 0.9.5.0 round 18: the first pane paint froze for seconds because the sidebar tab
+# label was GDI+ text (Gdiplus::Font from a family name loads GDI+'s whole installed-font
+# collection on first use). No GDI+ text anywhere; [Pane] timing stays wired in.
+foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src') -Recurse -File -Include '*.cpp','*.h')) {
+    $Text = Remove-CppComments ([System.IO.File]::ReadAllText($File.FullName))
+    if ([regex]::IsMatch($Text, '\bGdiplus::(?:Font|FontFamily|InstalledFontCollection|PrivateFontCollection)\b') -or
+        [regex]::IsMatch($Text, '\.\s*(?:DrawString|MeasureString)\s*\(')) {
+        throw "GDI+ text is not allowed (first use loads every installed font on the UI thread): $($File.Name)"
+    }
+}
+$SidebarTabBody = Remove-CppComments (Get-FunctionBody $GdiText 'void MacOsUiFramework::PaintSidebarTab(')
+if (-not ($SidebarTabBody.Contains('SidebarTabFont(') -and $SidebarTabBody.Contains('DrawTextW('))) {
+    throw 'PaintSidebarTab must draw its label with GDI and the cached SidebarTabFont.'
+}
+foreach ($PaneEvent in @('pane_open', 'pane_reveal', 'pane_first_paint', 'pane_frost_capture', 'pane_slow_paint')) {
+    if (-not $ControlsPaintText.Contains("L`"$PaneEvent`"")) { throw "[Pane] timing event is missing: $PaneEvent" }
+}
+if (-not (Get-AppInternalText).Contains('core/pane_timing.h')) {
+    throw 'The [Pane] timing recorder (core/pane_timing.h) must stay wired in.'
+}
+
+# 0.9.5.0 round 19: app-owned worker threads (ratings, batch, search, deferred startup)
+# carry a shutdown token, wake the UI only through PostFromWorker, and are all joined by
+# StopAllWorkersForTeardown before the persistent cache closes (normal close and Force quit).
+foreach ($Folder in @('src\app', 'src\ui')) {
+    foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir $Folder) -Recurse -File -Filter '*.cpp')) {
+        $Text = Remove-CppComments ([System.IO.File]::ReadAllText($File.FullName))
+        foreach ($Match in [regex]::Matches($Text, 'std::thread\s*\(\s*\[([^\]]*)\]')) {
+            $Captures = $Match.Groups[1].Value
+            if ([regex]::IsMatch($Captures, '(?<![\w.])this\b') -and -not $Captures.Contains('token = workerLifetime_.Issue()')) {
+                throw "Worker thread captures this without a shutdown token: $($File.Name)"
+            }
+        }
+        if ([regex]::IsMatch($Text, 'PostMessageW\s*\([^;]*WM_APP_(?:RATINGS_WORKER_DONE|BATCH_WORKER_DONE|SEARCH_WORKER|STARTUP_READY)\b')) {
+            throw "Worker completion must be posted through PostFromWorker: $($File.Name)"
+        }
+    }
+}
+$LifetimeAppText = Remove-CppComments (Read-SourceText 'src\app\quicksift_application.cpp')
+$StopAllBody = Get-FunctionBody $LifetimeAppText 'void QuickSiftApplicationImpl::StopAllWorkersForTeardown('
+foreach ($Token in @('workerLifetime_.Revoke()', 'deferredStartupThread_.join()', 'StopRatingsWorker()', 'StopBatchWorker()', 'StopSearchWorker()')) {
+    if (-not $StopAllBody.Contains($Token)) { throw "StopAllWorkersForTeardown is missing: $Token" }
+}
+if ($StopAllBody.IndexOf('workerLifetime_.Revoke()') -gt $StopAllBody.IndexOf('deferredStartupThread_.join()')) {
+    throw 'StopAllWorkersForTeardown must revoke the worker token before joining.'
+}
+if (-not (Get-FunctionBody $LifetimeAppText 'QuickSiftApplicationImpl::~QuickSiftApplicationImpl(').Contains('StopAllWorkersForTeardown()')) {
+    throw 'The application destructor must stop all workers.'
+}
+if (-not (Get-FunctionBody $LifetimeAppText 'bool QuickSiftApplicationImpl::PostFromWorker(').Contains('RunIfAlive')) {
+    throw 'PostFromWorker must post only while the worker token is alive.'
+}
+$LifetimeChromeText = Remove-CppComments (Read-SourceText 'src\ui\main_window_chrome_and_messages.cpp')
+# Round 19: WM_DESTROY delegates to OnMainWindowDestroyed, which joins every app
+# worker before StopServicesForShutdown closes the persistent cache.
+$DestroyAt = $LifetimeChromeText.IndexOf('case WM_DESTROY: {')
+$DestroyCase = if ($DestroyAt -ge 0) { $LifetimeChromeText.Substring($DestroyAt, [Math]::Min(120, $LifetimeChromeText.Length - $DestroyAt)) } else { '' }
+$DestroyedBody = Get-FunctionBody $LifetimeChromeText 'void QuickSiftApplicationImpl::OnMainWindowDestroyed('
+$ServicesBody = Get-FunctionBody $LifetimeChromeText 'void QuickSiftApplicationImpl::StopServicesForShutdown('
+$StopAt = $DestroyedBody.IndexOf('StopAllWorkersForTeardown()')
+$ServicesAt = $DestroyedBody.IndexOf('StopServicesForShutdown()')
+if ($DestroyAt -lt 0 -or -not $DestroyCase.Contains('OnMainWindowDestroyed()') -or $StopAt -lt 0 -or $ServicesAt -lt 0 -or
+    $StopAt -gt $ServicesAt -or -not $ServicesBody.Contains('persistentCache_.CloseForShutdown()') -or
+    $DestroyedBody.Contains('persistentCache_.CloseForShutdown()')) {
+    throw 'WM_DESTROY (normal close and Force quit) must stop all workers before the cache closes.'
+}
+$SearchLoopBody = Get-FunctionBody (Remove-CppComments (Read-SourceText 'src\ui\thumbnail_search_controller.cpp')) 'void QuickSiftApplicationImpl::SearchWorkerLoop('
+if ([regex]::IsMatch($SearchLoopBody, '\bhwnd_\b')) { throw 'SearchWorkerLoop runs on the worker thread and must not read hwnd_.' }
+$DeferredBody = Get-FunctionBody $LifetimeAppText 'void QuickSiftApplicationImpl::StartDeferredStartup('
+$DeferredLambda = $DeferredBody.Substring($DeferredBody.IndexOf('std::thread'))
+if ([regex]::IsMatch($DeferredLambda.Substring($DeferredLambda.IndexOf(']')), '\bhwnd_\b')) {
+    throw 'The deferred startup worker must not read hwnd_.'
+}
+[void](Read-SourceText 'scripts\checks\lifecycle_checks.cpp')
+[void](Read-SourceText 'src\core\worker_lifetime.h')
+
+# 0.9.5.0 round 19: diagnostic files older than 7 days are deleted on a background-priority
+# thread: only QuickSift's own names in its own two folders, never the current session log,
+# never a reparse point, never recursive, every deletion logged.
+$RetentionPolicyText = Read-SourceText 'src\core\log_retention.h'
+foreach ($Token in @('kMaxAge{ 24 * 7 }', 'Skip::CurrentSession', 'Skip::ReparsePoint', 'Skip::NotOurs', 'Skip::WrongFolder')) {
+    if (-not $RetentionPolicyText.Contains($Token)) { throw "Diagnostic retention policy is missing: $Token" }
+}
+$RetentionLogText = Remove-CppComments (Read-SourceText 'src\diagnostics\diagnostic_log.cpp')
+$CleanupBody = Get-FunctionBody $RetentionLogText 'CleanupSummary CleanupOldDiagnosticFiles('
+foreach ($Token in @('lr::Plan(', 'SessionLogPath()', 'DeleteOwnDiagnosticFile(', 'L"old_file_deleted"', 'L"cleanup_complete"', 'cancelled()')) {
+    if (-not $CleanupBody.Contains($Token)) { throw "Diagnostic cleanup is missing: $Token" }
+}
+if ($CleanupBody.Contains('DeleteFileW') -or $CleanupBody.Contains('fs::remove')) {
+    throw 'Diagnostic cleanup must delete only through DeleteOwnDiagnosticFile (handle re-check, no link following).'
+}
+$DeleterBody = Get-FunctionBody $RetentionLogText 'DeleteOutcome DeleteOwnDiagnosticFile('
+foreach ($Token in @('FILE_FLAG_OPEN_REPARSE_POINT', 'FILE_ATTRIBUTE_REPARSE_POINT', 'kMaxAge', 'FileDispositionInfo')) {
+    if (-not $DeleterBody.Contains($Token)) { throw "DeleteOwnDiagnosticFile is missing: $Token" }
+}
+if (-not (Get-FunctionBody $RetentionLogText 'bool ListRetentionCandidates(').Contains('FILE_ATTRIBUTE_REPARSE_POINT')) {
+    throw 'Diagnostic cleanup must skip a Logs/CrashReports folder that is a reparse point.'
+}
+foreach ($Forbidden in @('recursive_directory_iterator', 'remove_all', 'SHFileOperation')) {
+    if ($RetentionLogText.Contains($Forbidden)) { throw "Diagnostic cleanup must never recurse or bulk-delete: $Forbidden" }
+}
+$CleanupStartBody = Get-FunctionBody $LifetimeAppText 'void QuickSiftApplicationImpl::StartDiagnosticsCleanup('
+foreach ($Token in @('THREAD_MODE_BACKGROUND_BEGIN', 'CleanupOldDiagnosticFiles', 'token.StopRequested()')) {
+    if (-not $CleanupStartBody.Contains($Token)) { throw "Diagnostic cleanup must run on a cancellable background-priority thread: $Token" }
+}
+if (-not $DeferredBody.Contains('StartDiagnosticsCleanup()')) { throw 'Diagnostic cleanup must start after the first frame (StartDeferredStartup).' }
+if (-not $StopAllBody.Contains('diagnosticsCleanupThread_.join()')) { throw 'Teardown must join the diagnostic cleanup thread.' }
+$HelpLocalizationText = Read-SourceText 'src\localization.cpp'
+if (-not ($HelpLocalizationText.Contains('older than 7 days') -and $HelpLocalizationText.Contains('cũ hơn 7 ngày'))) {
+    throw 'Help (EN and VI) must describe the 7-day diagnostic cleanup.'
+}
+if (-not (Read-SourceText 'USER_GUIDE.md').Contains('older than 7 days')) { throw 'USER_GUIDE.md must describe the 7-day diagnostic cleanup.' }
+[void](Read-SourceText 'src\core\log_retention.h')
+
+# 0.9.5.0 round 19: the Direct2D image-source cache (wicImageSources_) was never drawn from;
+# it stays gone. The Shell fallback owns its WIC factory creation.
+foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src') -Recurse -File -Include '*.cpp','*.h')) {
+    $Text = Remove-CppComments ([System.IO.File]::ReadAllText($File.FullName))
+    foreach ($Token in @('wicImageSources_', 'WicImageSourceEntry', 'GetOrCreateWicImageSource', 'DrawWicImageSourceFit',
+            'ClearWicImageSources', 'CreateImageSourceFromWic', 'ID2D1ImageSourceFromWic')) {
+        if ([regex]::IsMatch($Text, "\b$Token\b")) { throw "The removed Direct2D image-source cache is back ($Token): $($File.Name)" }
+    }
+}
+$ShellFallbackBody = Remove-CppComments (Get-FunctionBody (Read-SourceText 'src\ui\graphics_resources_and_image_cache.cpp') 'ComPtr<ID2D1Bitmap> QuickSiftApplicationImpl::GetOrCreateShellFallback(')
+$FactoryAt = $ShellFallbackBody.IndexOf('CoCreateInstance(CLSID_WICImagingFactory')
+if ($FactoryAt -lt 0 -or $FactoryAt -gt $ShellFallbackBody.IndexOf('GetImage(')) {
+    throw 'The Shell fallback must create its WIC factory before calling GetImage.'
+}
+
+# 0.9.5.0 round 19: LayoutControls re-lays the title bar only when one of its inputs changed
+# (TitleLayoutKey) or it was marked dirty (DPI, fonts, language, theme).
+$TitleHeaderText = Read-SourceText 'src\app\quicksift_application_internal.h'
+$TitleKeyText = $TitleHeaderText.Substring($TitleHeaderText.IndexOf('struct TitleLayoutKey {'))
+$TitleKeyText = $TitleKeyText.Substring(0, $TitleKeyText.IndexOf("`n    };"))
+foreach ($Token in @('int width', 'UINT dpi', 'bool fullscreen', 'bool fullscreenTitleVisible', 'bool singleOrCompare', 'AppTheme theme', 'widths', 'operator==')) {
+    if (-not $TitleKeyText.Contains($Token)) { throw "TitleLayoutKey is missing an input: $Token" }
+}
+$TitleLayoutText = Read-SourceText 'src\ui\main_window_controls_layout_and_painting.cpp'
+$TitleBody = Remove-CppComments (Get-FunctionBody $TitleLayoutText 'void QuickSiftApplicationImpl::LayoutTitleControls(')
+foreach ($Token in @('CurrentTitleLayoutKey(width)', 'titleLayoutApplied_ == key', 'titleLayoutDirty_', 'key.fullscreen', 'key.widths')) {
+    if (-not $TitleBody.Contains($Token)) { throw "LayoutTitleControls skip guard is missing: $Token" }
+}
+if ($TitleBody.Contains('MeasuredTitleButtonWidthsPx()')) { throw 'LayoutTitleControls must use the widths measured into its TitleLayoutKey.' }
+if (-not (Get-FunctionBody $TitleLayoutText 'QuickSiftApplicationImpl::CurrentTitleLayoutKey(').Contains('MeasuredTitleButtonWidthsPx()')) {
+    throw 'TitleLayoutKey must include the measured caption widths.'
+}
+$GuardedControlsBody = Remove-CppComments (Get-FunctionBody $TitleLayoutText 'void QuickSiftApplicationImpl::LayoutControls(')
+if (-not [regex]::IsMatch($GuardedControlsBody, 'LayoutTitleControls\(width,\s*false\)')) {
+    throw 'LayoutControls must call the guarded LayoutTitleControls(width, false).'
+}
+foreach ($Pair in @(@('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::OnDpiChanged('),
+        @('src\ui\app_theme_documents_and_localization.cpp', 'void QuickSiftApplicationImpl::RefreshLocalizedText('),
+        @('src\ui\app_theme_documents_and_localization.cpp', 'void QuickSiftApplicationImpl::ApplyTheme('),
+        @('src\ui\main_window_chrome_and_messages.cpp', 'void QuickSiftApplicationImpl::RecreateUiFonts('))) {
+    if (-not (Get-FunctionBody (Read-SourceText $Pair[0]) $Pair[1]).Contains('MarkTitleLayoutDirty()')) {
+        throw "$($Pair[1]) must mark the title layout dirty."
+    }
+}
+
+# 0.9.5.0 round 19: QuickSiftApplicationImpl's plain state lives in cohesive structs
+# (src\app\state\*.h) inherited privately; data only (no methods, no COM objects).
+$StateHeaderText = Read-SourceText 'src\app\quicksift_application_internal.h'
+$StateStructs = @('ChromeState', 'PaneState', 'ViewerState', 'BrowseState', 'MetadataState', 'RatingsExchangeState', 'BatchState', 'SearchState', 'HudState', 'SessionLogBrowserState')
+foreach ($Name in $StateStructs) {
+    if (-not $StateHeaderText.Contains("private state::$Name")) { throw "QuickSiftApplicationImpl must inherit state::$Name privately." }
+}
+$FoundStateStructs = @()
+foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src\app\state') -File -Filter '*.h')) {
+    $Text = Remove-CppComments ([IO.File]::ReadAllText($File.FullName))
+    foreach ($Match in [regex]::Matches($Text, '(?m)^struct (\w+State) \{')) { $FoundStateStructs += $Match.Groups[1].Value }
+    if ($Text.Contains('ComPtr<')) { throw "COM objects stay in QuickSiftApplicationImpl (release order): $($File.Name)" }
+    foreach ($Line in ($Text -split "`n")) {
+        if ([regex]::IsMatch($Line, '^\s+(?:static\s+)?[\w:<>,\s*&]+\s+[A-Z]\w*\([^)]*\)\s*(?:const)?\s*(?:noexcept)?\s*;\s*$')) {
+            throw "State structs hold data only (method declared): $($File.Name): $($Line.Trim())"
+        }
+    }
+    if (-not $CMakeText.Contains("src/app/state/$($File.Name)")) { throw "State header is not registered in CMake: $($File.Name)" }
+}
+foreach ($Name in $StateStructs) {
+    if ($FoundStateStructs -notcontains $Name) { throw "State struct is missing: $Name" }
+}
+
+# 0.9.5.0 round 19: catch (...) in the Windows app layer logs through QS_LOG_AND_CONTINUE
+# (noexcept, per-site rate limit) or states why it is silent (QS_CATCH_SILENT_BY_DESIGN).
+$LacCore = Remove-CppComments (Read-SourceText 'src\core\log_and_continue.h')
+foreach ($Token in @('bool Report(LogRateLimiter& limiter', ') noexcept {', 'DescribeCurrentException() noexcept',
+        '#define QS_CATCH_SILENT_BY_DESIGN(reason)')) {
+    if (-not $LacCore.Contains($Token)) { throw "Log-and-continue core contract is missing: $Token" }
+}
+$LacGlue = Remove-CppComments (Read-SourceText 'src\diagnostics\log_and_continue.h')
+foreach ($Token in @('inline void LogAndContinue(core::LogRateLimiter& limiter', 'std::wstring_view site) noexcept {',
+        '#define QS_LOG_AND_CONTINUE(category, site)', 'static ::quicksift::core::LogRateLimiter', 'kBurstPerSite')) {
+    if (-not $LacGlue.Contains($Token)) { throw "QS_LOG_AND_CONTINUE contract is missing: $Token" }
+}
+$LacCmake = Read-SourceText 'CMakeLists.txt'
+foreach ($Header in @('src/core/log_and_continue.h', 'src/diagnostics/log_and_continue.h')) {
+    if (-not $LacCmake.Contains($Header)) { throw "Log-and-continue header is not registered in CMake: $Header" }
+}
+$LacCoreBlock = [regex]::Match($LacCmake, 'add_library\(QuickSiftCore STATIC(.*?)\)', 'Singleline')
+$LacCoreFiles = @($LacCoreBlock.Groups[1].Value -split '\s+' | Where-Object { $_ })
+$LacSrc = Join-Path $SourceDir 'src'
+foreach ($File in Get-ChildItem -LiteralPath $LacSrc -Recurse -Filter '*.cpp' -File) {
+    $Relative = 'src/' + $File.FullName.Substring($LacSrc.Length + 1).Replace('\', '/')
+    if ($LacCoreFiles -contains $Relative -or $Relative -eq 'src/diagnostics/diagnostic_log.cpp' -or
+        $Relative -eq 'src/main.cpp' -or $Relative.StartsWith('src/core/') -or
+        $Relative.StartsWith('src/ui/framework/') -or $Relative.StartsWith('src/platform/')) { continue }
+    if (-not $LacCmake.Contains($Relative)) { continue }
+    $LacRaw = [IO.File]::ReadAllText($File.FullName, [Text.Encoding]::UTF8)
+    $LacText = Remove-CppComments $LacRaw
+    if ([regex]::IsMatch($LacText, 'catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}')) {
+        throw "Empty catch (...) in ${Relative}; use QS_LOG_AND_CONTINUE or QS_CATCH_SILENT_BY_DESIGN."
+    }
+    if ($LacText.Contains('QS_LOG_AND_CONTINUE(') -and -not $LacRaw.Contains('#include "diagnostics/log_and_continue.h"')) {
+        throw "$Relative uses QS_LOG_AND_CONTINUE without including diagnostics/log_and_continue.h."
+    }
+}
+$LacChecks = Read-SourceText 'scripts\checks\lifecycle_checks.cpp'
+if (-not ($LacChecks.Contains('LogAndContinueChecks();') -and $LacChecks.Contains('#include "core/log_and_continue.h"'))) {
+    throw 'lifecycle_checks must exercise the log-and-continue helper.'
+}
+
+# 0.9.5.0 round 19: layout DIP values come from src\ui\ui_layout_constants.h, never literals.
+$LayoutConstants = Remove-CppComments (Read-SourceText 'src\ui\ui_layout_constants.h')
+foreach ($Token in @('namespace main_window', 'namespace left_pane', 'namespace status_bar', 'namespace document',
+        'kMinTrackWidthDip', 'kInfoCommentHeightDip', 'kSettingsRowHeightDip', 'kCloseLightDiameterDip', 'kButtonWidthDip')) {
+    if (-not $LayoutConstants.Contains($Token)) { throw "Layout constants header is missing: $Token" }
+}
+if (-not (Read-SourceText 'CMakeLists.txt').Contains('src/ui/ui_layout_constants.h')) {
+    throw 'src/ui/ui_layout_constants.h is not registered in CMake.'
+}
+$LayoutLiteral = '\b(?:DipToPx|px|Px)\(\s*(?:\w+\s*\?\s*)?\d|\?\s*\d+\s*:\s*\d+\s*\)|FlyoutButtonWidthPx\([^;]*,\s*\d+\s*\)'
+$LayoutConstantFunctions = @(
+    @('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::LayoutFoldersSection('),
+    @('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::LayoutInfoSection('),
+    @('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::LayoutButtonFlowSection('),
+    @('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::LayoutSettingsSection('),
+    @('src\ui\main_window_controls_layout_and_painting.cpp', 'void QuickSiftApplicationImpl::LayoutStatusBar('),
+    @('src\ui\main_window_chrome_and_messages.cpp', 'LRESULT QuickSiftApplicationImpl::OnGetMinMaxInfo('),
+    @('src\ui\document_and_menu_models.cpp', 'void PaintDocumentChrome('),
+    @('src\ui\document_and_menu_models.cpp', 'RECT DocumentTitleCloseRect('),
+    @('src\ui\document_and_menu_models.cpp', 'std::optional<LRESULT> DocumentHitTest('),
+    @('src\ui\document_and_menu_models.cpp', 'void LayoutDocumentWindow(')
+)
+foreach ($Entry in $LayoutConstantFunctions) {
+    $LayoutSource = Read-SourceText $Entry[0]
+    if (-not $LayoutSource.Contains('#include "ui/ui_layout_constants.h"')) { throw "$($Entry[0]) must include ui/ui_layout_constants.h." }
+    $LayoutBody = Get-FunctionBody (Remove-CppComments $LayoutSource) $Entry[1]
+    $LayoutMatch = [regex]::Match($LayoutBody, $LayoutLiteral)
+    if ($LayoutMatch.Success) {
+        throw "Magic layout number in $($Entry[1]) ($($Entry[0])): $($LayoutMatch.Value); use ui_layout_constants.h."
+    }
+}
+
+# 0.9.5.0 round 20: the diagnostic log window can open previous session logs. Read-only
+# (never deletes or writes), only QuickSift's own session-log names in the one Logs folder,
+# reparse points skipped, bounded read, worker off the UI thread.
+$SessionPolicyText = Read-SourceText 'src\core\session_log_browser.h'
+foreach ($Token in @('kMaxDisplayBytes', 'kMaxListed', 'candidate.reparsePoint', 'currentSessionName', 'Kind::SessionLog')) {
+    if (-not $SessionPolicyText.Contains($Token)) { throw "Session log browser policy is missing: $Token" }
+}
+$SessionLogText = Remove-CppComments (Read-SourceText 'src\diagnostics\diagnostic_log.cpp')
+if (-not (Get-FunctionBody $SessionLogText 'fs::path SessionLogDirectory(').Contains('root / L"Logs"')) {
+    throw 'SessionLogDirectory must be the one Logs folder under DataRootPath.'
+}
+$SessionReaderBody = Get-FunctionBody $SessionLogText 'SessionLogText ReadSessionLogTail('
+foreach ($Token in @('sl::IsBrowsableName(', 'BrowsableLogsFolder()', 'GENERIC_READ', 'FILE_FLAG_OPEN_REPARSE_POINT', 'FILE_ATTRIBUTE_REPARSE_POINT', 'sl::PlanTail(')) {
+    if (-not $SessionReaderBody.Contains($Token)) { throw "ReadSessionLogTail is missing: $Token" }
+}
+if ($SessionReaderBody.Contains('GENERIC_WRITE') -or $SessionReaderBody.Replace('FILE_SHARE_DELETE', '').Contains('DELETE')) {
+    throw 'ReadSessionLogTail must open logs read-only.'
+}
+if (-not (Get-FunctionBody $SessionLogText 'fs::path BrowsableLogsFolder(').Contains('FILE_ATTRIBUTE_REPARSE_POINT')) {
+    throw 'The session log browser must not follow a Logs folder that is a reparse point.'
+}
+$SessionControllerText = Remove-CppComments (Read-SourceText 'src\ui\session_log_browser_controller.cpp')
+foreach ($Forbidden in @('DeleteFile', 'fs::remove', 'std::filesystem::remove', 'MoveFile', 'CreateFileW', 'GENERIC_WRITE')) {
+    if ($SessionControllerText.Contains($Forbidden)) { throw "The session log browser is read-only and goes through diagnostic_log: $Forbidden" }
+}
+foreach ($Token in @('token = workerLifetime_.Issue()', 'WM_APP_SESSION_LOG_WORKER_DONE', 'ListPreviousSessionLogs()', 'ReadSessionLogTail(', 'TrackDropdownMenuVerbatim(', 'DocumentKind::SessionLog')) {
+    if (-not $SessionControllerText.Contains($Token)) { throw "Session log browser controller is missing: $Token" }
+}
+if (-not ($CMakeText.Contains('src/ui/session_log_browser_controller.cpp') -and $CMakeText.Contains('src/core/session_log_browser.h'))) {
+    throw 'Session log browser files are not registered in CMake.'
+}
+if (-not $StopAllBody.Contains('StopSessionLogWorker()')) { throw 'Teardown must join the session log worker.' }
+$SessionIdsText = Read-SourceText 'src\ui\ui_command_ids.h'
+foreach ($Token in @('ID_DOCUMENT_PREVIOUS_SESSIONS', 'ID_DOCUMENT_SESSION_LOG_FIRST', 'ID_DOCUMENT_SESSION_LOG_LAST')) {
+    if (-not $SessionIdsText.Contains($Token)) { throw "Session log browser command id is missing from ui_command_ids.h: $Token" }
+}
+if (-not (Read-SourceText 'scripts\checks\lifecycle_checks.cpp').Contains('SessionLogBrowserChecks()')) {
+    throw 'lifecycle_checks must exercise the session log browser policy.'
+}
+
+# 0.9.5.0 round 20: a build failure prints a plain-language explanation
+# (Build failed / What to do / Technical detail) and keeps a non-zero exit code.
+$FailureHelpText = Read-SourceText 'scripts\build-failure-help.ps1'
+foreach ($Token in @('function Write-QuickSiftFailure', 'function Add-QuickSiftFailureHint', '"Build failed: "', "'What to do:'", '"Technical detail: "')) {
+    if (-not $FailureHelpText.Contains($Token)) { throw "Build failure helper is missing: $Token" }
+}
+if ($FailureHelpText -match '[^\x00-\x7F]') { throw 'scripts\build-failure-help.ps1 must stay ASCII (Windows PowerShell 5.1 reads it as ANSI).' }
+foreach ($ScriptName in @('scripts\build.ps1', 'scripts\verify-source.ps1', 'scripts\verify-binary.ps1', 'scripts\package-msix.ps1')) {
+    $ScriptText = Read-SourceText $ScriptName
+    foreach ($Token in @(". (Join-Path `$PSScriptRoot 'build-failure-help.ps1')", 'Write-QuickSiftFailure $_', 'exit 1')) {
+        if (-not $ScriptText.Contains($Token)) { throw "$ScriptName must explain failures through build-failure-help.ps1: $Token" }
+    }
+}
+if (-not (Read-SourceText 'scripts\build.ps1').Contains('Add-QuickSiftFailureHint $Line')) { throw 'build.ps1 must remember diagnostic lines for the failure explanation.' }
+foreach ($Wrapper in @('build.cmd', 'build-release.cmd', 'open-in-visual-studio.cmd', 'package-msix.bat')) {
+    $WrapperText = Read-SourceText $Wrapper
+    foreach ($Token in @('set "QS_EXIT=%ERRORLEVEL%"', 'exit /b %QS_EXIT%', ':no_powershell', 'exit /b 9009')) {
+        if (-not $WrapperText.Contains($Token)) { throw "$Wrapper must keep the exit code and explain a missing PowerShell: $Token" }
+    }
+}
+
+# 0.9.5.0 round 21 (t29u): Single View load-stall fixes stay in place.
+if (-not $CMakeText.Contains('src/core/view_load_policy.h')) { throw 'CMake does not list src/core/view_load_policy.h' }
+$ViewEngineText = Read-SourceText 'src\work\background_work_engine.cpp'
+if (-not (Get-FunctionBody $ViewEngineText 'bool Worker::DecodeFullJob(').Contains('!IsCancelled(job) && DecodeWithShell(')) {
+    throw 'DecodeFullJob must not run the uncancellable Shell fallback after cancellation/timeout.'
+}
+if (-not (Get-FunctionBody $ViewEngineText 'void Worker::EnqueueViewDecode(').Contains('ViewDecodeInteractionEpoch(')) {
+    throw 'View-lane decodes must not be cancelled by the pan/zoom interaction epoch.'
+}
+if (-not (Get-FunctionBody $ViewEngineText 'bool Worker::Enqueue(').Contains('RunningViewJobIsStaleForLocked(job)')) {
+    throw 'A stale running view job must not absorb a new foreground request.'
+}
+foreach ($Signature in @('void Worker::AbandonJobWithoutBudget(', 'void Worker::AbandonCancelledJob(')) {
+    if (-not (Get-FunctionBody $ViewEngineText $Signature).Contains('RefreshReadAheadGate()')) { throw "$Signature must re-evaluate the read-ahead gate." }
+}
+$ViewCacheText = Read-SourceText 'src\ui\graphics_resources_and_image_cache.cpp'
+if (-not (Get-FunctionBody $ViewCacheText 'BitmapEntry* QuickSiftApplicationImpl::GetOrRequestBitmap(').Contains('ShouldRequestFullViewDecode(')) {
+    throw 'The RAW full request must stop once the exact bucket holds a full-quality result.'
+}
+if (-not (Get-FunctionBody $ViewCacheText 'int QuickSiftApplicationImpl::BucketFor(').Contains('MaximumViewDecodeEdge()')) {
+    throw "Decode buckets must be capped by the device's maximum bitmap edge."
+}
+$AdmitBody = Get-FunctionBody (Read-SourceText 'src\ui\catalog_loading_and_result_integration.cpp') 'void QuickSiftApplicationImpl::AdmitDecodedPixels('
+if (([regex]::Matches($AdmitBody, 'RejectUndisplayableDecode\(')).Count -lt 2) {
+    throw 'Undisplayable decoded pixels must enter the bounded retry policy, not be dropped silently.'
+}
+$ViewCanvasText = Read-SourceText 'src\ui\canvas_rendering_and_overlays.cpp'
+if (-not (Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::RenderSingle(').Contains('singleViewStallWatch_.Observe(')) {
+    throw 'RenderSingle must feed the Single View stall watchdog.'
+}
+if (-not (Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::LogSingleViewStall(').Contains('LogRateLimiter')) {
+    throw 'The Single View stall log must be rate-limited.'
+}
+$ViewChecksText = Read-SourceText 'scripts\checks\view_load_checks.cpp'
+foreach ($Token in @('DecodeBudgetChecks()', 'StallWatchChecks()', 'StaleRunningJobChecks()')) {
+    if (-not $ViewChecksText.Contains($Token)) { throw "view_load_checks must run $Token" }
+}
+
+# Round 22: Single View filmstrip audit guards.
+$FilmTarget = 'filmstrip::ThumbnailTarget(ThumbnailDecodeTarget())'
+if (-not (Get-FunctionBody (Read-SourceText 'src\app\quicksift_application.cpp') 'void QuickSiftApplicationImpl::PrefetchFilmstrip(').Contains($FilmTarget)) {
+    throw 'PrefetchFilmstrip must request the grid thumbnail target (shared cache).'
+}
+$FilmRender = Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::RenderFilmstrip('
+if (-not $FilmRender.Contains($FilmTarget)) { throw 'RenderFilmstrip must look up the grid thumbnail target.' }
+if ($FilmRender.Replace('ComPtr<ID2D1SolidColorBrush>& brush', '').Contains('ComPtr<ID2D1SolidColorBrush>')) {
+    throw 'RenderFilmstrip must reuse cached brushes, not create them per frame.'
+}
+if (-not ($FilmRender.Contains('palette.accent') -and $FilmRender.Contains('palette.border'))) {
+    throw 'RenderFilmstrip borders must follow the theme palette.'
+}
+if (-not (Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::RenderSingle(').Contains('SingleImageArea(')) {
+    throw 'RenderSingle must use the shared (filmstrip-aware) image area.'
+}
+if (-not (Get-FunctionBody (Read-SourceText 'src\ui\view_state_controller.cpp') 'D2D1_RECT_F QuickSiftApplicationImpl::ViewAreaForPath(').Contains('SingleImageArea(')) {
+    throw 'ViewAreaForPath must reserve the open filmstrip band.'
+}
+$FilmDiscard = Get-FunctionBody $ViewCacheText 'void QuickSiftApplicationImpl::DiscardDeviceResources('
+foreach ($Token in @('shellFallbackCache_.clear()', 'filmstripBackgroundBrush_.Reset()', 'filmstripActiveBrush_.Reset()', 'filmstripInactiveBrush_.Reset()')) {
+    if (-not $FilmDiscard.Contains($Token)) { throw "DiscardDeviceResources must run $Token" }
+}
+$FilmNavText = Read-SourceText 'src\ui\navigation_input_and_session.cpp'
+if (-not (Get-FunctionBody $FilmNavText 'void QuickSiftApplicationImpl::OnCanvasWheel(').Contains('TakeWheelSteps(')) { throw 'Wheel over the filmstrip must step images.' }
+if (-not (Get-FunctionBody $FilmNavText 'void QuickSiftApplicationImpl::OnCanvasDoubleClick(').Contains('FilmstripContains(')) { throw 'A double-click on the filmstrip must not toggle zoom.' }
+if (-not $FilmNavText.Contains('L"Filmstrip"')) { throw 'The filmstrip preference must be saved in the session.' }
+if (-not (Get-FunctionBody $ViewEngineText 'WorkJob Worker::PopWork(').Contains('ThumbnailDecodeAdmitted(')) {
+    throw 'Filmstrip thumbnail decodes must share the one-thumbnail cap during view load.'
+}
+# Round 23: fade, decode window, badges, dashed blur outline.
+$FilmAppText = Read-SourceText 'src\app\quicksift_application.cpp'
+if (-not (Get-FunctionBody $FilmAppText 'void QuickSiftApplicationImpl::UpdateAnimations(').Contains('SyncFilmstripMotion(')) { throw 'The animation tick must drive the filmstrip fade through SyncFilmstripMotion.' }
+if (-not (Get-FunctionBody $FilmAppText 'void QuickSiftApplicationImpl::ToggleFilmstrip(').Contains('SyncFilmstripMotion(')) { throw 'ToggleFilmstrip must start the fade at once.' }
+$FilmSetMode = Get-FunctionBody $FilmNavText 'void QuickSiftApplicationImpl::SetMode('
+if (-not ($FilmSetMode.Contains('SyncFilmstripMotion(') -and $FilmSetMode.Contains('PublishFilmstripDecodeWindow('))) { throw 'SetMode must sync the filmstrip fade and drop strip decodes outside Single View.' }
+if ((Get-FunctionBody $FilmAppText 'bool QuickSiftApplicationImpl::FilmstripContains(').Contains('filmstripOpacity_')) { throw 'Filmstrip hit-testing must follow the logical state, not the animated opacity.' }
+$FilmPrefetch = Get-FunctionBody $FilmAppText 'void QuickSiftApplicationImpl::PrefetchFilmstrip('
+$FilmPublishAt = $FilmPrefetch.IndexOf('PublishFilmstripDecodeWindow(')
+$FilmRequestAt = $FilmPrefetch.IndexOf('GetOrRequestBitmap(')
+if ($FilmPublishAt -lt 0 -or $FilmRequestAt -lt 0 -or $FilmPublishAt -gt $FilmRequestAt) { throw 'PrefetchFilmstrip must publish the decode window before requesting cells.' }
+if (-not (Get-FunctionBody $ViewEngineText 'bool Worker::IsCancelled(').Contains('FilmstripDecodeDropped(')) { throw 'In-flight filmstrip decodes outside the window must be cancelled.' }
+$FilmPerfText = Read-SourceText 'src\work\background_performance_controller.cpp'
+$FilmWindowBody = Get-FunctionBody $FilmPerfText 'void Worker::SetFilmstripDecodeWindow('
+if (-not ($FilmWindowBody.Contains('pending_.erase(') -and $FilmWindowBody.Contains('RefreshReadAheadGate()'))) { throw 'Dropped filmstrip decodes must release their pending keys and re-evaluate the read-ahead gate.' }
+if (-not (Get-FunctionBody $FilmPerfText 'bool Worker::FilmstripDecodeDropped(').Contains('filmstrip::DecodeDropped(')) { throw 'The filmstrip drop rule must come from core/filmstrip_policy.h.' }
+$FilmBadges = Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::DrawThumbnailBadges(const PhotoItem& photo, D2D1_RECT_F area,'
+if ($FilmBadges.Contains('std::vector') -or $FilmBadges.Contains('Tr(')) { throw 'DrawThumbnailBadges must not allocate per frame.' }
+if (-not ($FilmRender.Contains('DrawThumbnailBadges(') -and $FilmRender.Contains('blurOutlineStrokeStyle_'))) { throw 'The filmstrip must reuse the grid badges and the dashed blur outline.' }
+if (-not (Get-FunctionBody $ViewCanvasText 'void QuickSiftApplicationImpl::RenderThumbnails(').Contains('blurOutlineStrokeStyle_')) { throw "The grid's blurry-photo outline must be dashed." }
+foreach ($Token in @('blurOutlineBrush_.Reset()', 'blurOutlineStrokeStyle_.Reset()')) {
+    if (-not $FilmDiscard.Contains($Token)) { throw "DiscardDeviceResources must run $Token" }
+}
+if (-not (Get-FunctionBody (Read-SourceText 'src\ui\app_theme_documents_and_localization.cpp') 'void QuickSiftApplicationImpl::ApplyTheme(').Contains('blurOutlineBrush_.Reset()')) { throw 'ApplyTheme must recreate the theme-dependent blur outline brush.' }
+$FilmChecksText = Read-SourceText 'scripts\checks\filmstrip_checks.cpp'
+foreach ($Token in @('CheckWindow()', 'CheckHitTesting()', 'CheckGeometry()', 'CheckWheel()', 'CheckScheduling()', 'CheckFade()', 'CheckDecodeWindow()', 'CheckBadges()', 'CheckBlurOutline()')) {
+    if (-not $FilmChecksText.Contains($Token)) { throw "filmstrip_checks must run $Token" }
 }
 
 Write-Host 'QuickSift native source verification passed.' -ForegroundColor Green

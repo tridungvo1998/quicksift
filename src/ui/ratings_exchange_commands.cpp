@@ -7,6 +7,7 @@
 #include "core/priority_policy.h"
 #include "diagnostics/log_categories.h"
 #include "version.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <algorithm>
 #include <string>
@@ -63,7 +64,9 @@ bool WriteBytesAtomically(const fs::path& target, const std::string& bytes, std:
         const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - offset, 1u << 20));
         DWORD written = 0;
         if (!WriteFile(file, bytes.data() + offset, chunk, &written, nullptr) || written == 0) {
-            error = WindowsErrorText(GetLastError());
+            // A successful zero-byte write leaves GetLastError() at 0 ("success (0)").
+            const DWORD code = GetLastError();
+            error = WindowsErrorText(code != ERROR_SUCCESS ? code : ERROR_WRITE_FAULT);
             ok = false;
             break;
         }
@@ -179,6 +182,19 @@ std::wstring ReplaceToken(std::wstring text, std::wstring_view token, const std:
 // (including non-ASCII letters) for FILENAME.EXTENSION reconciliation.
 std::wstring WindowsNameFold(std::wstring_view name) {
     if (name.empty()) return {};
+    // Fast path: invariant upper-casing almost always keeps the UTF-16 length, so
+    // map straight into a same-sized buffer (one API call instead of two; this runs
+    // for every folder file and every list entry in import and batch matching).
+    if (name.size() < static_cast<std::size_t>(INT_MAX)) {
+        std::wstring direct(name.size(), L'\0');
+        const int mapped = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(),
+            static_cast<int>(name.size()), direct.data(), static_cast<int>(direct.size()),
+            nullptr, nullptr, 0);
+        if (mapped > 0) {
+            direct.resize(static_cast<std::size_t>(mapped));
+            return direct;
+        }
+    }
     const int length = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_UPPERCASE, name.data(),
         static_cast<int>(name.size()), nullptr, 0, nullptr, nullptr, 0);
     if (length <= 0) return quicksift::core::ratings_exchange::AsciiFold(name);
@@ -199,6 +215,7 @@ void QuickSiftApplicationImpl::StopRatingsWorker() noexcept {
     try {
         if (ratingsWorker_.joinable()) ratingsWorker_.join();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Ratings", L"StopRatingsWorker");
         // Shutdown boundary: never throw.
     }
     ratingsWorkerRunning_.store(false, std::memory_order_release);
@@ -221,6 +238,8 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
             GlassAlertKind::Information);
         return;
     }
+    // Live blocking-wait dialog (what, which file, how many left, elapsed, why).
+    if (ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::RatingsExport)) return;
     if (transactions_.Busy() || RatingsWorkerBusy() || ratingsImportToken_ != 0) {
         ShowGlassAlert(L"Export ratings",
             L"Wait for the current file, metadata or ratings operation to finish, then try again.",
@@ -257,6 +276,7 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
         inputs.push_back(std::move(input));
     }
 
+    if (workersStoppedForTeardown_) return;
     StopRatingsWorker(); // joins a finished previous worker (never a running one: checked above)
     ratingsWorkerCancel_.store(false, std::memory_order_release);
     ratingsWorkerDone_.store(0, std::memory_order_release);
@@ -270,7 +290,7 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
     const std::uint64_t generation = generation_;
     const fs::path file = *target;
     try {
-        ratingsWorker_ = std::thread([this, window, generation, file, exportTime,
+        ratingsWorker_ = std::thread([this, window, generation, file, exportTime, token = workerLifetime_.Issue(),
             inputs = std::move(inputs)]() mutable noexcept {
             RatingsWorkerResult result;
             result.import = false;
@@ -281,13 +301,19 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
             namespace prio = quicksift::core::priority;
             try {
                 const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                // Balanced on every exit, including an exception from a metadata read
+                // (the explicit CoUninitialize below used to be skipped then).
+                struct ComScope {
+                    HRESULT hr;
+                    ~ComScope() { if (SUCCEEDED(hr)) CoUninitialize(); }
+                } comScope{ com };
                 rx::ExportDocument document;
                 document.version = QS_VERSION_FILE_STRING;
                 document.time = exportTime;
                 document.totalFiles = inputs.size();
                 bool cancelled = false;
                 for (std::size_t index = 0; index < inputs.size(); ++index) {
-                    if (ratingsWorkerCancel_.load(std::memory_order_acquire)) {
+                    if (ratingsWorkerCancel_.load(std::memory_order_acquire) || token.StopRequested()) {
                         cancelled = true;
                         break;
                     }
@@ -314,7 +340,6 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
                     if (rx::HasData(entry)) document.entries.push_back(std::move(entry));
                     ratingsWorkerDone_.store(index + 1, std::memory_order_release);
                 }
-                if (SUCCEEDED(com)) CoUninitialize();
                 if (cancelled) {
                     result.error = L"cancelled";
                 } else {
@@ -325,6 +350,7 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
                     else result.error = error;
                 }
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsExport");
                 result.ok = false;
                 if (result.error.empty()) result.error = L"Unexpected error while exporting.";
             }
@@ -332,12 +358,14 @@ void QuickSiftApplicationImpl::BeginRatingsExport() {
                 std::lock_guard lock(ratingsWorkerMutex_);
                 ratingsWorkerResult_ = std::move(result);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsExport [2]");
             }
             ratingsWorkerRunning_.store(false, std::memory_order_release);
             // A lost post is recovered by OnTimer (worker joinable && not busy).
-            static_cast<void>(PostMessageW(window, WM_APP_RATINGS_WORKER_DONE, 0, 0));
+            static_cast<void>(PostFromWorker(token, window, WM_APP_RATINGS_WORKER_DONE));
         });
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsExport [3]");
         ratingsWorkerRunning_.store(false, std::memory_order_release);
         ShowGlassAlert(L"Export ratings", L"QuickSift could not start the export.", GlassAlertKind::Error);
         return;
@@ -357,6 +385,8 @@ void QuickSiftApplicationImpl::BeginRatingsImport() {
             GlassAlertKind::Information);
         return;
     }
+    // Live blocking-wait dialog (what, which file, how many left, elapsed, why).
+    if (ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::RatingsImport)) return;
     if (transactions_.Busy() || RatingsWorkerBusy() || ratingsImportToken_ != 0) {
         ShowGlassAlert(L"Import ratings",
             L"Wait for the current file, metadata or ratings operation to finish, then try again.",
@@ -368,6 +398,7 @@ void QuickSiftApplicationImpl::BeginRatingsImport() {
         currentFolder_, Tr(L"Text files (*.txt)"));
     if (!source) return;
 
+    if (workersStoppedForTeardown_) return;
     StopRatingsWorker();
     ratingsWorkerCancel_.store(false, std::memory_order_release);
     ratingsWorkerDone_.store(0, std::memory_order_release);
@@ -381,7 +412,7 @@ void QuickSiftApplicationImpl::BeginRatingsImport() {
     const std::uint64_t generation = generation_;
     const fs::path file = *source;
     try {
-        ratingsWorker_ = std::thread([this, window, generation, file]() noexcept {
+        ratingsWorker_ = std::thread([this, window, generation, file, token = workerLifetime_.Issue()]() noexcept {
             RatingsWorkerResult result;
             result.import = true;
             result.file = file;
@@ -398,6 +429,7 @@ void QuickSiftApplicationImpl::BeginRatingsImport() {
                     result.ok = true; // read succeeded; parse.ok carries validation
                 }
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsImport");
                 result.ok = false;
                 if (result.error.empty()) result.error = L"Unexpected error while reading the file.";
             }
@@ -405,12 +437,14 @@ void QuickSiftApplicationImpl::BeginRatingsImport() {
                 std::lock_guard lock(ratingsWorkerMutex_);
                 ratingsWorkerResult_ = std::move(result);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsImport [2]");
             }
             ratingsWorkerRunning_.store(false, std::memory_order_release);
             // A lost post is recovered by OnTimer (worker joinable && not busy).
-            static_cast<void>(PostMessageW(window, WM_APP_RATINGS_WORKER_DONE, 0, 0));
+            static_cast<void>(PostFromWorker(token, window, WM_APP_RATINGS_WORKER_DONE));
         });
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Ratings", L"BeginRatingsImport [3]");
         ratingsWorkerRunning_.store(false, std::memory_order_release);
         ShowGlassAlert(L"Import ratings", L"QuickSift could not start reading the file.", GlassAlertKind::Error);
         return;
@@ -427,7 +461,7 @@ void QuickSiftApplicationImpl::OnRatingsWorkerCompleted() {
         ratingsWorkerResult_.reset();
     }
     if (ratingsWorker_.joinable() && !RatingsWorkerBusy()) {
-        try { ratingsWorker_.join(); } catch (...) {}
+        try { ratingsWorker_.join(); } catch (...) { QS_LOG_AND_CONTINUE(L"Ratings", L"OnRatingsWorkerCompleted"); }
     }
     if (ratingsImportToken_ == 0) KillTimer(hwnd_, ID_TIMER_RATINGS_PROGRESS);
     UpdateStatus();

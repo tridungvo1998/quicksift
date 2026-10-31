@@ -1,5 +1,6 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "ui/ui_layout_constants.h"
 
 namespace quicksift::app {
 
@@ -932,6 +933,8 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
 
 
 
+    // Main window procedure (0.9.5.0 round 19: the larger cases moved into named
+    // handlers below with no behaviour change; the switch keeps every message).
     LRESULT QuickSiftApplicationImpl::HandleMainMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
         case WM_CREATE:
@@ -969,38 +972,15 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             }
             return DefWindowProc(hwnd_, message, wParam, lParam);
         case WM_ACTIVATE:
-            windowActive_ = LOWORD(wParam) != WA_INACTIVE || menuOpen_;
-            if (fullscreen_ && LOWORD(wParam) == WA_INACTIVE && !menuOpen_) {
-                SetFullscreenTitleVisible(false);
-            }
-            InvalidateTitleBar();
-            if (LOWORD(wParam) == WA_INACTIVE) {
-                // Remember the focused child (search box, comment field, canvas...)
-                // so Alt+Tab / closing a dialog returns focus there, not to the frame.
-                HWND focused = GetFocus();
-                if (focused && IsChild(hwnd_, focused)) lastFocusedChild_ = focused;
-            } else if (!HIWORD(wParam) && lastFocusedChild_ && IsWindow(lastFocusedChild_) &&
-                IsChild(hwnd_, lastFocusedChild_) && IsWindowVisible(lastFocusedChild_) &&
-                IsWindowEnabled(lastFocusedChild_)) {
-                SetFocus(lastFocusedChild_);
-                return 0;
-            }
-            return DefWindowProc(hwnd_, message, wParam, lParam);
+            return OnMainActivate(wParam, lParam);
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED:
         case WM_SYSCOLORCHANGE:
         case WM_DWMCOLORIZATIONCOLORCHANGED:
             OnSystemVisualSettingsChanged();
             return DefWindowProc(hwnd_, message, wParam, lParam);
-        case WM_MOUSEMOVE: {
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            UpdateTrafficHover(point);
-            if (!trackingTitleMouse_) {
-                TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd_, 0 };
-                trackingTitleMouse_ = TrackMouseEvent(&track) != FALSE;
-            }
-            return 0;
-        }
+        case WM_MOUSEMOVE:
+            return OnTitleMouseMove(lParam);
         case WM_NCMOUSEMOVE:
             if (hoveredTrafficLight_ != TrafficLight::None) {
                 hoveredTrafficLight_ = TrafficLight::None;
@@ -1014,30 +994,10 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
                 InvalidateTitleBar();
             }
             return 0;
-        case WM_LBUTTONDOWN: {
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            const TrafficLight light = HitTrafficLight(point);
-            if (light != TrafficLight::None) {
-                pressedTrafficLight_ = light;
-                hoveredTrafficLight_ = light;
-                SetCapture(hwnd_);
-                InvalidateTitleBar();
-                return 0;
-            }
-            return DefWindowProc(hwnd_, message, wParam, lParam);
-        }
+        case WM_LBUTTONDOWN:
+            return OnTitleLeftButtonDown(wParam, lParam);
         case WM_LBUTTONUP:
-            if (pressedTrafficLight_ != TrafficLight::None) {
-                POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                const TrafficLight pressed = pressedTrafficLight_;
-                const TrafficLight releasedOver = HitTrafficLight(point);
-                pressedTrafficLight_ = TrafficLight::None;
-                if (GetCapture() == hwnd_) ReleaseCapture();
-                InvalidateTitleBar();
-                if (pressed == releasedOver) PerformTrafficAction(pressed);
-                return 0;
-            }
-            return DefWindowProc(hwnd_, message, wParam, lParam);
+            return OnTitleLeftButtonUp(wParam, lParam);
         case WM_CAPTURECHANGED:
         case WM_CANCELMODE:
             pressedTrafficLight_ = TrafficLight::None;
@@ -1053,43 +1013,20 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         case WM_DPICHANGED:
             OnDpiChanged(HIWORD(wParam), reinterpret_cast<RECT*>(lParam));
             return 0;
-        case WM_GETMINMAXINFO: {
-            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-            if (!info) return 0;
-
-            MONITORINFO monitorInfo{ sizeof(MONITORINFO) };
-            const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
-            if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
-                monitorInfo.rcMonitor = { 0, 0,
-                    std::max(1, GetSystemMetrics(SM_CXSCREEN)),
-                    std::max(1, GetSystemMetrics(SM_CYSCREEN)) };
-                monitorInfo.rcWork = monitorInfo.rcMonitor;
-                SystemParametersInfoW(SPI_GETWORKAREA, 0, &monitorInfo.rcWork, 0);
-                QS_LOG_WARNING(L"UI", L"Window sizing is using primary-screen geometry because monitor information was unavailable");
-            }
-
-            const LONG workWidth = std::max<LONG>(1, monitorInfo.rcWork.right - monitorInfo.rcWork.left);
-            const LONG workHeight = std::max<LONG>(1, monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
-            info->ptMaxPosition.x = monitorInfo.rcWork.left - monitorInfo.rcMonitor.left;
-            info->ptMaxPosition.y = monitorInfo.rcWork.top - monitorInfo.rcMonitor.top;
-            info->ptMaxSize.x = workWidth;
-            info->ptMaxSize.y = workHeight;
-            info->ptMinTrackSize.x = std::min<LONG>(static_cast<LONG>(DipToPx(1120)), workWidth);
-            info->ptMinTrackSize.y = std::min<LONG>(static_cast<LONG>(DipToPx(520)), workHeight);
-            return 0;
-        }
+        case WM_GETMINMAXINFO:
+            return OnGetMinMaxInfo(reinterpret_cast<MINMAXINFO*>(lParam));
         case WM_DRAWITEM:
             return OnDrawItem(reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
         case WM_CTLCOLORLISTBOX:
-            // The library list fills any area it paints itself with the panel colour
-            // (the default COLOR_WINDOW brush was a white strip in dark theme).
-            if (reinterpret_cast<HWND>(lParam) == libraryList_) {
-                HDC dc = reinterpret_cast<HDC>(wParam);
-                SetBkColor(dc, Palette().panelStrong);
-                SetTextColor(dc, Palette().text);
-                return reinterpret_cast<LRESULT>(LibraryListBrush());
-            }
+            return OnCtlColorListBox(wParam, lParam);
+        case WM_MOUSEWHEEL:
+            // Wheel over the left pane (forwarded by its buttons/labels/backdrop).
+            if (HandlePaneWheel(wParam, lParam)) return 0;
             return DefWindowProc(hwnd_, message, wParam, lParam);
+        case quicksift::ui::framework::MacOsUiFramework::kButtonFocusedMessage:
+            // Keyboard focus moved to a pane button: scroll it into view.
+            EnsurePaneControlVisible(reinterpret_cast<HWND>(wParam));
+            return 0;
         case WM_COMMAND:
             OnCommand(LOWORD(wParam), HIWORD(wParam), reinterpret_cast<HWND>(lParam));
             return 0;
@@ -1126,174 +1063,20 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         case WM_APP_SEARCH_WORKER:
             OnSearchWorkerMessage();
             return 0;
+        case WM_APP_SESSION_LOG_WORKER_DONE:
+            OnSessionLogWorkerDone();
+            return 0;
         case WM_TIMER:
             OnTimer(static_cast<UINT_PTR>(wParam));
             return 0;
         case WM_CLOSE:
-            // Coalesced edits not yet submitted are written (or, if the user then
-            // chooses "Close anyway", cancelled with everything else) — never lost
-            // silently.
-            FlushPendingMetadataEdits();
-            if (transactions_.Busy() || !pendingMetadataEdits_.Empty()) {
-                if (closingAfterTransactionCancellation_) {
-                    ShowToast(L"Cancelling file operations at a safe boundary before closing…");
-                    return 0;
-                }
-                ShowGlassConfirmation(
-                    L"File operations are still running",
-                    L"QuickSift is still changing files. Closing anyway will cancel pending operations at the next safe file boundary. Already completed and verified files will remain complete; QuickSift will not stop in the middle of an atomic media group.",
-                    L"Close anyway", PendingGlassAction::CloseWithPendingOperations,
-                    GlassAlertKind::Warning, L"Wait");
-                return 0;
-            }
-            SaveSession();
-            DestroyWindow(hwnd_);
-            return 0;
+            return OnMainCloseRequested();
         case WM_QUERYENDSESSION:
-            SaveSession();
-            // A shutdown query is not a normal close request. Ask active work to
-            // stop at its next safe boundary, but do not auto-close QuickSift if
-            // this shutdown attempt is vetoed or cancelled by another process.
-            transactions_.CancelAll();
-            if (transactions_.Busy()) {
-                // An Exiv2 write cannot be interrupted safely once it has entered
-                // the library. Veto this shutdown attempt and let the user retry
-                // after the serialized transaction reaches its safe boundary.
-                const wchar_t* reason =
-                    L"QuickSift is finishing a verified media transaction.";
-                if (ShutdownBlockReasonCreate(hwnd_, reason) != FALSE) {
-                    shutdownBlocked_ = true;
-                }
-                return FALSE;
-            }
-            return TRUE;
+            return OnQueryEndSession();
         case WM_ENDSESSION:
-            if (shutdownBlocked_) {
-                ShutdownBlockReasonDestroy(hwnd_);
-                shutdownBlocked_ = false;
-            }
-            if (wParam != FALSE) {
-                SaveSession();
-                DestroyWindow(hwnd_);
-            } else {
-                // Another application vetoed shutdown. Re-open the coordinator
-                // so QuickSift does not remain permanently read-only afterward.
-                transactions_.CancelCloseRequest();
-                closingAfterTransactionCancellation_ = false;
-            }
-            return 0;
+            return OnEndSession(wParam);
         case WM_DESTROY: {
-            if (shutdownBlocked_) {
-                ShutdownBlockReasonDestroy(hwnd_);
-                shutdownBlocked_ = false;
-            }
-            const auto shutdownStartedAt = std::chrono::steady_clock::now();
-            QS_LOG_INFO(L"Lifecycle", L"Shutdown sequence started after main window destruction");
-            // Non-metadata work must never block close. Signal decode stop
-            // immediately (queues cleared, budgets stopped) without joining.
-            // The later worker_.Stop() joins only after in-flight work observes
-            // the stop flag. Only metadata writes (subject to kHardTimeout)
-            // are allowed to finish.
-            worker_.RequestStop();
-            {
-                std::lock_guard lock(searchMutex_);
-                searchWorkerStop_ = true;
-                searchHydrateQueue_.clear();
-                searchEvalJob_.reset();
-            }
-            searchCv_.notify_all();
-            scanner_.Cancel();
-            KillTimer(hwnd_, ID_TIMER_IDLE_QUALITY);
-            KillTimer(hwnd_, ID_TIMER_CACHE_FLUSH);
-            KillTimer(hwnd_, ID_TIMER_AUTOHIDE);
-            KillTimer(hwnd_, ID_TIMER_METADATA_UI);
-            KillTimer(hwnd_, ID_TIMER_VIEW_RESOURCE_TRIM);
-            KillTimer(hwnd_, ID_TIMER_BACKGROUND_ANALYSIS);
-            KillTimer(hwnd_, ID_TIMER_FOLDER_SELECTION);
-            KillTimer(hwnd_, ID_TIMER_FILE_PROGRESS);
-            KillTimer(hwnd_, ID_TIMER_PERFORMANCE_HUD);
-            KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
-            KillTimer(hwnd_, ID_TIMER_ANIMATION);
-            // Animation teardown: no cadence switches after this point; fading
-            // dropdowns are destroyed now and pending completions are dropped.
-            uiFramework_.Motion().SetActivationHook({});
-            uiFramework_.ShutdownAnimations();
-            uiFramework_.ClearPaneFrost();
-            if (libraryListBrush_) {
-                DeleteObject(libraryListBrush_);
-                libraryListBrush_ = nullptr;
-            }
-            KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
-            KillTimer(hwnd_, ID_TIMER_SCROLL_FRAME);
-            KillTimer(hwnd_, ID_TIMER_SCROLL_SETTLE);
-            KillTimer(hwnd_, ID_TIMER_THROTTLED_SCHEDULE);
-            KillTimer(hwnd_, ID_TIMER_COMPLETION_PUMP);
-            KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RECONCILE);
-            KillTimer(hwnd_, ID_TIMER_RATINGS_PROGRESS);
-            KillTimer(hwnd_, ID_TIMER_BATCH_GLASS_WATCH);
-            KillTimer(hwnd_, ID_TIMER_SEARCH_DEBOUNCE);
-            searchDebounceArmed_ = false;
-            KillTimer(hwnd_, ID_TIMER_METADATA_WRITE_LANE);
-            metadataWriteLaneTimerActive_ = false;
-            KillTimer(hwnd_, ID_TIMER_USER_COMMENT_RETRY);
-            KillTimer(hwnd_, ID_TIMER_LIBRARY_LIST_RETRY);
-            StopRatingsWorker();
-            StopBatchWorker();
-            StopSearchWorker(); // before the persistent cache closes (it reads comments)
-            CloseBatchDialog();
-            thumbnailReconcileTimerActive_ = false;
-            completionPumpTimerActive_ = false;
-
-            auto logShutdownStage = [&](std::wstring_view stage, const auto startedAt) {
-                const double ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - startedAt).count();
-                QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Lifecycle", L"shutdown_stage",
-                    {L"stage", std::wstring(stage)}, {L"ms", std::to_wstring(ms)});
-            };
-
-            auto stage = std::chrono::steady_clock::now();
-            resourcePressureMonitor_.Stop();
-            logShutdownStage(L"resource_pressure_stop", stage);
-
-            stage = std::chrono::steady_clock::now();
-            transactions_.Stop();
-            logShutdownStage(L"transactions_stop", stage);
-
-            stage = std::chrono::steady_clock::now();
-            scanner_.Cancel();
-            scanner_.SetNotify(nullptr);
-            logShutdownStage(L"scanner_cancel", stage);
-
-            stage = std::chrono::steady_clock::now();
-            worker_.SetNotify(nullptr);
-            worker_.Stop();
-            logShutdownStage(L"worker_stop", stage);
-
-            stage = std::chrono::steady_clock::now();
-            DrainPostedWorkerMessages();
-            logShutdownStage(L"drain_completions", stage);
-
-            stage = std::chrono::steady_clock::now();
-            // Persistent cache is disposable. Release SQLite/WAL handles without a
-            // forced checkpoint; committed WAL frames are recovered on the next open.
-            persistentCache_.CloseForShutdown();
-            logShutdownStage(L"cache_close", stage);
-
-            const double totalMs = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - shutdownStartedAt).count();
-            QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Lifecycle", L"shutdown_sequence_complete",
-                {L"total_ms", std::to_wstring(totalMs)});
-
-            if (faceWarningTooltip_) {
-                DestroyWindow(faceWarningTooltip_);
-                faceWarningTooltip_ = nullptr;
-            }
-            if (faceLockAvailabilityTooltip_) {
-                DestroyWindow(faceLockAvailabilityTooltip_);
-                faceLockAvailabilityTooltip_ = nullptr;
-            }
-            DestroyUiFonts();
-            PostQuitMessage(0);
+            OnMainWindowDestroyed();
             return 0;
         }
         default:
@@ -1301,7 +1084,292 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         }
     }
 
+    LRESULT QuickSiftApplicationImpl::OnMainActivate(WPARAM wParam, LPARAM lParam) {
+        const UINT message = WM_ACTIVATE;
+        windowActive_ = LOWORD(wParam) != WA_INACTIVE || menuOpen_;
+        if (fullscreen_ && LOWORD(wParam) == WA_INACTIVE && !menuOpen_) {
+            SetFullscreenTitleVisible(false);
+        }
+        InvalidateTitleBar();
+        if (LOWORD(wParam) == WA_INACTIVE) {
+            // Remember the focused child (search box, comment field, canvas...)
+            // so Alt+Tab / closing a dialog returns focus there, not to the frame.
+            HWND focused = GetFocus();
+            if (focused && IsChild(hwnd_, focused)) lastFocusedChild_ = focused;
+        } else if (!HIWORD(wParam) && lastFocusedChild_ && IsWindow(lastFocusedChild_) &&
+            IsChild(hwnd_, lastFocusedChild_) && IsWindowVisible(lastFocusedChild_) &&
+            IsWindowEnabled(lastFocusedChild_)) {
+            SetFocus(lastFocusedChild_);
+            return 0;
+        }
+        return DefWindowProc(hwnd_, message, wParam, lParam);
+    }
 
+    LRESULT QuickSiftApplicationImpl::OnTitleMouseMove(LPARAM lParam) {
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        UpdateTrafficHover(point);
+        if (!trackingTitleMouse_) {
+            TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd_, 0 };
+            trackingTitleMouse_ = TrackMouseEvent(&track) != FALSE;
+        }
+        return 0;
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnTitleLeftButtonDown(WPARAM wParam, LPARAM lParam) {
+        const UINT message = WM_LBUTTONDOWN;
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        const TrafficLight light = HitTrafficLight(point);
+        if (light != TrafficLight::None) {
+            pressedTrafficLight_ = light;
+            hoveredTrafficLight_ = light;
+            SetCapture(hwnd_);
+            InvalidateTitleBar();
+            return 0;
+        }
+        return DefWindowProc(hwnd_, message, wParam, lParam);
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnTitleLeftButtonUp(WPARAM wParam, LPARAM lParam) {
+        const UINT message = WM_LBUTTONUP;
+        if (pressedTrafficLight_ != TrafficLight::None) {
+            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            const TrafficLight pressed = pressedTrafficLight_;
+            const TrafficLight releasedOver = HitTrafficLight(point);
+            pressedTrafficLight_ = TrafficLight::None;
+            if (GetCapture() == hwnd_) ReleaseCapture();
+            InvalidateTitleBar();
+            if (pressed == releasedOver) PerformTrafficAction(pressed);
+            return 0;
+        }
+        return DefWindowProc(hwnd_, message, wParam, lParam);
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnGetMinMaxInfo(MINMAXINFO* info) {
+        if (!info) return 0;
+
+        MONITORINFO monitorInfo{ sizeof(MONITORINFO) };
+        const HMONITOR monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+        if (!monitor || !GetMonitorInfoW(monitor, &monitorInfo)) {
+            monitorInfo.rcMonitor = { 0, 0,
+                std::max(1, GetSystemMetrics(SM_CXSCREEN)),
+                std::max(1, GetSystemMetrics(SM_CYSCREEN)) };
+            monitorInfo.rcWork = monitorInfo.rcMonitor;
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &monitorInfo.rcWork, 0);
+            QS_LOG_WARNING(L"UI", L"Window sizing is using primary-screen geometry because monitor information was unavailable");
+        }
+
+        const LONG workWidth = std::max<LONG>(1, monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+        const LONG workHeight = std::max<LONG>(1, monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+        info->ptMaxPosition.x = monitorInfo.rcWork.left - monitorInfo.rcMonitor.left;
+        info->ptMaxPosition.y = monitorInfo.rcWork.top - monitorInfo.rcMonitor.top;
+        info->ptMaxSize.x = workWidth;
+        info->ptMaxSize.y = workHeight;
+        info->ptMinTrackSize.x = std::min<LONG>(static_cast<LONG>(DipToPx(quicksift::ui::layout::main_window::kMinTrackWidthDip)), workWidth);
+        info->ptMinTrackSize.y = std::min<LONG>(static_cast<LONG>(DipToPx(quicksift::ui::layout::main_window::kMinTrackHeightDip)), workHeight);
+        return 0;
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnCtlColorListBox(WPARAM wParam, LPARAM lParam) {
+        // The library list fills any area it paints itself with the panel colour
+        // (the default COLOR_WINDOW brush was a white strip in dark theme).
+        if (reinterpret_cast<HWND>(lParam) == libraryList_) {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            SetBkColor(dc, Palette().panelStrong);
+            SetTextColor(dc, Palette().text);
+            return reinterpret_cast<LRESULT>(LibraryListBrush());
+        }
+        return DefWindowProc(hwnd_, WM_CTLCOLORLISTBOX, wParam, lParam);
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnMainCloseRequested() {
+        // Coalesced edits not yet submitted are written (or, if the user then
+        // chooses "Close anyway", cancelled with everything else) — never lost
+        // silently.
+        FlushPendingMetadataEdits();
+        // Never a silent block: show exactly what is pending (operation, file,
+        // count, elapsed, reason), live, with Force quit (blocking_wait_controller).
+        // Read-only indexing/metadata reads never block closing.
+        if (ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::Close)) return 0;
+        SaveSession();
+        DestroyWindow(hwnd_);
+        return 0;
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnQueryEndSession() {
+        SaveSession();
+        // A shutdown query is not a normal close request. Ask active work to
+        // stop at its next safe boundary, but do not auto-close QuickSift if
+        // this shutdown attempt is vetoed or cancelled by another process.
+        transactions_.CancelAll();
+        if (transactions_.Busy()) {
+            // An Exiv2 write cannot be interrupted safely once it has entered
+            // the library. Veto this shutdown attempt and let the user retry
+            // after the serialized transaction reaches its safe boundary.
+            const wchar_t* reason =
+                L"QuickSift is finishing a verified media transaction.";
+            if (ShutdownBlockReasonCreate(hwnd_, reason) != FALSE) {
+                shutdownBlocked_ = true;
+            }
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnEndSession(WPARAM wParam) {
+        if (shutdownBlocked_) {
+            ShutdownBlockReasonDestroy(hwnd_);
+            shutdownBlocked_ = false;
+        }
+        if (wParam != FALSE) {
+            SaveSession();
+            DestroyWindow(hwnd_);
+        } else {
+            // Another application vetoed shutdown. Re-open the coordinator
+            // so QuickSift does not remain permanently read-only afterward.
+            transactions_.CancelCloseRequest();
+            closingAfterTransactionCancellation_ = false;
+        }
+        return 0;
+    }
+
+    // WM_DESTROY: normal close and Force quit both arrive here.
+    void QuickSiftApplicationImpl::OnMainWindowDestroyed() {
+        if (shutdownBlocked_) {
+            ShutdownBlockReasonDestroy(hwnd_);
+            shutdownBlocked_ = false;
+        }
+        const auto shutdownStartedAt = std::chrono::steady_clock::now();
+        QS_LOG_INFO(L"Lifecycle", L"Shutdown sequence started after main window destruction");
+        RequestBackgroundStopForShutdown();
+        KillMainTimersForShutdown();
+        // Animation teardown: no cadence switches after this point; fading
+        // dropdowns are destroyed now and pending completions are dropped.
+        uiFramework_.Motion().SetActivationHook({});
+        uiFramework_.ShutdownAnimations();
+        uiFramework_.ClearPaneFrost();
+        if (libraryListBrush_) {
+            DeleteObject(libraryListBrush_);
+            libraryListBrush_ = nullptr;
+        }
+        KillInteractionTimersForShutdown();
+        // Normal close and Force quit both arrive here. Revoke the worker token
+        // and join every app-owned worker (ratings, batch, search, deferred
+        // startup) before the persistent cache closes: the deferred startup
+        // thread may still be opening it, and search reads comments from it.
+        StopAllWorkersForTeardown();
+        CloseBatchDialog();
+        thumbnailReconcileTimerActive_ = false;
+        completionPumpTimerActive_ = false;
+
+        StopServicesForShutdown();
+
+        const double totalMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - shutdownStartedAt).count();
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Lifecycle", L"shutdown_sequence_complete",
+            {L"total_ms", std::to_wstring(totalMs)});
+
+        if (faceWarningTooltip_) {
+            DestroyWindow(faceWarningTooltip_);
+            faceWarningTooltip_ = nullptr;
+        }
+        if (faceLockAvailabilityTooltip_) {
+            DestroyWindow(faceLockAvailabilityTooltip_);
+            faceLockAvailabilityTooltip_ = nullptr;
+        }
+        DestroyUiFonts();
+        PostQuitMessage(0);
+    }
+
+    void QuickSiftApplicationImpl::RequestBackgroundStopForShutdown() {
+        // Non-metadata work must never block close. Signal decode stop
+        // immediately (queues cleared, budgets stopped) without joining.
+        // The later worker_.Stop() joins only after in-flight work observes
+        // the stop flag. Only metadata writes (subject to kHardTimeout)
+        // are allowed to finish.
+        worker_.RequestStop();
+        {
+            std::lock_guard lock(searchMutex_);
+            searchWorkerStop_ = true;
+            searchHydrateQueue_.clear();
+            searchEvalJob_.reset();
+        }
+        searchCv_.notify_all();
+        scanner_.Cancel();
+    }
+
+    void QuickSiftApplicationImpl::KillMainTimersForShutdown() {
+        KillTimer(hwnd_, ID_TIMER_IDLE_QUALITY);
+        KillTimer(hwnd_, ID_TIMER_CACHE_FLUSH);
+        KillTimer(hwnd_, ID_TIMER_AUTOHIDE);
+        KillTimer(hwnd_, ID_TIMER_METADATA_UI);
+        KillTimer(hwnd_, ID_TIMER_VIEW_RESOURCE_TRIM);
+        KillTimer(hwnd_, ID_TIMER_BACKGROUND_ANALYSIS);
+        KillTimer(hwnd_, ID_TIMER_FOLDER_SELECTION);
+        KillTimer(hwnd_, ID_TIMER_FILE_PROGRESS);
+        KillTimer(hwnd_, ID_TIMER_PERFORMANCE_HUD);
+        KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RETRY_COOLDOWN);
+        KillTimer(hwnd_, ID_TIMER_ANIMATION);
+    }
+
+    void QuickSiftApplicationImpl::KillInteractionTimersForShutdown() {
+        KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
+        KillTimer(hwnd_, ID_TIMER_SCROLL_FRAME);
+        KillTimer(hwnd_, ID_TIMER_SCROLL_SETTLE);
+        KillTimer(hwnd_, ID_TIMER_THROTTLED_SCHEDULE);
+        KillTimer(hwnd_, ID_TIMER_COMPLETION_PUMP);
+        KillTimer(hwnd_, ID_TIMER_THUMBNAIL_RECONCILE);
+        KillTimer(hwnd_, ID_TIMER_RATINGS_PROGRESS);
+        KillTimer(hwnd_, ID_TIMER_BATCH_GLASS_WATCH);
+        KillTimer(hwnd_, ID_TIMER_SEARCH_DEBOUNCE);
+        searchDebounceArmed_ = false;
+        KillTimer(hwnd_, ID_TIMER_METADATA_WRITE_LANE);
+        metadataWriteLaneTimerActive_ = false;
+        KillTimer(hwnd_, ID_TIMER_USER_COMMENT_RETRY);
+        KillTimer(hwnd_, ID_TIMER_LIBRARY_LIST_RETRY);
+    }
+
+    // Staged service stops, each logged as a shutdown_stage event. Runs after
+    // StopAllWorkersForTeardown, so no app worker can touch the cache it closes.
+    void QuickSiftApplicationImpl::StopServicesForShutdown() {
+        auto logShutdownStage = [&](std::wstring_view stage, const auto startedAt) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - startedAt).count();
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Lifecycle", L"shutdown_stage",
+                {L"stage", std::wstring(stage)}, {L"ms", std::to_wstring(ms)});
+        };
+
+        auto stage = std::chrono::steady_clock::now();
+        resourcePressureMonitor_.Stop();
+        logShutdownStage(L"resource_pressure_stop", stage);
+
+        stage = std::chrono::steady_clock::now();
+        transactions_.Stop();
+        logShutdownStage(L"transactions_stop", stage);
+
+        stage = std::chrono::steady_clock::now();
+        scanner_.Cancel();
+        scanner_.SetNotify(nullptr);
+        logShutdownStage(L"scanner_cancel", stage);
+
+        stage = std::chrono::steady_clock::now();
+        worker_.SetNotify(nullptr);
+        worker_.Stop();
+        logShutdownStage(L"worker_stop", stage);
+
+        stage = std::chrono::steady_clock::now();
+        DrainPostedWorkerMessages();
+        logShutdownStage(L"drain_completions", stage);
+
+        stage = std::chrono::steady_clock::now();
+        // Persistent cache is disposable. Release SQLite/WAL handles without a
+        // forced checkpoint; committed WAL frames are recovered on the next open.
+        persistentCache_.CloseForShutdown();
+        logShutdownStage(L"cache_close", stage);
+    }
+
+
+    // Canvas window procedure (0.9.5.0 round 19: the larger cases moved into named
+    // handlers below with no behaviour change).
     LRESULT QuickSiftApplicationImpl::HandleCanvasMessage(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
         case WM_CREATE:
@@ -1316,81 +1384,14 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             return 0;
         case WM_ERASEBKGND:
             return 1;
-        case WM_LBUTTONDOWN: {
-            HideFaceWarningTooltip();
-            MarkInteraction();
-            SetFocus(canvas_);
-            const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-            if (HandleGlassAlertClick(point.x, point.y)) return 0;
-            if (HandleSearchFieldMouseDown(point.x, point.y)) return 0;
-            if (reviewState_.Mode() == ViewMode::Thumbnails && thumbnailScrollbarHot_) {
-                thumbnailScrollDragging_ = true;
-                thumbnailScrollMotionActive_ = true;
-                thumbnailDragLoadMode_ = 0;
-                thumbnailScrollConcurrentCap_ = 0;
-                thumbnailDragVelocityPixelsPerSecond_ = 0.0f;
-                worker_.SetThumbnailDragLoadMode(0);
-                worker_.SetThumbnailScrollConcurrentCap(0);
-                worker_.SetThumbnailDragActive(true);
-                thumbnailViewportNeedsUpdate_ = false;
-                const D2D1_RECT_F thumb = ThumbnailScrollbarThumbRect();
-                thumbnailScrollDragOffset_ = point.y - thumb.top;
-                SetCapture(canvas_);
-                InvalidateCanvas();
-                return 0;
-            }
-            OnCanvasLeftDown(point.x, point.y, wParam);
-            return 0;
-        }
-        case WM_LBUTTONUP: {
-            if (thumbnailScrollDragging_) {
-                thumbnailScrollDragging_ = false;
-                if (GetCapture() == canvas_) ReleaseCapture();
-                if (thumbnailDragRenderTimerActive_) {
-                    KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
-                    thumbnailDragRenderTimerActive_ = false;
-                }
-                thumbnailViewportNeedsUpdate_ = false;
-                // Settle-debounce fills the viewport; do not dump Interactive work on release.
-                ArmThumbnailScrollSettle();
-                ScheduleViewResourceTrim();
-                if (completionQueue_.Size() != 0 && hwnd_ && IsWindow(hwnd_)) {
-                    // The claim may still be held from the placeholder phase; refresh
-                    // it and post one wake so the backlog drains right after release.
-                    completionQueue_.ReleaseWake();
-                    RequestBackgroundCompletionWake();
-                }
-                InvalidateCanvas();
-                return 0;
-            }
-            if (uiFramework_.Alerts().Visible()) return 0;
-            const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-            OnCanvasLeftUp(point.x, point.y);
-            return 0;
-        }
+        case WM_LBUTTONDOWN:
+            return OnCanvasLeftButtonDownMessage(wParam, lParam);
+        case WM_LBUTTONUP:
+            return OnCanvasLeftButtonUpMessage(lParam);
         case WM_CAPTURECHANGED:
-        case WM_CANCELMODE: {
-            // Losing capture mid-press (Alt+Tab, modal UI) cancels a pending face click
-            // and the click-vs-drag press (OnCanvasLeftUp evaluates the click before
-            // its own ReleaseCapture, so this never eats a genuine click).
-            pendingFaceClick_.reset();
-            canvasPress_.Cancel();
-            faceTogglePress_ = {};
-            facePanDeferred_ = false;
-            if (reinterpret_cast<HWND>(lParam) != canvas_) dragging_ = false;
-            if (thumbnailScrollDragging_) {
-                thumbnailScrollDragging_ = false;
-                if (thumbnailDragRenderTimerActive_) {
-                    KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
-                    thumbnailDragRenderTimerActive_ = false;
-                }
-                thumbnailViewportNeedsUpdate_ = false;
-                ArmThumbnailScrollSettle();
-                InvalidateCanvas();
-                return 0;
-            }
+        case WM_CANCELMODE:
+            if (CancelCanvasPressOnCaptureLoss(lParam)) return 0;
             break;
-        }
         case WM_RBUTTONUP: {
             // Right-click on a photo pins/unpins the face outlines (FaceLock on,
             // Single/Compare only). Right-click had no canvas behaviour before.
@@ -1409,66 +1410,8 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             OnCanvasDoubleClick(point.x, point.y);
             return 0;
         }
-        case WM_MOUSEMOVE: {
-            const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
-            if (!trackingCanvasMouse_) {
-                TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, canvas_, 0 };
-                trackingCanvasMouse_ = TrackMouseEvent(&track) != FALSE;
-            }
-            if (uiFramework_.Alerts().Visible()) {
-                HideFaceWarningTooltip();
-                UpdateGlassAlertHover(point.x, point.y);
-                return 0;
-            }
-            if (reviewState_.Mode() == ViewMode::Thumbnails) {
-                if (thumbnailScrollDragging_) {
-                    const auto layout = CurrentThumbnailLayout();
-                    const float trackTop = 6.0f;
-                    const float trackBottom = layout.canvasHeight - 6.0f;
-                    const float trackHeight = std::max(1.0f, trackBottom - trackTop);
-                    const float thumbHeight = std::clamp(
-                        (layout.canvasHeight / std::max(1.0f, layout.contentHeight)) * trackHeight,
-                        32.0f, trackHeight);
-                    const float travel = std::max(1.0f, trackHeight - thumbHeight);
-                    const float desiredTop = std::clamp(
-                        point.y - thumbnailScrollDragOffset_, trackTop, trackTop + travel);
-                    const float ratio = (desiredTop - trackTop) / travel;
-                    const float previousScroll = reviewState_.Thumbnails().scrollDip;
-                    const auto now = std::chrono::steady_clock::now();
-                    reviewState_.SetThumbnailScroll(ratio * layout.maximumScroll);
-                    if (reviewState_.Thumbnails().scrollDip != previousScroll) {
-                        thumbnailPrefetchPlanner_.ObserveScroll(reviewState_.Thumbnails().scrollDip, now);
-                        ApplyThumbnailScrollLoadBudget(CurrentThumbnailScrollLoadBudget());
-                        // One virtualized frame (paint + optional publish) — never enqueue
-                        // from WM_MOUSEMOVE. Successive flings cancel settle via Request.
-                        RequestThumbnailScrollFrame();
-                        if (!thumbnailDragRenderTimerActive_) {
-                            thumbnailDragRenderTimerActive_ = StartUiTimer(ID_TIMER_DRAG_RENDER,
-                                static_cast<UINT>(quicksift::review::prefetch::ScrollFrameIntervalMilliseconds()),
-                                L"drag render throttle");
-                        }
-                    }
-                    return 0;
-                }
-                const D2D1_RECT_F thumb = ThumbnailScrollbarThumbRect();
-                const bool hit = point.x >= thumb.left - 16.0f && point.x <= thumb.right + 16.0f &&
-                    point.y >= thumb.top && point.y <= thumb.bottom;
-                if (hit != thumbnailScrollbarHot_) {
-                    thumbnailScrollbarHot_ = hit;
-                    InvalidateCanvas();
-                }
-                UpdateSearchFieldHover(point.x, point.y);
-                if ((wParam & MK_LBUTTON) == 0 && SearchFieldContains(point.x, point.y)) {
-                    // Over the floating field: no card hover / tooltips through it.
-                    HideFaceWarningTooltip();
-                    return 0;
-                }
-            }
-            UpdateFaceWarningTooltip(point.x, point.y);
-            if ((wParam & MK_LBUTTON) != 0) MarkInteraction();
-            OnCanvasMouseMove(point.x, point.y, wParam);
-            return 0;
-        }
+        case WM_MOUSEMOVE:
+            return OnCanvasMouseMoveMessage(wParam, lParam);
         case WM_MOUSELEAVE:
             trackingCanvasMouse_ = false;
             HideFaceWarningTooltip();
@@ -1479,6 +1422,8 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         case WM_MOUSEWHEEL: {
             HideFaceWarningTooltip();
             if (uiFramework_.Alerts().Visible()) return 0;
+            // Focus-routed wheel with the pointer over the open pane scrolls the pane.
+            if (HandlePaneWheel(wParam, lParam)) return 0;
             MarkInteraction();
             POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
             ScreenToClient(canvas_, &point);
@@ -1495,18 +1440,226 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             OnKeyDown(static_cast<UINT>(wParam), GetKeyState(VK_CONTROL) < 0, GetKeyState(VK_SHIFT) < 0);
             return 0;
         case WM_SETCURSOR:
-            if (uiFramework_.Alerts().Visible() && uiFramework_.Alerts().AnyButtonHot()) {
-                SetCursor(LoadCursor(nullptr, IDC_HAND));
-                return TRUE;
-            }
-            if (dragging_) {
-                // A face-outline press stays a hand until it becomes a drag (pan).
-                SetCursor(LoadCursor(nullptr, facePanDeferred_ ? IDC_HAND : IDC_SIZEALL));
-                return TRUE;
-            }
+            if (SetCanvasCursor(lParam)) return TRUE;
             break;
         }
         return DefWindowProc(hwnd, message, wParam, lParam);
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnCanvasLeftButtonDownMessage(WPARAM wParam, LPARAM lParam) {
+        HideFaceWarningTooltip();
+        MarkInteraction();
+        SetFocus(canvas_);
+        const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        if (HandleGlassAlertClick(point.x, point.y)) return 0;
+        if (!uiFramework_.Alerts().Visible() && HudHandleHit(point.x, point.y)) {
+            // Only the handle strip is interactive; the rest of the HUD is click-through.
+            hudDragging_ = true;
+            hudDragOffset_ = D2D1::Point2F(point.x - hudPanelRect_.left, point.y - hudPanelRect_.top);
+            SetCapture(canvas_);
+            InvalidateCanvas();
+            return 0;
+        }
+        if (HandleSearchFieldMouseDown(point.x, point.y)) return 0;
+        if (reviewState_.Mode() == ViewMode::Thumbnails && thumbnailScrollbarHot_) {
+            BeginThumbnailScrollbarDrag(point.y);
+            return 0;
+        }
+        OnCanvasLeftDown(point.x, point.y, wParam);
+        return 0;
+    }
+
+    void QuickSiftApplicationImpl::BeginThumbnailScrollbarDrag(float pointY) {
+        thumbnailScrollDragging_ = true;
+        thumbnailScrollMotionActive_ = true;
+        thumbnailDragLoadMode_ = 0;
+        thumbnailScrollConcurrentCap_ = 0;
+        thumbnailDragVelocityPixelsPerSecond_ = 0.0f;
+        worker_.SetThumbnailDragLoadMode(0);
+        worker_.SetThumbnailScrollConcurrentCap(0);
+        worker_.SetThumbnailDragActive(true);
+        thumbnailViewportNeedsUpdate_ = false;
+        const D2D1_RECT_F thumb = ThumbnailScrollbarThumbRect();
+        thumbnailScrollDragOffset_ = pointY - thumb.top;
+        SetCapture(canvas_);
+        InvalidateCanvas();
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnCanvasLeftButtonUpMessage(LPARAM lParam) {
+        if (hudDragging_) {
+            hudDragging_ = false;
+            if (GetCapture() == canvas_) ReleaseCapture();
+            // Store the clamped position (what is on screen), in DIPs.
+            hudX_ = hudPanelRect_.left;
+            hudY_ = hudPanelRect_.top;
+            SaveSession();
+            InvalidateCanvas();
+            return 0;
+        }
+        if (thumbnailScrollDragging_) {
+            EndThumbnailScrollbarDrag();
+            return 0;
+        }
+        if (uiFramework_.Alerts().Visible()) return 0;
+        const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        OnCanvasLeftUp(point.x, point.y);
+        return 0;
+    }
+
+    void QuickSiftApplicationImpl::EndThumbnailScrollbarDrag() {
+        thumbnailScrollDragging_ = false;
+        if (GetCapture() == canvas_) ReleaseCapture();
+        if (thumbnailDragRenderTimerActive_) {
+            KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
+            thumbnailDragRenderTimerActive_ = false;
+        }
+        thumbnailViewportNeedsUpdate_ = false;
+        // Settle-debounce fills the viewport; do not dump Interactive work on release.
+        ArmThumbnailScrollSettle();
+        ScheduleViewResourceTrim();
+        if (completionQueue_.Size() != 0 && hwnd_ && IsWindow(hwnd_)) {
+            // The claim may still be held from the placeholder phase; refresh
+            // it and post one wake so the backlog drains right after release.
+            completionQueue_.ReleaseWake();
+            RequestBackgroundCompletionWake();
+        }
+        InvalidateCanvas();
+    }
+
+    // WM_CAPTURECHANGED / WM_CANCELMODE. Returns true when the message is fully
+    // handled (a scrollbar drag ended); false falls through to DefWindowProc.
+    bool QuickSiftApplicationImpl::CancelCanvasPressOnCaptureLoss(LPARAM lParam) {
+        // Losing capture mid-press (Alt+Tab, modal UI) cancels a pending face click
+        // and the click-vs-drag press (OnCanvasLeftUp evaluates the click before
+        // its own ReleaseCapture, so this never eats a genuine click).
+        pendingFaceClick_.reset();
+        canvasPress_.Cancel();
+        if (hudDragging_) {
+            hudDragging_ = false;
+            hudX_ = hudPanelRect_.left;
+            hudY_ = hudPanelRect_.top;
+            SaveSession();
+            InvalidateCanvas();
+        }
+        faceTogglePress_ = {};
+        facePanDeferred_ = false;
+        if (reinterpret_cast<HWND>(lParam) != canvas_) dragging_ = false;
+        if (thumbnailScrollDragging_) {
+            thumbnailScrollDragging_ = false;
+            if (thumbnailDragRenderTimerActive_) {
+                KillTimer(hwnd_, ID_TIMER_DRAG_RENDER);
+                thumbnailDragRenderTimerActive_ = false;
+            }
+            thumbnailViewportNeedsUpdate_ = false;
+            ArmThumbnailScrollSettle();
+            InvalidateCanvas();
+            return true;
+        }
+        return false;
+    }
+
+    LRESULT QuickSiftApplicationImpl::OnCanvasMouseMoveMessage(WPARAM wParam, LPARAM lParam) {
+        const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        if (!trackingCanvasMouse_) {
+            TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, canvas_, 0 };
+            trackingCanvasMouse_ = TrackMouseEvent(&track) != FALSE;
+        }
+        if (hudDragging_) {
+            const D2D1_SIZE_F size = renderTarget_ ? renderTarget_->GetSize() : D2D1::SizeF(0.0f, 0.0f);
+            const float width = hudPanelRect_.right - hudPanelRect_.left;
+            const float height = hudPanelRect_.bottom - hudPanelRect_.top;
+            hudX_ = std::clamp(point.x - hudDragOffset_.x, 0.0f, std::max(0.0f, size.width - width));
+            hudY_ = std::clamp(point.y - hudDragOffset_.y, 0.0f, std::max(0.0f, size.height - height));
+            InvalidateCanvas();
+            return 0;
+        }
+        if (const bool hot = HudHandleHit(point.x, point.y); hot != hudHandleHot_) {
+            hudHandleHot_ = hot;
+            InvalidateCanvas();
+        }
+        if (uiFramework_.Alerts().Visible()) {
+            HideFaceWarningTooltip();
+            UpdateGlassAlertHover(point.x, point.y);
+            return 0;
+        }
+        if (reviewState_.Mode() == ViewMode::Thumbnails) {
+            if (thumbnailScrollDragging_) {
+                DragThumbnailScrollbar(point.y);
+                return 0;
+            }
+            const D2D1_RECT_F thumb = ThumbnailScrollbarThumbRect();
+            const bool hit = point.x >= thumb.left - 16.0f && point.x <= thumb.right + 16.0f &&
+                point.y >= thumb.top && point.y <= thumb.bottom;
+            if (hit != thumbnailScrollbarHot_) {
+                thumbnailScrollbarHot_ = hit;
+                InvalidateCanvas();
+            }
+            UpdateSearchFieldHover(point.x, point.y);
+            if ((wParam & MK_LBUTTON) == 0 && SearchFieldContains(point.x, point.y)) {
+                // Over the floating field: no card hover / tooltips through it.
+                HideFaceWarningTooltip();
+                return 0;
+            }
+        }
+        UpdateFaceWarningTooltip(point.x, point.y);
+        if ((wParam & MK_LBUTTON) != 0) MarkInteraction();
+        OnCanvasMouseMove(point.x, point.y, wParam);
+        return 0;
+    }
+
+    // Scrollbar thumb drag: map the pointer to a scroll position and request one
+    // virtualized frame (never enqueue decode work from WM_MOUSEMOVE).
+    void QuickSiftApplicationImpl::DragThumbnailScrollbar(float pointY) {
+        const auto layout = CurrentThumbnailLayout();
+        const float trackTop = 6.0f;
+        const float trackBottom = layout.canvasHeight - 6.0f;
+        const float trackHeight = std::max(1.0f, trackBottom - trackTop);
+        const float thumbHeight = std::clamp(
+            (layout.canvasHeight / std::max(1.0f, layout.contentHeight)) * trackHeight,
+            32.0f, trackHeight);
+        const float travel = std::max(1.0f, trackHeight - thumbHeight);
+        const float desiredTop = std::clamp(
+            pointY - thumbnailScrollDragOffset_, trackTop, trackTop + travel);
+        const float ratio = (desiredTop - trackTop) / travel;
+        const float previousScroll = reviewState_.Thumbnails().scrollDip;
+        const auto now = std::chrono::steady_clock::now();
+        reviewState_.SetThumbnailScroll(ratio * layout.maximumScroll);
+        if (reviewState_.Thumbnails().scrollDip != previousScroll) {
+            thumbnailPrefetchPlanner_.ObserveScroll(reviewState_.Thumbnails().scrollDip, now);
+            ApplyThumbnailScrollLoadBudget(CurrentThumbnailScrollLoadBudget());
+            // One virtualized frame (paint + optional publish) — never enqueue
+            // from WM_MOUSEMOVE. Successive flings cancel settle via Request.
+            RequestThumbnailScrollFrame();
+            if (!thumbnailDragRenderTimerActive_) {
+                thumbnailDragRenderTimerActive_ = StartUiTimer(ID_TIMER_DRAG_RENDER,
+                    static_cast<UINT>(quicksift::review::prefetch::ScrollFrameIntervalMilliseconds()),
+                    L"drag render throttle");
+            }
+        }
+    }
+
+    // WM_SETCURSOR. Returns true when a cursor was set (the message returns TRUE).
+    bool QuickSiftApplicationImpl::SetCanvasCursor(LPARAM lParam) {
+        if (uiFramework_.Alerts().Visible() && uiFramework_.Alerts().AnyButtonHot()) {
+            SetCursor(LoadCursor(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        if (LOWORD(lParam) == HTCLIENT && performanceHudVisible_) {
+            POINT cursor{};
+            if (GetCursorPos(&cursor) && ScreenToClient(canvas_, &cursor)) {
+                const auto point = CanvasPixelsToDips(cursor.x, cursor.y);
+                if (hudDragging_ || HudHandleHit(point.x, point.y)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+                    return TRUE;
+                }
+            }
+        }
+        if (dragging_) {
+            // A face-outline press stays a hand until it becomes a drag (pan).
+            SetCursor(LoadCursor(nullptr, facePanDeferred_ ? IDC_HAND : IDC_SIZEALL));
+            return TRUE;
+        }
+        return false;
     }
 
 
@@ -1587,6 +1740,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
 
 
     void QuickSiftApplicationImpl::RecreateUiFonts() {
+        MarkTitleLayoutDirty(); // caption widths are measured with these fonts
         // Type scale + families from the design tokens; Segoe UI Variable resolves
         // to Segoe UI where it is not installed (Windows 10) instead of GDI's
         // arbitrary substitute.
@@ -1616,6 +1770,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         uiFontSemibold_ = newSemibold ? newSemibold : oldSemibold;
         uiTitleFont_ = newTitle ? newTitle : oldTitle;
         ApplyUiFontsToControls(uiFont_, uiFontSemibold_);
+        RestyleTooltips(); // DPI-scaled tooltip font and margins
 
         if (newNormal && oldNormal) DeleteObject(oldNormal);
         if (newSemibold && oldSemibold) DeleteObject(oldSemibold);

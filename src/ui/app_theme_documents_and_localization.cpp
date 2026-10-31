@@ -1,6 +1,8 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
 
+#include "ui/ui_layout_constants.h"
+
 namespace quicksift::app {
 
 
@@ -57,7 +59,8 @@ namespace quicksift::app {
                     reinterpret_cast<WPARAM>(state->normalFont), TRUE);
             }
         }
-        for (HWND button : { state->refresh, state->exportButton, state->close }) {
+        for (HWND button : { state->refresh, state->exportButton, state->close,
+                state->verboseLogging, state->autoRefresh, state->previousSessions }) {
             if (!button) continue;
             SetWindowTheme(button, L"", L"");
             if (state->semiboldFont) {
@@ -71,9 +74,13 @@ namespace quicksift::app {
 
     HWND QuickSiftApplicationImpl::ShowDocumentWindow(const std::wstring& title, const std::wstring& body, DocumentKind kind,
         std::wstring_view titleKey) {
+        namespace docsize = ::quicksift::ui::layout::document;
         const bool missingFiles = kind == DocumentKind::MissingFiles;
-        const int width = DipToPx(missingFiles ? 640 : 760);
-        const int height = DipToPx(missingFiles ? 460 : 680);
+        const bool verbatim = missingFiles || kind == DocumentKind::SessionLog;
+        const int width = DipToPx(missingFiles ? docsize::kMissingFilesWidthDip :
+            (kind == DocumentKind::DiagnosticLog || kind == DocumentKind::SessionLog ? docsize::kDiagnosticLogWidthDip :
+            docsize::kDocumentWidthDip));
+        const int height = DipToPx(missingFiles ? docsize::kMissingFilesHeightDip : docsize::kDocumentHeightDip);
         RECT owner{};
         if (!GetWindowRect(hwnd_, &owner)) {
             owner = { 0, 0, width, height };
@@ -137,17 +144,16 @@ namespace quicksift::app {
                 ID_DOCUMENT_REFRESH, Tr(L"Refresh") });
             state->exportButton = uiFramework_.CreateButton({ document, instance_,
                 ID_DOCUMENT_EXPORT, Tr(L"Export…") });
-            state->verboseLogging = uiFramework_.CreateControl({
-                0, L"BUTTON", Tr(L"Verbose logging"),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS | BS_AUTOCHECKBOX,
-                document, ID_DOCUMENT_VERBOSE, instance_, nullptr});
-            if (state->verboseLogging) {
-                SendMessageW(state->verboseLogging, BM_SETCHECK,
-                    quicksift::diagnostics::VerboseLogging() ? BST_CHECKED : BST_UNCHECKED, 0);
-                if (state->normalFont) SendMessageW(state->verboseLogging, WM_SETFONT,
-                    reinterpret_cast<WPARAM>(state->normalFont), TRUE);
-                SetWindowTheme(state->verboseLogging, state->theme.dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-            }
+            // Shared custom-drawn checkboxes (MacOsUiFramework::PaintCheckbox).
+            state->verboseLogging = uiFramework_.CreateButton({ document, instance_,
+                ID_DOCUMENT_VERBOSE, Tr(L"Verbose logging") });
+            state->autoRefresh = uiFramework_.CreateButton({ document, instance_,
+                ID_DOCUMENT_AUTO_REFRESH, Tr(L"Auto refresh") });
+            state->previousSessions = uiFramework_.CreateButton({ document, instance_,
+                ID_DOCUMENT_PREVIOUS_SESSIONS, Tr(L"Previous sessions…") });
+            state->browseSessionLogs = [this](HWND window, HWND anchor) { BrowseSessionLogs(window, anchor); };
+            quicksift::ui::framework::MacOsUiFramework::SetCheckboxChecked(state->verboseLogging,
+                quicksift::diagnostics::VerboseLogging());
         }
         state->close = uiFramework_.CreateButton({ document, instance_, IDOK, Tr(L"Close") });
         if (state->close) {
@@ -158,7 +164,8 @@ namespace quicksift::app {
                     ~static_cast<LONG_PTR>(WS_TABSTOP));
         }
         if (!state->edit || !state->close ||
-            (state->diagnosticLog && (!state->refresh || !state->exportButton || !state->verboseLogging))) {
+            (state->diagnosticLog && (!state->refresh || !state->exportButton || !state->verboseLogging || !state->autoRefresh ||
+                !state->previousSessions))) {
             QS_LOG_ERROR(L"UI", L"One or more required document-window controls could not be created");
             DestroyWindow(document); // The subclass owns and releases state.
             return nullptr;
@@ -177,10 +184,19 @@ namespace quicksift::app {
             if (state->refresh) SendMessageW(state->refresh, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
             if (state->exportButton) SendMessageW(state->exportButton, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
             if (state->verboseLogging) SendMessageW(state->verboseLogging, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
+            if (state->autoRefresh) SendMessageW(state->autoRefresh, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
+            if (state->previousSessions) SendMessageW(state->previousSessions, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
             SendMessageW(state->close, WM_SETFONT, reinterpret_cast<WPARAM>(uiFont_), TRUE);
         }
-        if (missingFiles) SetDocumentPlainText(state->edit, body, state->richEdit, state->theme);
+        if (kind == DocumentKind::SessionLog) {
+            // Up to core::session_logs::kMaxDisplayBytes of text: lift the 32K default limit.
+            const auto limit = static_cast<LPARAM>(body.size() + 1024);
+            SendMessageW(state->edit, state->richEdit ? EM_EXLIMITTEXT : EM_SETLIMITTEXT,
+                0, limit);
+        }
+        if (verbatim) SetDocumentPlainText(state->edit, body, state->richEdit, state->theme);
         else SetDocumentControlText(state->edit, body, kind == DocumentKind::Help, state->richEdit, state->theme);
+        if (state->diagnosticLog || kind == DocumentKind::SessionLog) ScrollDocumentToEnd(state->edit); // newest entry is last
         RECT client{};
         if (GetClientRect(document, &client)) {
             SendMessageW(document, WM_SIZE, 0, MAKELPARAM(client.right, client.bottom));
@@ -220,12 +236,15 @@ namespace quicksift::app {
                 const auto kind = static_cast<DocumentKind>(kindValue);
                 const bool help = kind == DocumentKind::Help;
                 const bool diagnosticLog = kind == DocumentKind::DiagnosticLog;
-                if (kind == DocumentKind::MissingFiles) {
-                    // Verbatim list: keep the text, re-apply title/theme/caption only.
+                if (kind == DocumentKind::MissingFiles || kind == DocumentKind::SessionLog) {
+                    // Verbatim text: keep it, re-apply title/theme/caption only.
                     auto* missingState = reinterpret_cast<DocumentWindowState*>(
                         GetPropW(window, kDocumentStateProperty));
-                    SetWindowTextW(window, context->app->Tr(missingState && !missingState->titleKey.empty() ?
-                        std::wstring_view(missingState->titleKey) : std::wstring_view(L"Missing files")).c_str());
+                    std::wstring windowTitle = context->app->Tr(missingState && !missingState->titleKey.empty() ?
+                        std::wstring_view(missingState->titleKey) : std::wstring_view(L"Missing files"));
+                    if (missingState && !missingState->titleSuffix.empty())
+                        windowTitle += L" \u2014 " + missingState->titleSuffix;
+                    SetWindowTextW(window, windowTitle.c_str());
                     if (missingState) context->app->ApplyDocumentTheme(window, missingState);
                     if (HWND edit = GetDlgItem(window, ID_DOCUMENT_TEXT)) {
                         const int length = GetWindowTextLengthW(edit);
@@ -261,6 +280,15 @@ namespace quicksift::app {
                 }
                 if (HWND refresh = GetDlgItem(window, ID_DOCUMENT_REFRESH))
                     SetWindowTextW(refresh, context->app->Tr(L"Refresh").c_str());
+                if (diagnosticLog) {
+                    if (HWND edit = GetDlgItem(window, ID_DOCUMENT_TEXT)) ScrollDocumentToEnd(edit);
+                }
+                if (HWND verbose = GetDlgItem(window, ID_DOCUMENT_VERBOSE))
+                    SetWindowTextW(verbose, context->app->Tr(L"Verbose logging").c_str());
+                if (HWND autoRefresh = GetDlgItem(window, ID_DOCUMENT_AUTO_REFRESH))
+                    SetWindowTextW(autoRefresh, context->app->Tr(L"Auto refresh").c_str());
+                if (HWND previous = GetDlgItem(window, ID_DOCUMENT_PREVIOUS_SESSIONS))
+                    SetWindowTextW(previous, context->app->Tr(L"Previous sessions…").c_str());
                 if (HWND exportButton = GetDlgItem(window, ID_DOCUMENT_EXPORT))
                     SetWindowTextW(exportButton, context->app->Tr(L"Export…").c_str());
                 if (HWND close = GetDlgItem(window, IDOK))
@@ -282,7 +310,7 @@ namespace quicksift::app {
 
 
     std::wstring QuickSiftApplicationImpl::FaceWarningTooltipText() const {
-        return Tr(L"Red border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.");
+        return Tr(L"Red dashed border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.");
     }
 
 
@@ -336,6 +364,7 @@ namespace quicksift::app {
         spec.toolId = kFaceWarningTooltipId;
         spec.text = &faceWarningTooltipText_;
         faceWarningTooltip_ = uiFramework_.CreateTooltip(spec);
+        RestyleTooltips();
         if (!faceWarningTooltip_) {
             quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Warning,
                 L"UI", L"Creating the face-focus warning tooltip");
@@ -403,6 +432,7 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::RefreshLocalizedText() {
+        MarkTitleLayoutDirty(); // captions change width; the re-layout below re-applies
         if (hwnd_) SetWindowTextW(hwnd_, localizer_.WindowTitle().c_str());
         for (const auto& [id, key] : controlTextKeys_) {
             const auto found = controls_.find(id);
@@ -422,6 +452,12 @@ namespace quicksift::app {
         UpdateDateFilterButton();
         UpdateSortButton();
         UpdateRatingButton();
+        UpdateColorLabelButton();
+        UpdateColorLabelFilterButton();
+        UpdatePickFilterButton();
+        UpdateRatingFilterButton();
+        UpdateFullscreenButton();
+        UpdateZoomModeButton();
         UpdateThumbnailSizeButton();
         UpdateToggleButtons();
         UpdateLanguageSelectorButton();
@@ -453,6 +489,17 @@ namespace quicksift::app {
         if (exif_) InvalidateRect(exif_, nullptr, FALSE);
         for (HWND tab : flyoutTabs_) if (tab) InvalidateRect(tab, nullptr, FALSE);
         RedrawActiveFlyoutContents();
+        // 0.9.5.0: owner-drawn panes that call Tr() at paint time (comments pane,
+        // settings section headers, library list) and the live HUD / blocking-wait
+        // dialog are part of the same central pass.
+        for (HWND window : { userCommentLabel_, userCommentEdit_, libraryList_, filterLabel_,
+                 filmstripToggle_, languageSelector_, flyoutBackdrop_ }) {
+            if (window) InvalidateRect(window, nullptr, TRUE);
+        }
+        for (HWND label : settingsSectionLabels_) if (label) InvalidateRect(label, nullptr, TRUE);
+        hudCountsAt_ = {}; // HUD blocking reason is localized; rebuild on next frame
+        hudTextWidthDip_ = 0.0f;
+        if (blockingWaitCommand_) UpdateBlockingWaitDialog();
         RefreshOpenDocumentWindows();
         RequestExifForActive();
         UpdateStatus();
@@ -477,8 +524,57 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::ApplyTheme() {
+    void QuickSiftApplicationImpl::UpdateTruncationTooltip(HWND button, bool truncated,
+        const std::wstring& fullText) {
+        // Root cause of "overflow tooltips never show": the tools were TTF_SUBCLASS
+        // tools on buttons that already carry the framework hover subclass and are
+        // painted through the buffered pane pass; comctl32 never got the relayed
+        // hover for them, so the tip never popped (and TTM_ADDTOOL failures were
+        // silent). The framework now shows ONE tracking tooltip from its own hover
+        // tracking (MacOsUiFramework::ArmOverflowTip / ShowOverflowTip).
+        using quicksift::ui::framework::MacOsUiFramework;
+        if (!button || !hwnd_) return;
+        const auto found = truncatedButtonText_.find(button);
+        if (!truncated || fullText.empty()) {
+            if (found != truncatedButtonText_.end()) {
+                MacOsUiFramework::SetButtonOverflowText(button, nullptr);
+                truncatedButtonText_.erase(found);
+            }
+            return;
+        }
+        if (found != truncatedButtonText_.end() && found->second == fullText) return;
+        if (!truncationTooltip_) {
+            MacOsUiFramework::SetOverflowTraceSink([](const wchar_t* message) noexcept {
+                quicksift::diagnostics::Write(quicksift::diagnostics::Level::Trace, L"Tooltip", message);
+            });
+            truncationTooltip_ = MacOsUiFramework::CreateOverflowTooltip(hwnd_, instance_);
+            if (!truncationTooltip_) {
+                quicksift::diagnostics::Write(quicksift::diagnostics::Level::Warning, L"UI",
+                    L"Overflow tooltip could not be created; truncated captions have no tooltip.");
+                return;
+            }
+            MacOsUiFramework::StyleTooltip(truncationTooltip_, Palette(), currentDpi_, uiFont_);
+            MacOsUiFramework::SetOverflowTooltip(truncationTooltip_);
+        }
+        std::wstring& stored = truncatedButtonText_[button];
+        MacOsUiFramework::SetButtonOverflowText(button, nullptr); // old pointer may dangle
+        stored = fullText;
+        MacOsUiFramework::SetButtonOverflowText(button, stored.c_str());
+    }
+
+
+    void QuickSiftApplicationImpl::RestyleTooltips() {
         const ThemePalette palette = Palette();
+        for (HWND tooltip : { truncationTooltip_, libraryTooltip_, faceWarningTooltip_, faceLockAvailabilityTooltip_ }) {
+            quicksift::ui::framework::MacOsUiFramework::StyleTooltip(tooltip, palette, currentDpi_, uiFont_);
+        }
+    }
+
+
+    void QuickSiftApplicationImpl::ApplyTheme() {
+        MarkTitleLayoutDirty();
+        const ThemePalette palette = Palette();
+        RestyleTooltips();
         // Central DWM chrome: dark title, no coloured system frame around the custom
         // chrome (DWMWA_COLOR_NONE; system colours in high contrast), rounded corners
         // (square while fullscreen) and no system backdrop behind the opaque canvas.
@@ -502,6 +598,7 @@ namespace quicksift::app {
         overlayBrush_.Reset();
         glassBorderBrush_.Reset();
         glassHighlightBrush_.Reset();
+        blurOutlineBrush_.Reset(); // round 23: theme-dependent red
         backgroundPixels_.clear();
         backgroundCacheWidth_ = 0;
         backgroundCacheHeight_ = 0;
@@ -524,6 +621,17 @@ namespace quicksift::app {
         invalidate(exif_);
         invalidate(status_);
         for (HWND tab : flyoutTabs_) invalidate(tab);
+        // Windows outside controls_ that also paint theme colours. The left pane
+        // backdrop draws the closed-rail accent indicator; it was never invalidated
+        // on a theme switch, so the indicator kept the previous theme's colours.
+        for (HWND window : { flyoutBackdrop_, libraryList_, filterLabel_, userCommentEdit_,
+                userCommentLabel_, searchInput_, filmstripToggle_, languageSelector_ }) {
+            if (window) RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_FRAME);
+        }
+        for (HWND label : settingsSectionLabels_) invalidate(label);
+        // Catch-all: every descendant (including hidden/zero-region ones, whose stale
+        // pixels would otherwise show on the next reveal) is dirtied once.
+        RedrawWindow(hwnd_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_FRAME | RDW_ALLCHILDREN);
         // The left pane keeps its own ordered compose (backdrop, then content).
         RedrawActiveFlyoutContents();
         // Single synchronous flush of whatever is still invalid (no RDW_INVALIDATE:

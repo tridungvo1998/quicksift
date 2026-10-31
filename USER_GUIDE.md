@@ -27,9 +27,11 @@ Use the mouse wheel to zoom and drag to pan. The zoom selector provides Fit, Fit
 
 In Compare mode, **Sync** keeps zoom and pan aligned between panes. **Face Lock** keeps the view anchored on a face when face data is available (see *Face Lock with several faces* below). **F11** enters fullscreen; the title bar retracts toward the top edge and reappears when the pointer rests there briefly.
 
+In Single view, **F7** or the **›** button on the right edge shows the **filmstrip**: a column of neighbouring images centred on the current one. Click a thumbnail, or scroll the mouse wheel over the strip, to change images. Filmstrip thumbnails show the same star-rating and Pick/Reject badges as the grid (following the **Settings** badge options) and the red dashed border for a possibly blurred photo. The strip fades in and out (instantly when Windows animations are turned off). While the strip is open, the photo is fitted into the remaining space, so no part of it is hidden. QuickSift remembers whether the strip is on, and keeps it on when you return from Grid or Compare. The strip is hidden in Compare mode.
+
 Rotate left/right changes the display orientation only. It never rotates the source file.
 
-A red border around a thumbnail means at least one detected face looks out of focus, motion-blurred, or has its eyes closed according to QuickSift's conservative analysis. Hover the border to see which face and why (for example "Face 2: eyes closed"; faces are numbered left to right); in Single and Compare the same reason appears in the status bar. Treat this as a prompt to inspect at 100%, not as an automatic rejection verdict.
+A red dashed border around a thumbnail (in the grid and on the filmstrip) means at least one detected face looks out of focus, motion-blurred, or has its eyes closed according to QuickSift's conservative analysis. Hover the border to see which face and why (for example "Face 2: eyes closed"; faces are numbered left to right); in Single and Compare the same reason appears in the status bar. Treat this as a prompt to inspect at 100%, not as an automatic rejection verdict.
 
 ### Face Lock with several faces
 
@@ -57,6 +59,28 @@ Metadata-dependent filters include only authoritative values. Photographs whose 
 is still being read, could not be read, or contains an unsupported custom value do not
 pretend to be unrated, unmarked, or unlabeled. Results update progressively as authoritative
 metadata arrives.
+
+### Format, date and camera-settings filters
+
+- **Format** and **Date** list only the extensions and capture dates present in the folder.
+- **ISO**, **Aperture**, **Focal length**, **Shutter**, **Camera** and **Hour** filter by shooting
+  settings, listing only values present in the folder. Camera names are the full model without a
+  repeated make ("Canon EOS R5", not "Canon Canon EOS R5"). ISO values that cameras store in the
+  32-bit EXIF form are read too.
+- Settings and capture dates are read on a background worker, below image display and your own
+  actions, so opening a filter menu never freezes the window. In a large, never-indexed folder the
+  first opening may list only the values known so far; reopen the menu to see more. An active filter
+  re-applies itself as values arrive. Changing folders cancels reading for the previous folder.
+- Read settings are remembered per file and re-read automatically when the file changes (size or
+  modified time), so an edited photo does not keep showing stale values.
+- Menu value lists are maintained incrementally as values arrive (and cleared on folder change),
+  so the menus open instantly even in folders with tens of thousands of photos.
+
+Ratings, picks and labels are indexed visible-first: with no Stars, Pick/Reject or Label filter
+active, the photos on screen (and about one screen above and two below, or the neighbours of the
+photo in Single/Compare view) are read first and the rest at idle priority. Turning such a filter
+on, or sorting by rating, moves every remaining photo up the queue. The "metadata pending" status
+stays until all photos are read, so counts are never shown as final early.
 
 ### Thumbnail search
 
@@ -88,13 +112,22 @@ In Single and Compare views, Ctrl+F still means zoom to fit.
 | `date:fri`, `date:friday`, `date:thứ sáu` | taken on that weekday | Bare weekday names are treated as text, so use `date:` |
 | `date:12/10`, `date:12/10/2026`, `2026-10-12` | taken on that day | DD/MM order. ISO dates also work without `date:`. `ngày:` works like `date:` |
 | `5 stars`, `5 sta`, `5 sao`, `5★`, `5*`, `★★★★★`, `rating:5` | exactly 5 stars | Any unit prefix of at least 3 letters (`sta`, `star`, `stars`, `sao`) |
-| `>=4 stars`, `4+`, `>3 stars`, `<=2 stars`, `stars:>=4` | rating comparison | |
+| `>=4 stars`, `4+`, `>3 stars`, `<=2 stars`, `stars:>=4`, `>=3*`, `≥3 stars`, `≤ 4 stars` | rating comparison | |
+| `0 stars and up`, `3 stars or more`, `3 stars and above`, `3 stars or higher`, `at least 3 stars`, `no less than 3 stars` | 3 stars or more (≥) | `star` also works: `at least 1 star` |
+| `5 stars and lower`, `5 stars or less`, `5 stars and below`, `at most 4 stars`, `no more than 4 stars`, `up to 4 stars` | that many or fewer (≤) | |
+| `less than 5 stars`, `under 3 stars`, `below 3 stars`, `fewer than 3 stars` / `more than 2 stars`, `over 2 stars`, `above 2 stars` | strictly fewer (<) / strictly more (>) | |
+| `3 sao trở lên`, `từ 3 sao`, `ít nhất 3 sao`, `tối thiểu 3 sao` / `5 sao trở xuống`, `tối đa 4 sao`, `không quá 4 sao` | ≥ / ≤ | Without diacritics too: `3 sao tro len`, `khong qua 4 sao` |
+| `dưới 5 sao`, `ít hơn 5 sao` / `trên 2 sao`, `nhiều hơn 2 sao`, `hơn 2 sao` | < / > | |
 | `unrated`, `0 stars`, `rating:unrated` | no stars | |
 | `red`, `yellow`, `green`, `blue`, `purple`, `đỏ`, `vàng`, `xanh lá` | that colour label | Fuzzy: `yelow`, `grn`, `purp`, `pur` |
 | `no color`, `color:none` | no colour label | `label:`, `colour:` and `màu:` work like `color:` |
 | `picked`, `pick`, `pik` | picked photos | Vietnamese: `đã chọn` |
 | `rejected`, `rej` | rejected photos | Vietnamese: `loại` |
 | `unmarked`, `unflagged`, `no pick` | photos with no pick state | `pick:` / `flag:` prefixes accepted |
+| `NEF`, `ARW`, `CR2`, `JPG`, `TIFF` | that file format | `JPG` also matches `.jpeg`, `TIFF` matches `.tif` and `.tiff` |
+| `older than 7 days`, `newer than 2 months`, `today` | relative capture date | Vietnamese: `cũ hơn 7 ngày`, `hôm nay` |
+| `iso:400`, `f/4`, `f:2.8`, `50mm`, `focal:50`, `1/125`, `shutter:1/125`, `camera:nikon`, `lens:24-70` | camera settings | A bare fraction that could be a day/month (`9/10`) is never a shutter speed (it stays text; use `date:9/10`); `1/x` or a denominator above 12 is a shutter speed |
+| `not NEF`, `-NEF`, `không NEF`, `a + b` | exclude the next term / explicit AND | |
 
 **Precedence (how a word is read)**
 
@@ -108,22 +141,30 @@ So `red` means the red label; type `"red"` or `name:red` to search for the word 
 
 **Where the facts come from**
 
-- **Ratings, picks and labels:** the same authoritative values the Filter tab uses. Photos whose metadata is still being read do not match these terms until the value is known.
+- **Ratings, picks and labels:** the same authoritative values the Filter tab uses. Photos whose metadata is still being read do not match these terms until the value is known; while any are pending the counter shows "…" and such a query moves the remaining photos up the reading queue. A photo with no rating in any source QuickSift reads (sidecar, embedded XMP, Windows properties) is 0 stars / unrated, exactly as it is displayed; unreadable files and custom values are never treated as 0.
+- **A star word is required for ratings:** `0` alone is a file-name search (names containing 0), `0 stars` is a rating search. The two can legitimately give different counts.
 - **Capture time:** the EXIF *DateTimeOriginal*. If it is missing, QuickSift falls back to *DateTimeDigitized*, then *DateTime*, then the file's modified time (local time). It is read in the background the first time a time or date term is used, and the counter shows "…" while that is in progress.
 - **User comments:** loaded in the background the first time you search for text.
+- **Camera settings:** taken from the folder's index when the file is unchanged; otherwise read from the file header in the background (one file open serves capture time and camera settings).
 
 
 ## 5. View information and configure behavior
 
 Open the left pane and choose **Info** to inspect EXIF for the active photograph, or **Settings** for appearance, language, badges, metadata-writing behavior, and related preferences. Switching between English and Vietnamese updates the interface immediately.
 
-**Settings → Load only JPG previews for RAW** is off by default. When enabled, RAW photographs are displayed only from a JPEG preview embedded in the RAW container. QuickSift does not demosaic RAW sensor pixels, does not fall back to WIC/Shell full-RAW rendering, does not request RAW deep-zoom tiles, and does not reuse an ambiguous persistent RAW bitmap created under full-decode mode. A RAW without a usable embedded JPEG may therefore remain unavailable until this setting is turned off. Changing the setting cancels stale queued/in-flight RAW decode policy and refreshes visible images.
+**Settings → Load only JPG previews for RAW** is off by default. When enabled, RAW photographs are displayed only from a JPEG preview embedded in the RAW container. QuickSift does not demosaic RAW sensor pixels, does not fall back to WIC/Shell full-RAW rendering, does not request RAW deep-zoom tiles, and does not reuse an ambiguous persistent RAW bitmap created under full-decode mode. A RAW without a usable embedded JPEG may therefore remain unavailable until this setting is turned off. Changing the setting cancels stale queued/in-flight RAW decode policy and refreshes visible images. In Single view this mode shows the largest embedded JPEG at full quality (QuickSift scans the whole RAW container for it, falling back to LibRaw's own preview).
+
+The RAW you are viewing in Single or Compare view, including its full demosaic, gets the foreground decode budget (at least 12 seconds) so large RAWs are not cancelled and retried mid-decode. Every filter button shows a dropdown arrow.
 
 ## 6. Diagnostics and log export
 
-Open **Settings → Diagnostic log** to view recent lifecycle, catalog, decode, metadata, cache, and file-operation events. The viewer follows the active theme and provides **Refresh**, **Export…**, and **Close** controls.
+Open **Settings → Diagnostic log** to view recent lifecycle, catalog, decode, metadata, cache, and file-operation events. The viewer follows the active theme and provides **Refresh** (scrolls to the newest entry), **Auto refresh** (off by default; refreshes every second), **Verbose logging**, **Previous sessions…**, **Export…**, and **Close** controls.
 
-QuickSift automatically creates `QuickSiftData` beside `QuickSift.exe`. The session/preferences file is `QuickSiftData\QuickSift.session.ini`; the disposable persistent cache is `QuickSiftData\.cache`; UTF-8 session logs are written to `QuickSiftData\Logs`; and unhandled failures create text reports and minidumps under `QuickSiftData\CrashReports`. The newest 20 session logs and newest 20 crash incidents are retained, and an individual session log is capped at 16 MiB. If `QuickSiftData` cannot be created and written, QuickSift displays a startup error and does not launch. Logs may include local paths and filenames, and minidumps may contain fragments of process memory; inspect them before sharing.
+**Previous sessions…** lists the logs of earlier QuickSift sessions saved in the `Logs` folder, newest first. Each entry shows when that session started and how big its log is; the current session is not in the list because the window already shows it. Click one to open it in its own read-only window, for example to see what happened before a crash or a restart. A large log shows only its newest 2 MB, with a note at the top; open the file itself (its path is shown) to read the rest. Nothing is deleted or changed here. Logs older than 7 days are still removed automatically, as described below.
+
+If closing, ratings import/export or Batch Processing has to wait, a live dialog shows the operation, file, how many are left, elapsed time and reason. When closing, **Force quit** cancels background work, saves what can be saved and logs what was abandoned. For the other operations, **Cancel operation** cancels the blocking work and **Stop waiting** dismisses the dialog. The **Performance HUD** (Settings; it opens inside the image area below the search bar; drag it by the grip on its top edge; its position is remembered and is never left under the search bar or another control) shows queue depths per lane, in-flight jobs, pending counts, the oldest waiting job, cache size and hit rate, last RAW/JPEG decode times, worker states and the current blocking reason. When a left-pane tab has more content than fits (for example Settings in a short window), the pane scrolls: use the mouse wheel; a themed scrollbar shows the position; Tab scrolls the focused button into view; each tab remembers its scroll position. Buttons whose caption is cut off (…) show the full text in a tooltip after a short hover.
+
+QuickSift automatically creates `QuickSiftData` beside `QuickSift.exe`. The session/preferences file is `QuickSiftData\QuickSift.session.ini`; the disposable persistent cache is `QuickSiftData\.cache`; UTF-8 session logs are written to `QuickSiftData\Logs`; and unhandled failures create text reports and minidumps under `QuickSiftData\CrashReports`. Session logs, crash reports and minidumps older than 7 days (by last-modified time) are deleted automatically a few seconds after startup, on a low-priority background thread. The current session's log is never deleted, only files with QuickSift's own names (`QuickSift-<date>-<time>-<ms>-<process>.log`, `QuickSift-crash-<date>-<time>-<ms>-p<process>.log`/`.dmp`) in those two folders are touched, links (reparse points) are never followed, and every deleted file is recorded in the diagnostic log (`[Diagnostics] event=old_file_deleted`, then `cleanup_complete`). When an internal step fails and QuickSift safely continues (for example a cache flush or a background bookkeeping step), the log records one warning such as `QueryFaceDetectorCapability failed and continued: <reason>`; repeats of the same failure within 30 seconds are counted and reported as `(N similar suppressed)` instead of flooding the log. At most the newest 20 crash incidents are kept, and an individual session log is capped at 16 MiB. If `QuickSiftData` cannot be created and written, QuickSift displays a startup error and does not launch. Logs may include local paths and filenames, and minidumps may contain fragments of process memory; inspect them before sharing.
 
 ## 7. Copy and move safely
 
@@ -148,7 +189,7 @@ Undo and Redo can reverse or reapply protected metadata and file operations whil
 - **Export…** asks where to save (default name `QuickSift-Ratings-YYYYMMDD-HHMMSS.txt`) and lists every file in the folder that has a rating, a pick/reject or a colour tag (filters are ignored; unmarked files are omitted). The file looks like:
 
   ```
-  Header: QuickSift version 0.9.4.0 - Ratings/Pick state / Color tag data
+  Header: QuickSift version 0.9.6.0 - Ratings/Pick state / Color tag data
   Exported time: 14:05:09 09 Oct 2026
   Total files count: 812 files total
   Files that has been rated, picked or rejected, or color tagged: 2 files
@@ -225,3 +266,11 @@ example, a file another app is still writing) get the full set of attempts. Unre
 straight to the Windows Shell thumbnail fallback. Failed images are retried automatically when the
 file changes on disk or when the folder is reloaded. Press **F5** or **Ctrl+Shift+R** to retry
 every failed image immediately.
+
+### Metadata reading progress
+
+Ratings, pick states and labels are read in the background, below image decoding and your own edits, but reading always keeps making progress (at least one read after 0.75 s of waiting). A file that cannot be read is shown as *unreadable* rather than *pending*, so "metadata pending" always ends. Closing QuickSift, import, export and batch never wait for read-only indexing; they wait only for running file or metadata write operations.
+
+## Metadata storage switches
+
+In **Settings → Metadata handling**, **Write metadata into RAW files**, **Write metadata into JPG/PNG files** and **Write metadata into TIFF files** are switches (highlighted means on). When a switch is on, ratings, pick states and labels for that format are written inside the image, through a verified temporary copy. When it is off, they are written to an XMP sidecar next to the image (`IMG_0001.xmp` for a RAW), and the image itself is never modified. By default RAW files use sidecars and JPG/PNG/TIFF are written in place. Existing metadata is not migrated when you change a switch; the folder is reloaded from the newly selected source.

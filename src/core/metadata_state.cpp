@@ -167,4 +167,27 @@ const wchar_t* MetadataFieldDisplayName(MetadataFieldId field) noexcept {
     return L"metadata field";
 }
 
+bool ResolveUnsetMetadataAsNone(PhotoMetadataValues& values) {
+    bool changed = false;
+    for (MetadataFieldValue* field : { &values.rating, &values.colorLabel, &values.pickState }) {
+        if (field->knowledge == MetadataKnowledge::Unknown) {
+            *field = KnownMetadataValue(0);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+bool ResolveMetadataReadOutcome(PhotoMetadataValues& values, bool fileOpens) {
+    if (fileOpens) return ResolveUnsetMetadataAsNone(values);
+    bool changed = false;
+    for (MetadataFieldValue* field : { &values.rating, &values.colorLabel, &values.pickState }) {
+        if (field->knowledge == MetadataKnowledge::Unknown) {
+            *field = UnreadableMetadataValue();
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 } // namespace quicksift::core

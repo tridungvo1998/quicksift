@@ -18,6 +18,7 @@ constexpr std::uint16_t kTagFocalLength = 0x920A;
 constexpr std::uint16_t kTagLensModel = 0xA434;
 constexpr std::uint16_t kTypeAscii = 2;
 constexpr std::uint16_t kTypeShort = 3;
+constexpr std::uint16_t kTypeLong = 4;
 constexpr std::uint16_t kTypeRational = 5;
 constexpr std::uint16_t kMaxEntries = 1024;
 
@@ -78,7 +79,11 @@ public:
         }
         if (offset > data_.size() || data_.size() - offset < count) return {};
         std::string_view raw{ reinterpret_cast<const char*>(data_.data() + offset), count };
-        while (!raw.empty() && (raw.back() == '\0' || raw.back() == ' ')) raw.remove_suffix(1);
+        // EXIF ASCII ends at the first NUL; bytes after it are padding or junk
+        // (some cameras leave stale text there, which leaked into camera/lens names).
+        if (const std::size_t nul = raw.find('\0'); nul != std::string_view::npos) raw = raw.substr(0, nul);
+        while (!raw.empty() && raw.back() == ' ') raw.remove_suffix(1);
+        while (!raw.empty() && raw.front() == ' ') raw.remove_prefix(1);
         return std::string(raw);
     }
 
@@ -96,10 +101,19 @@ public:
     int ShortValue(std::size_t entry) const noexcept {
         std::uint16_t type = 0;
         std::uint32_t count = 0;
-        if (!U16(entry + 2, type) || !U32(entry + 4, count) || type != kTypeShort || count == 0) return -1;
-        std::uint16_t value = 0;
-        if (!U16(entry + 8, value)) return -1;
-        return static_cast<int>(value);
+        if (!U16(entry + 2, type) || !U32(entry + 4, count) || count == 0) return -1;
+        if (type == kTypeShort) {
+            std::uint16_t value = 0;
+            if (!U16(entry + 8, value)) return -1;
+            return static_cast<int>(value);
+        }
+        // Some writers store ISO as LONG; the value still fits the 4-byte field.
+        if (type == kTypeLong && count == 1) {
+            std::uint32_t value = 0;
+            if (!U32(entry + 8, value) || value > 10'000'000u) return -1;
+            return static_cast<int>(value);
+        }
+        return -1;
     }
 
     void ScanCamera(std::size_t offset, CameraSettingsResult& out) const noexcept {
@@ -120,8 +134,23 @@ public:
             case kTagModel: {
                 const std::string model = AsciiFlexible(entry);
                 if (!model.empty()) {
-                    if (!out.camera.empty()) out.camera += L" ";
-                    out.camera.append(model.begin(), model.end());
+                    // Many Models already start with the Make ("Canon" + "Canon EOS R5"):
+                    // do not produce "Canon Canon EOS R5" (duplicate filter entries).
+                    const auto startsWithMake = [&]() {
+                        if (out.camera.empty() || out.camera.size() > model.size()) return false;
+                        for (std::size_t i = 0; i < out.camera.size(); ++i) {
+                            const auto lower = [](unsigned c) { return c >= 'A' && c <= 'Z' ? c + 32u : c; };
+                            if (lower(static_cast<unsigned>(out.camera[i])) !=
+                                lower(static_cast<unsigned char>(model[i]))) return false;
+                        }
+                        return true;
+                    };
+                    if (startsWithMake()) {
+                        out.camera.assign(model.begin(), model.end());
+                    } else {
+                        if (!out.camera.empty()) out.camera += L" ";
+                        out.camera.append(model.begin(), model.end());
+                    }
                 }
                 break;
             }
@@ -271,7 +300,10 @@ std::optional<CaptureTimeResult> FindCaptureTime(std::span<const std::uint8_t> b
             }
             at += 2 + length;
         }
-        if (best) return best;
+        // A JPEG's EXIF can only live in the APP segments walked above. Scanning
+        // the compressed scan data for TIFF magic cost CPU over the whole window
+        // and could "find" garbage dates in entropy-coded bytes.
+        return best;
     }
     // TIFF-based files (TIFF, DNG, NEF, ARW, CR2, ORF "IIRO", RW2 "IIU\0", ...).
     if (bytes.size() >= 8 && ((bytes[0] == 'I' && bytes[1] == 'I') || (bytes[0] == 'M' && bytes[1] == 'M'))) {
@@ -341,7 +373,8 @@ CameraSettingsResult FindCameraSettings(std::span<const std::uint8_t> bytes) noe
             }
             at += 2 + length;
         }
-        if (best.known) return best;
+        // JPEG EXIF lives only in APP segments (see FindCaptureTime).
+        return best;
     }
     // TIFF-based
     if (bytes.size() >= 8 && ((bytes[0] == 'I' && bytes[1] == 'I') || (bytes[0] == 'M' && bytes[1] == 'M'))) {

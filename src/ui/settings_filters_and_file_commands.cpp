@@ -23,19 +23,6 @@ MenuItem MakeMenuItem(std::wstring text, int command, bool checked = false,
     return item;
 }
 
-MenuItem MakeMenuSeparator() {
-    MenuItem item{};
-    item.separator = true;
-    return item;
-}
-
-MenuItem MakeHeader(std::wstring text) {
-    MenuItem item{};
-    item.text = std::move(text);
-    item.header = true;
-    return item;
-}
-
 } // namespace
 
 // CODE GUIDE: See CODE_GUIDE.md -> "How to add a feature".
@@ -169,6 +156,8 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         case ID_SETTING_COPY_MOVE_RAW_WITH_JPG: copyMoveRawWithJpg_ = !copyMoveRawWithJpg_; break;
         case ID_SETTING_PERFORMANCE_HUD:
             performanceHudVisible_ = !performanceHudVisible_;
+            hudTextWidthDip_ = 0.0f;
+            hudPanelRect_ = {};
             UpdatePerformanceHudTimer();
             SaveSession();
             ShowToast(performanceHudVisible_ ? L"Performance HUD enabled." : L"Performance HUD disabled.");
@@ -180,6 +169,18 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             worker_.DiscardQueuedTiles();
             ClearBitmapCache();
             failedDecodes_.clear();
+            viewRetryState_.clear();
+            // Single/Compare must reload immediately; otherwise the pane stays
+            // blank until the user leaves and re-enters the view.
+            if (reviewState_.Mode() == ViewMode::Single || reviewState_.Mode() == ViewMode::Compare) {
+                const std::wstring path = reviewState_.Mode() == ViewMode::Single
+                    ? reviewState_.SinglePath() : reviewState_.ActivePath();
+                if (!path.empty()) {
+                    // Force a fresh request on the next paint and also enqueue now.
+                    RequestViewDecode(fs::path(path), JobKind::DecodeFull, 2048,
+                        CacheClass::Full, JobPriority::Interactive, false);
+                }
+            }
             ScheduleVisibleWork();
             InvalidateCanvas();
             SaveSession();
@@ -190,23 +191,19 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             theme_ = theme_ == AppTheme::Dark ? AppTheme::Light : AppTheme::Dark;
             SetWindowTextW(controls_[ID_THEME_TOGGLE], ThemeToggleText().c_str());
             ApplyTheme();
+            SaveSession(); // the Settings entry did not persist the theme before 0.9.5.0
             break;
         case ID_SETTING_DIRECT_JPEG: toggledMetadataFlag = MetadataDirectJpeg; break;
-        case ID_SETTING_METADATA_RAW:
-            metadataDirectMask_ ^= MetadataDirectRaw;
-            gMetadataDirectMask.store(metadataDirectMask_, std::memory_order_relaxed);
-            SaveSession();
+        case ID_SETTING_METADATA_RAW: toggledMetadataFlag = MetadataDirectRaw; break;
+        case ID_SETTING_METADATA_TIFF: toggledMetadataFlag = MetadataDirectTiff; break;
+        case ID_SETTING_METADATA_LOSSY: {
+            // JPG and PNG share one switch: normalise a mixed mask before toggling.
+            const std::uint32_t lossy = MetadataDirectJpeg | MetadataDirectPng;
+            const bool wasOn = (metadataDirectMask_ & lossy) != 0;
+            metadataDirectMask_ = (metadataDirectMask_ & ~lossy) | (wasOn ? lossy : std::uint32_t{ 0 });
+            toggledMetadataFlag = lossy;
             break;
-        case ID_SETTING_METADATA_LOSSY:
-            metadataDirectMask_ ^= (MetadataDirectJpeg | MetadataDirectPng);
-            gMetadataDirectMask.store(metadataDirectMask_, std::memory_order_relaxed);
-            SaveSession();
-            break;
-        case ID_SETTING_METADATA_TIFF:
-            metadataDirectMask_ ^= MetadataDirectTiff;
-            gMetadataDirectMask.store(metadataDirectMask_, std::memory_order_relaxed);
-            SaveSession();
-            break;
+        }
         case ID_SETTING_SAFE_JPEG:
             safeJpegMetadataWrites_ = !safeJpegMetadataWrites_;
             if (safeJpegMetadataWrites_) {
@@ -273,75 +270,35 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         UpdateToggleButtons();
     }
 
-    void QuickSiftApplicationImpl::ShowSettingsMenu() {
-        std::vector<MenuItem> items;
-
-        items.push_back(MakeHeader(L"Thumbnails"));
-        items.push_back(MakeMenuItem(L"Show star badges", ID_SETTING_BADGE_STARS, badgeStars_));
-        items.push_back(MakeMenuItem(L"Show color-label badges", ID_SETTING_BADGE_COLOR, badgeColor_));
-        items.push_back(MakeMenuItem(L"Show pick/reject badges", ID_SETTING_BADGE_PICK, badgePick_));
-        items.push_back(MakeMenuItem(L"Show RAW/JPG badges", ID_SETTING_BADGE_PAIR, badgePair_));
-        items.push_back(MakeMenuSeparator());
-
-        items.push_back(MakeHeader(L"RAW handling"));
-        items.push_back(MakeMenuItem(L"Copy/Move RAW with JPG", ID_SETTING_COPY_MOVE_RAW_WITH_JPG, copyMoveRawWithJpg_));
-        items.push_back(MakeMenuItem(L"Load only JPG previews for RAW", ID_SETTING_RAW_JPEG_PREVIEWS_ONLY, loadOnlyRawJpegPreviews_));
-        items.push_back(MakeMenuSeparator());
-
-        items.push_back(MakeHeader(L"Metadata handling"));
-        items.push_back(MakeMenuItem(L"Safe JPG writes", ID_SETTING_SAFE_JPEG, safeJpegMetadataWrites_));
-        const bool rawEmbedded = (metadataDirectMask_ & MetadataDirectRaw) != 0;
-        const bool lossyEmbedded = (metadataDirectMask_ & (MetadataDirectJpeg | MetadataDirectPng)) != 0;
-        const bool tiffEmbedded = (metadataDirectMask_ & MetadataDirectTiff) != 0;
-        items.push_back(MakeHeader(L"Use XMP instead of metadata write for"));
-        items.push_back(MakeMenuItem(L"RAW files", ID_SETTING_METADATA_RAW, rawEmbedded));
-        items.push_back(MakeMenuItem(L"JPG, PNG and lossy formats", ID_SETTING_METADATA_LOSSY, lossyEmbedded));
-        items.push_back(MakeMenuItem(L"TIFF", ID_SETTING_METADATA_TIFF, tiffEmbedded));
-        items.push_back(MakeMenuSeparator());
-
-        items.push_back(MakeHeader(L"Help & Diagnostics"));
-        items.push_back(MakeMenuItem(L"Show performance HUD", ID_SETTING_PERFORMANCE_HUD, performanceHudVisible_));
-        items.push_back(MakeMenuItem(L"Show diagnostic log", ID_SETTING_DIAGNOSTIC_LOG));
-        items.push_back(MakeMenuItem(L"Clear memory cache", ID_SETTING_CLEAR_MEMORY_CACHE));
-        items.push_back(MakeMenuItem(L"Clear disk cache", ID_SETTING_CLEAR_DISK_CACHE));
-        items.push_back(MakeMenuItem(L"Help and documentation", ID_SETTING_HELP));
-        items.push_back(MakeMenuItem(L"About this app", ID_SETTING_ABOUT));
-
-        const int command = TrackDropdownMenu(hwnd_, std::move(items));
-        if (command != 0) ApplySettingCommand(command);
-    }
-
     void QuickSiftApplicationImpl::ShowFormatsMenu() {
-        std::vector<MenuItem> items = {
-            MakeMenuItem(L"JPEG", ID_FMT_JPEG, formats_[FormatGroup::Jpeg]),
-            MakeMenuItem(L"PNG", ID_FMT_PNG, formats_[FormatGroup::Png]),
-            MakeMenuItem(L"AVIF / HEIF", ID_FMT_HEIF, formats_[FormatGroup::Heif]),
-            MakeMenuItem(L"TIFF", ID_FMT_TIFF, formats_[FormatGroup::Tiff]),
-            MakeMenuItem(L"BMP / GIF", ID_FMT_BASIC, formats_[FormatGroup::Basic]),
-            MakeMenuItem(L"WebP", ID_FMT_WEBP, formats_[FormatGroup::WebP]),
-            MakeMenuItem(L"Camera RAW", ID_FMT_RAW, formats_[FormatGroup::Raw]),
-            MakeMenuSeparator(),
-            MakeMenuItem(L"Enable all", ID_FMT_ALL),
-        };
-        const int command = TrackDropdownMenu(controls_[ID_FORMATS], std::move(items));
-        if (command == 0) return;
-        if (command == ID_FMT_ALL) {
-            for (auto& [group, enabled] : formats_) enabled = true;
-        } else {
-            const std::unordered_map<int, FormatGroup> ids = {
-                { ID_FMT_JPEG, FormatGroup::Jpeg }, { ID_FMT_PNG, FormatGroup::Png },
-                { ID_FMT_HEIF, FormatGroup::Heif }, { ID_FMT_TIFF, FormatGroup::Tiff },
-                { ID_FMT_BASIC, FormatGroup::Basic }, { ID_FMT_WEBP, FormatGroup::WebP },
-                { ID_FMT_RAW, FormatGroup::Raw }
-            };
-            auto it = ids.find(command);
-            if (it != ids.end()) formats_[it->second] = !formats_[it->second];
+        std::set<std::wstring> exts;
+        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
+            std::wstring ext = catalog_.PhotoAt(i).extension;
+            for (wchar_t& ch : ext) ch = static_cast<wchar_t>(std::towlower(ch));
+            if (!ext.empty() && ext.front() == L'.') ext.erase(ext.begin());
+            if (!ext.empty()) exts.insert(std::move(ext));
         }
-        UpdateFormatFilterButton();
-        SaveSession();
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, formatExtFilter_.empty()));
+        int id = 2;
+        for (const auto& ext : exts) {
+            std::wstring label = ext;
+            for (wchar_t& ch : label) ch = static_cast<wchar_t>(std::towupper(ch));
+            items.push_back(MakeMenuItem(label, id, formatExtFilter_ == ext));
+            ++id;
+        }
+        const int command = TrackDropdownMenu(controls_[ID_FORMATS], std::move(items));
+        if (command <= 0) return;
+        if (command == 1) formatExtFilter_.clear();
+        else {
+            auto it = exts.begin();
+            std::advance(it, command - 2);
+            formatExtFilter_ = *it;
+        }
+        std::wstring label = formatExtFilter_.empty() ? L"Format: All" : L"Format: " + formatExtFilter_;
+        for (wchar_t& ch : label) if (ch >= L'a' && ch <= L'z') ch = static_cast<wchar_t>(ch - L'a' + L'A');
+        SetWindowTextW(controls_[ID_FORMATS], label.c_str());
         RebuildVisiblePhotos();
-        ScheduleVisibleWork();
-        UpdateStatus();
         InvalidateCanvas();
     }
 
@@ -390,120 +347,46 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
     }
 
     void QuickSiftApplicationImpl::ShowDateFilterMenu() {
-        const int selected = static_cast<int>(dateFilter_);
-        std::vector<MenuItem> items = {
-            MakeMenuItem(L"Any modified date", ID_DATE_ANY, selected == 0),
-            MakeMenuItem(L"Modified in last 24 hours", ID_DATE_24H, selected == 1),
-            MakeMenuItem(L"Modified in last 7 days", ID_DATE_7D, selected == 2),
-            MakeMenuItem(L"Modified in last 30 days", ID_DATE_30D, selected == 3),
-            MakeMenuItem(L"Modified in last year", ID_DATE_1Y, selected == 4),
-        };
+        HydrateMetadataForFilters();
+        const std::vector<std::wstring> dates = catalog_.FilterValues().Dates(); // incremental, no folder scan
+        std::vector<MenuItem> items;
+        items.push_back(MakeMenuItem(L"All", 1, dateExactFilter_.empty()));
+        int id = 2;
+        for (const auto& d : dates) {
+            items.push_back(MakeMenuItem(d, id, dateExactFilter_ == d));
+            ++id;
+        }
         const int command = TrackDropdownMenu(controls_[ID_DATE_FILTER], std::move(items));
-        if (command < ID_DATE_ANY || command > ID_DATE_1Y) return;
-        dateFilter_ = static_cast<DateFilter>(command - ID_DATE_ANY);
-        UpdateDateFilterButton();
-        SaveSession();
+        if (command <= 0) return;
+        if (command == 1) dateExactFilter_.clear();
+        else {
+            auto it = dates.begin();
+            std::advance(it, command - 2);
+            dateExactFilter_ = *it;
+        }
+        std::wstring dateLabel = dateExactFilter_.empty() ? std::wstring(L"Date: All")
+            : L"Date: " + dateExactFilter_;
+        SetWindowTextW(controls_[ID_DATE_FILTER], dateLabel.c_str());
         RebuildVisiblePhotos();
-        ScheduleVisibleWork();
-        UpdateStatus();
         InvalidateCanvas();
     }
 
     // ---- Camera-settings filters (options from indexed values in the folder) ----
 
     void QuickSiftApplicationImpl::HydrateMetadataForFilters() {
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const PhotoItem& view = catalog_.PhotoAt(i);
-            const bool needCamera = !view.cameraSettingsKnown;
-            const bool needTime = view.captureTimeSource ==
-                quicksift::core::predicate::CaptureTimeSource::Unknown;
-            if (!needCamera && !needTime) continue;
-
-            int iso = view.iso;
-            double aperture = view.aperture;
-            double focal = view.focalLength;
-            double shutter = view.shutterSpeed;
-            std::wstring camera = view.camera;
-            std::wstring lens = view.lens;
-            bool cameraKnown = view.cameraSettingsKnown;
-            auto capture = view.captureTime;
-            auto captureSource = view.captureTimeSource;
-
-            if (needCamera) {
-                if (auto cached = persistentCache_.LookupCameraSettings(view.path)) {
-                    iso = cached->iso;
-                    aperture = cached->aperture;
-                    focal = cached->focalLength;
-                    shutter = cached->shutterSpeed;
-                    camera = std::move(cached->camera);
-                    lens = std::move(cached->lens);
-                    cameraKnown = true;
-                }
-            }
-            if (!cameraKnown || needTime) {
-                // Do not compete with Single View. Cache-only while a view decode
-                // is in flight; the next open fills the rest.
-                if (quicksift::core::priority::Demand().Snapshot().viewForeground > 0) continue;
-                HANDLE file = CreateFileW(view.path.c_str(), GENERIC_READ,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-                if (file != INVALID_HANDLE_VALUE) {
-                    std::vector<std::uint8_t> buffer(quicksift::core::exif::kCaptureTimeReadBytes);
-                    DWORD read = 0;
-                    if (ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0) {
-                        buffer.resize(read);
-                        if (!cameraKnown) {
-                            const auto settings = quicksift::core::exif::FindCameraSettings(buffer);
-                            iso = settings.iso;
-                            aperture = settings.aperture;
-                            focal = settings.focalLength;
-                            shutter = settings.shutterSpeed;
-                            camera = settings.camera;
-                            lens = settings.lens;
-                            cameraKnown = settings.known;
-                            CachedImageRecord rec;
-                            rec.iso = settings.iso;
-                            rec.aperture = settings.aperture;
-                            rec.focalLength = settings.focalLength;
-                            rec.shutterSpeed = settings.shutterSpeed;
-                            rec.camera = settings.camera;
-                            rec.lens = settings.lens;
-                            rec.cameraSettingsKnown = settings.known;
-                            persistentCache_.UpdateCameraSettings(view.path, rec);
-                        }
-                        if (needTime) {
-                            if (auto found = quicksift::core::exif::FindCaptureTime(buffer)) {
-                                capture = found->time;
-                                captureSource = quicksift::core::predicate::CaptureTimeSource::Exif;
-                            }
-                        }
-                    }
-                    CloseHandle(file);
-                }
-            }
-            if (cameraKnown || captureSource != view.captureTimeSource) {
-                catalog_.EditPhoto(i, [&](PhotoItem& p) {
-                    p.iso = iso;
-                    p.aperture = aperture;
-                    p.focalLength = focal;
-                    p.shutterSpeed = shutter;
-                    p.camera = std::move(camera);
-                    p.lens = std::move(lens);
-                    p.cameraSettingsKnown = cameraKnown;
-                    p.captureTime = capture;
-                    p.captureTimeSource = captureSource;
-                });
-            }
-        }
+        // No file or database I/O on the UI thread: take whatever the background
+        // worker has already read, then queue the rest (capture time + camera
+        // settings) on it at P3 priority (yields to decodes and user work, and is
+        // cancelled by the generation bump on folder change). Menus show values
+        // known now; reopening shows more as hydration completes, and active
+        // filters are re-applied as facts arrive (ApplySearchFactUpdates).
+        ApplySearchFactUpdates();
+        QueueFactHydration(true, false, true);
     }
 
     void QuickSiftApplicationImpl::ShowIsoFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<int> values;
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.cameraSettingsKnown && p.iso > 0) values.insert(p.iso);
-        }
+        const std::vector<int> values = catalog_.FilterValues().Iso();
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, isoFilter_ < 0));
         int id = 2;
@@ -528,11 +411,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowApertureFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<int> cents; // f-number * 100
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.cameraSettingsKnown && p.aperture > 0.0) cents.insert(static_cast<int>(p.aperture * 100.0 + 0.5));
-        }
+        const std::vector<int> cents = catalog_.FilterValues().ApertureCents(); // f-number * 100
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, apertureFilter_ <= 0.0));
         int id = 2;
@@ -561,11 +440,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowFocalFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<int> mms;
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.cameraSettingsKnown && p.focalLength > 0.0) mms.insert(static_cast<int>(p.focalLength + 0.5));
-        }
+        const std::vector<int> mms = catalog_.FilterValues().FocalMm();
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, focalFilter_ <= 0.0));
         int id = 2;
@@ -590,15 +465,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowShutterFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<int> denoms; // reciprocal, e.g. 160 for 1/160
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.cameraSettingsKnown && p.shutterSpeed > 0.0 && p.shutterSpeed < 1.0) {
-                denoms.insert(static_cast<int>(std::lround(1.0 / p.shutterSpeed)));
-            } else if (p.cameraSettingsKnown && p.shutterSpeed >= 1.0) {
-                denoms.insert(-static_cast<int>(std::lround(p.shutterSpeed))); // negative = whole seconds
-            }
-        }
+        const std::vector<int> denoms = catalog_.FilterValues().ShutterKeys(); // 160 = 1/160; negative = seconds
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, shutterFilter_ <= 0.0));
         int id = 2;
@@ -628,11 +495,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowCameraFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<std::wstring> cams;
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.cameraSettingsKnown && !p.camera.empty()) cams.insert(p.camera);
-        }
+        const std::vector<std::wstring> cams = catalog_.FilterValues().Cameras();
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, cameraFilter_.empty()));
         int id = 2;
@@ -657,12 +520,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
 
     void QuickSiftApplicationImpl::ShowHourFilterMenu() {
         HydrateMetadataForFilters();
-        std::set<int> hours;
-        for (std::size_t i = 0; i < catalog_.PhotoCount(); ++i) {
-            const auto& p = catalog_.PhotoAt(i);
-            if (p.captureTimeSource != quicksift::core::predicate::CaptureTimeSource::Unknown)
-                hours.insert(p.captureTime.hour);
-        }
+        const std::vector<int> hours = catalog_.FilterValues().Hours();
         std::vector<MenuItem> items;
         items.push_back(MakeMenuItem(L"All", 1, hourFilter_ < 0));
         int id = 2;
@@ -767,6 +625,10 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             L"Move to Deleted", PendingGlassAction::DeleteSelection, GlassAlertKind::Warning);
     }
 
+    // Copy / Move / Delete-to-folder (0.9.5.0 round 19: split into the RAW pairing,
+    // destination, preflight, storage and transaction-building stages with no
+    // behaviour change). Every stage that stops the operation shows its own alert
+    // and returns false / nullopt before any file is touched.
     void QuickSiftApplicationImpl::FileOperation(bool move, bool remove) {
         if (transactions_.Busy()) {
             ShowGlassAlert(L"A serialized transaction is still running",
@@ -781,84 +643,133 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             std::to_wstring(active.size()) + L" selected item(s)");
 
         bool missingRawCompanion = false;
-        if (copyMoveRawWithJpg_ && !remove) {
-            struct RawDirectoryIndex {
-                bool scanned = false;
-                bool succeeded = false;
-                std::unordered_map<std::wstring, std::vector<fs::path>> byStem;
-            };
-            std::unordered_map<std::wstring, RawDirectoryIndex> rawDirectories;
-            std::unordered_set<std::wstring> includedPaths;
-            includedPaths.reserve(active.size() * 2 + 1);
-            for (const fs::path& path : active) includedPaths.insert(NormalizedPathKey(path));
+        if (copyMoveRawWithJpg_ && !remove &&
+            !AddRawCompanionsForSelection(active, missingRawCompanion)) return;
 
-            const std::vector<fs::path> selected = active;
-            bool pairingScanFailed = false;
-            for (const fs::path& jpeg : selected) {
-                if (!IsJpegExtension(ExtensionLower(jpeg))) continue;
-                const fs::path parent = jpeg.parent_path();
-                const std::wstring directoryKey = NormalizedPathKey(parent);
-                RawDirectoryIndex& index = rawDirectories[directoryKey];
-                if (!index.scanned) {
-                    index.scanned = true;
-                    std::error_code scanError;
-                    fs::directory_iterator entry(parent, scanError);
-                    const fs::directory_iterator end;
-                    if (!scanError) {
-                        while (entry != end) {
-                            std::error_code statusError;
-                            const fs::file_status status = entry->symlink_status(statusError);
-                            if (statusError) {
-                                scanError = statusError;
-                                break;
-                            }
-                            if (fs::is_regular_file(status) &&
-                                IsRawExtension(ExtensionLower(entry->path()))) {
-                                index.byStem[ToLower(entry->path().stem().wstring())].push_back(entry->path());
-                            }
-                            entry.increment(scanError);
-                            if (scanError) break;
-                        }
-                    }
-                    index.succeeded = !scanError;
-                    if (index.succeeded) {
-                        for (auto& [stem, matches] : index.byStem) {
-                            (void)stem;
-                            std::sort(matches.begin(), matches.end(), [](const fs::path& left, const fs::path& right) {
-                                return ToLower(left.filename().wstring()) < ToLower(right.filename().wstring());
-                            });
-                        }
-                    }
-                }
-                if (!index.succeeded) {
-                    pairingScanFailed = true;
-                    break;
-                }
+        const std::optional<fs::path> destination = ChooseFileOperationDestination(move, remove);
+        if (!destination) return;
+        const fs::path destinationFolder = *destination;
 
-                const auto matches = index.byStem.find(ToLower(jpeg.stem().wstring()));
-                if (matches == index.byStem.end() || matches->second.empty()) {
-                    missingRawCompanion = true;
-                    continue;
-                }
-                for (const fs::path& raw : matches->second) {
-                    if (includedPaths.insert(NormalizedPathKey(raw)).second) active.push_back(raw);
-                }
-            }
-            if (pairingScanFailed) {
-                ShowGlassAlert(L"RAW pairing check failed — nothing changed",
-                    L"QuickSift could not safely inspect the source folder for corresponding RAW files. It stopped before copying or moving anything.",
-                    GlassAlertKind::Warning);
-                return;
-            }
+        std::vector<PlannedFileTransfer> plan;
+        if (!PlanFileTransfers(active, destinationFolder, move, remove, plan)) return;
+
+        // The plan owns the paths from here. Release duplicate selection and
+        // collision-check storage before potentially long filesystem work.
+        active.clear();
+        active.shrink_to_fit();
+
+        if (!CheckFileOperationStorage(plan, destinationFolder, move, remove)) return;
+
+        std::error_code createError;
+        fs::create_directories(destinationFolder, createError);
+        if (createError) {
+            ShowGlassAlert(remove ? L"Deleted folder unavailable" : L"Destination unavailable",
+                L"QuickSift could not create or access the destination folder. No files were changed.",
+                GlassAlertKind::Error);
+            return;
         }
 
+        quicksift::transactions::FileTransactionPlan transaction =
+            BuildFileTransactionPlan(plan, move, remove, missingRawCompanion);
+
+        const std::uint64_t token = transactions_.SubmitFile(transaction);
+        if (token == 0) {
+            ShowGlassAlert(L"Another file operation is already running",
+                L"QuickSift serializes verified file transactions so two operations cannot race over the same media. The new request was not started.",
+                GlassAlertKind::Warning);
+            return;
+        }
+        StartUiTimer(ID_TIMER_FILE_PROGRESS, 1000, L"file-operation progress");
+        UpdateStatus();
+        ShowToast(remove ? L"Moving selected files to Deleted…" :
+            (move ? L"Moving and verifying…" : L"Copying and verifying…"));
+    }
+
+    // "Copy/move RAW with JPG": append each selected JPEG's same-stem RAW siblings.
+    // Returns false (after an alert) when a source folder could not be inspected.
+    bool QuickSiftApplicationImpl::AddRawCompanionsForSelection(std::vector<fs::path>& active,
+        bool& missingRawCompanion) {
+        struct RawDirectoryIndex {
+            bool scanned = false;
+            bool succeeded = false;
+            std::unordered_map<std::wstring, std::vector<fs::path>> byStem;
+        };
+        std::unordered_map<std::wstring, RawDirectoryIndex> rawDirectories;
+        std::unordered_set<std::wstring> includedPaths;
+        includedPaths.reserve(active.size() * 2 + 1);
+        for (const fs::path& path : active) includedPaths.insert(NormalizedPathKey(path));
+
+        const std::vector<fs::path> selected = active;
+        bool pairingScanFailed = false;
+        for (const fs::path& jpeg : selected) {
+            if (!IsJpegExtension(ExtensionLower(jpeg))) continue;
+            const fs::path parent = jpeg.parent_path();
+            const std::wstring directoryKey = NormalizedPathKey(parent);
+            RawDirectoryIndex& index = rawDirectories[directoryKey];
+            if (!index.scanned) {
+                index.scanned = true;
+                std::error_code scanError;
+                fs::directory_iterator entry(parent, scanError);
+                const fs::directory_iterator end;
+                if (!scanError) {
+                    while (entry != end) {
+                        std::error_code statusError;
+                        const fs::file_status status = entry->symlink_status(statusError);
+                        if (statusError) {
+                            scanError = statusError;
+                            break;
+                        }
+                        if (fs::is_regular_file(status) &&
+                            IsRawExtension(ExtensionLower(entry->path()))) {
+                            index.byStem[ToLower(entry->path().stem().wstring())].push_back(entry->path());
+                        }
+                        entry.increment(scanError);
+                        if (scanError) break;
+                    }
+                }
+                index.succeeded = !scanError;
+                if (index.succeeded) {
+                    for (auto& [stem, matches] : index.byStem) {
+                        (void)stem;
+                        std::sort(matches.begin(), matches.end(), [](const fs::path& left, const fs::path& right) {
+                            return ToLower(left.filename().wstring()) < ToLower(right.filename().wstring());
+                        });
+                    }
+                }
+            }
+            if (!index.succeeded) {
+                pairingScanFailed = true;
+                break;
+            }
+
+            const auto matches = index.byStem.find(ToLower(jpeg.stem().wstring()));
+            if (matches == index.byStem.end() || matches->second.empty()) {
+                missingRawCompanion = true;
+                continue;
+            }
+            for (const fs::path& raw : matches->second) {
+                if (includedPaths.insert(NormalizedPathKey(raw)).second) active.push_back(raw);
+            }
+        }
+        if (pairingScanFailed) {
+            ShowGlassAlert(L"RAW pairing check failed — nothing changed",
+                L"QuickSift could not safely inspect the source folder for corresponding RAW files. It stopped before copying or moving anything.",
+                GlassAlertKind::Warning);
+            return false;
+        }
+        return true;
+    }
+
+    // Deleted subfolder (remove) or a picked folder; nullopt when cancelled or when
+    // the destination is not a usable normal folder (an alert is shown).
+    std::optional<fs::path> QuickSiftApplicationImpl::ChooseFileOperationDestination(bool move, bool remove) {
         fs::path destinationFolder;
         if (remove) {
             destinationFolder = currentFolder_ / L"Deleted";
         } else {
             const std::wstring destinationTitle = Tr(move ? L"Move selected photos to" : L"Copy selected photos to");
             const auto destination = PickFolder(hwnd_, destinationTitle.c_str());
-            if (!destination) return;
+            if (!destination) return std::nullopt;
             destinationFolder = *destination;
         }
 
@@ -869,23 +780,61 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             ShowGlassAlert(remove ? L"Deleted folder conflict" : L"Destination conflict",
                 L"The destination path is not a normal folder. QuickSift stopped before changing any files.",
                 GlassAlertKind::Warning);
-            return;
+            return std::nullopt;
         }
         if (destinationStatusError && destinationStatusError != std::errc::no_such_file_or_directory) {
             ShowGlassAlert(remove ? L"Deleted folder unavailable" : L"Destination unavailable",
                 L"QuickSift could not safely inspect the destination folder. No files were changed.",
                 GlassAlertKind::Error);
-            return;
+            return std::nullopt;
         }
+        return destinationFolder;
+    }
 
-        struct PlannedTransfer {
-            fs::path source;
-            fs::path destination;
-            fs::path sourceSidecar;
-            fs::path destinationSidecar;
-            bool sidecarPresent = false;
-        };
-        std::vector<PlannedTransfer> plan;
+    // Index the parent folder's media by sidecar path (once per folder) and report
+    // whether the sidecar is also owned by media outside this operation.
+    bool QuickSiftApplicationImpl::MediaSidecarHasExternalOwner(
+        std::unordered_map<std::wstring, SidecarOwnerIndex>& directories,
+        const std::unordered_set<std::wstring>& operationSourceKeys,
+        const fs::path& source, const fs::path& sidecar, bool& scanSucceeded) const {
+        const fs::path parent = source.parent_path();
+        SidecarOwnerIndex& index = directories[NormalizedPathKey(parent)];
+        if (!index.scanned) {
+            index.scanned = true;
+            std::error_code scanError;
+            fs::directory_iterator sibling(parent, scanError);
+            const fs::directory_iterator end;
+            while (!scanError && sibling != end) {
+                std::error_code typeError;
+                const fs::file_status type = sibling->symlink_status(typeError);
+                if (typeError) {
+                    scanError = typeError;
+                    break;
+                }
+                const std::wstring extension = ExtensionLower(sibling->path());
+                const quicksift::core::FormatSelection allSupportedFormats;
+                if (fs::is_regular_file(type) &&
+                    quicksift::core::IsFormatAllowed(extension, allSupportedFormats)) {
+                    index.ownersBySidecar[NormalizedPathKey(SidecarPathFor(sibling->path()))]
+                        .push_back(NormalizedPathKey(sibling->path()));
+                }
+                sibling.increment(scanError);
+            }
+            index.succeeded = !scanError;
+        }
+        scanSucceeded = index.succeeded;
+        if (!index.succeeded) return false;
+        const auto owners = index.ownersBySidecar.find(NormalizedPathKey(sidecar));
+        if (owners == index.ownersBySidecar.end()) return false;
+        return std::any_of(owners->second.begin(), owners->second.end(),
+            [&](const std::wstring& owner) { return !operationSourceKeys.contains(owner); });
+    }
+
+    // Preflight the whole batch (no overwrite, no automatic rename, no partial
+    // selection). Returns false after the conflict alert.
+    bool QuickSiftApplicationImpl::PlanFileTransfers(const std::vector<fs::path>& active,
+        const fs::path& destinationFolder, bool move, bool remove,
+        std::vector<PlannedFileTransfer>& plan) {
         plan.reserve(active.size());
         std::unordered_set<std::wstring> plannedDestinations;
         plannedDestinations.reserve(active.size() * 2 + 1);
@@ -907,46 +856,12 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             }
         };
 
-        struct RawSidecarDirectoryIndex {
-            bool scanned = false;
-            bool succeeded = false;
-            std::unordered_map<std::wstring, std::vector<std::wstring>> ownersBySidecar;
-        };
-        std::unordered_map<std::wstring, RawSidecarDirectoryIndex> rawSidecarDirectories;
+        std::unordered_map<std::wstring, SidecarOwnerIndex> rawSidecarDirectories;
         rawSidecarDirectories.reserve(4);
         auto mediaSidecarHasExternalOwner = [&](const fs::path& source,
             const fs::path& sidecar, bool& scanSucceeded) {
-            const fs::path parent = source.parent_path();
-            RawSidecarDirectoryIndex& index = rawSidecarDirectories[NormalizedPathKey(parent)];
-            if (!index.scanned) {
-                index.scanned = true;
-                std::error_code scanError;
-                fs::directory_iterator sibling(parent, scanError);
-                const fs::directory_iterator end;
-                while (!scanError && sibling != end) {
-                    std::error_code typeError;
-                    const fs::file_status type = sibling->symlink_status(typeError);
-                    if (typeError) {
-                        scanError = typeError;
-                        break;
-                    }
-                    const std::wstring extension = ExtensionLower(sibling->path());
-                    const quicksift::core::FormatSelection allSupportedFormats;
-                    if (fs::is_regular_file(type) &&
-                        quicksift::core::IsFormatAllowed(extension, allSupportedFormats)) {
-                        index.ownersBySidecar[NormalizedPathKey(SidecarPathFor(sibling->path()))]
-                            .push_back(NormalizedPathKey(sibling->path()));
-                    }
-                    sibling.increment(scanError);
-                }
-                index.succeeded = !scanError;
-            }
-            scanSucceeded = index.succeeded;
-            if (!index.succeeded) return false;
-            const auto owners = index.ownersBySidecar.find(NormalizedPathKey(sidecar));
-            if (owners == index.ownersBySidecar.end()) return false;
-            return std::any_of(owners->second.begin(), owners->second.end(),
-                [&](const std::wstring& owner) { return !operationSourceKeys.contains(owner); });
+            return MediaSidecarHasExternalOwner(rawSidecarDirectories, operationSourceKeys,
+                source, sidecar, scanSucceeded);
         };
 
         // Preflight the complete batch before creating folders or touching any
@@ -962,7 +877,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
                 continue;
             }
 
-            PlannedTransfer transfer;
+            PlannedFileTransfer transfer;
             transfer.source = source;
             transfer.destination = destinationFolder / source.filename();
             transfer.sourceSidecar = SidecarPathFor(source);
@@ -1053,15 +968,15 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             if (conflictCount > 1) message << L"\n\nPlus " << (conflictCount - 1) << L" other conflict(s).";
             message << L"\n\nQuickSift never overwrites or automatically renames files.";
             ShowGlassAlert(L"File conflict — nothing changed", message.str(), GlassAlertKind::Warning);
-            return;
+            return false;
         }
+        return true;
+    }
 
-        // The plan owns the paths from here. Release duplicate selection and
-        // collision-check storage before potentially long filesystem work.
-        active.clear();
-        active.shrink_to_fit();
-        std::unordered_set<std::wstring>().swap(plannedDestinations);
-
+    // Verified copies need room for the complete destination bytes plus a reserve.
+    // Returns false after the storage alert.
+    bool QuickSiftApplicationImpl::CheckFileOperationStorage(const std::vector<PlannedFileTransfer>& plan,
+        const fs::path& destinationFolder, bool move, bool remove) {
         // Verified copies need room for the complete destination bytes plus a
         // reserve for filesystem metadata and other applications. Same-volume
         // renames do not duplicate file data, while cross-volume moves do.
@@ -1070,7 +985,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         const auto destinationVolume = VolumeRootForPath(destinationFolder);
         std::unordered_set<std::wstring> sizedSidecars;
         sizedSidecars.reserve(plan.size() + 1);
-        for (const PlannedTransfer& transfer : plan) {
+        for (const PlannedFileTransfer& transfer : plan) {
             const auto sourceVolume = VolumeRootForPath(transfer.source);
             const bool duplicatesBytes = !move && !remove || !sourceVolume || !destinationVolume ||
                 *sourceVolume != *destinationVolume;
@@ -1093,7 +1008,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             ShowGlassAlert(L"Storage check failed — nothing changed",
                 L"QuickSift could not determine the complete size of the selected files. It stopped before copying or moving anything.",
                 GlassAlertKind::Warning);
-            return;
+            return false;
         }
         if (requiredDestinationBytes > 0) {
             constexpr std::uint64_t kCopyReserve = 128ull * 1024ull * 1024ull;
@@ -1107,26 +1022,21 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
                     << L"\nAvailable space: " << FormatFileSize(available)
                     << L"\n\nQuickSift needs enough room to finish and verify every copied byte before publishing the destination filenames.";
                 ShowGlassAlert(L"Low storage — nothing changed", message.str(), GlassAlertKind::Warning);
-                return;
+                return false;
             }
         }
+        return true;
+    }
 
-        std::error_code createError;
-        fs::create_directories(destinationFolder, createError);
-        if (createError) {
-            ShowGlassAlert(remove ? L"Deleted folder unavailable" : L"Destination unavailable",
-                L"QuickSift could not create or access the destination folder. No files were changed.",
-                GlassAlertKind::Error);
-            return;
-        }
-
+    quicksift::transactions::FileTransactionPlan QuickSiftApplicationImpl::BuildFileTransactionPlan(
+        std::vector<PlannedFileTransfer>& plan, bool move, bool remove, bool missingRawCompanion) {
         const std::wstring historyLabel = remove ? L"Delete to subfolder" :
             (move ? L"Move files" : L"Copy files");
         std::vector<std::pair<std::size_t, std::size_t>> historyPathLengths;
         historyPathLengths.reserve(plan.size() * 2);
         std::unordered_set<std::wstring> historySidecars;
         historySidecars.reserve(plan.size() + 1);
-        for (const PlannedTransfer& transfer : plan) {
+        for (const PlannedFileTransfer& transfer : plan) {
             historyPathLengths.emplace_back(transfer.source.native().size(),
                 transfer.destination.native().size());
             if (transfer.sidecarPresent &&
@@ -1148,7 +1058,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         transaction.groups.reserve(plan.size());
         std::unordered_map<std::wstring, std::size_t> mediaGroupBySidecar;
         mediaGroupBySidecar.reserve(plan.size() + 1);
-        for (PlannedTransfer& transfer : plan) {
+        for (PlannedFileTransfer& transfer : plan) {
             if (!transfer.sidecarPresent) {
                 quicksift::transactions::TransferGroup group;
                 group.owners.push_back({ std::move(transfer.source),
@@ -1170,18 +1080,7 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             transaction.groups[iterator->second].owners.push_back({
                 std::move(transfer.source), std::move(transfer.destination) });
         }
-
-        const std::uint64_t token = transactions_.SubmitFile(transaction);
-        if (token == 0) {
-            ShowGlassAlert(L"Another file operation is already running",
-                L"QuickSift serializes verified file transactions so two operations cannot race over the same media. The new request was not started.",
-                GlassAlertKind::Warning);
-            return;
-        }
-        StartUiTimer(ID_TIMER_FILE_PROGRESS, 1000, L"file-operation progress");
-        UpdateStatus();
-        ShowToast(remove ? L"Moving selected files to Deleted…" :
-            (move ? L"Moving and verifying…" : L"Copying and verifying…"));
+        return transaction;
     }
 
     void QuickSiftApplicationImpl::DrainFileTransactionResults() {

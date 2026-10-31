@@ -1,5 +1,9 @@
 // OWNER: Central macOS-inspired GDI/GDI+ component renderer.
+#include <windows.h>
+#include <commctrl.h>
+#include <uxtheme.h>
 #include "ui/framework/macos_ui_framework.h"
+#include "core/pane_scroll_policy.h"
 #include "ui/ui_layout_metrics.h"
 
 
@@ -7,6 +11,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cwchar>
 
 namespace quicksift::ui::framework {
 namespace {
@@ -72,10 +78,10 @@ void MacOsUiFramework::PaintChevron(HDC dc, const RECT& rect, COLORREF color, UI
         cx + ScaleDip(3, dpi), cy - ScaleDip(1, dpi));
 }
 
-void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
+bool MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
     const ButtonPresentation& presentation, const ThemePalette& palette,
     UINT dpi, HFONT normalFont, HFONT semiboldFont) const {
-    if (!dc) return;
+    if (!dc) return false;
     RECT rect = sourceRect;
     const bool title = presentation.role == ButtonRole::TitleBar;
     const bool header = presentation.role == ButtonRole::Header;
@@ -208,7 +214,8 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
     }
 
     HFONT oldFont = nullptr;
-    if (!SelectFontObject(dc, semiboldFont ? semiboldFont : normalFont, oldFont)) return;
+    if (!SelectFontObject(dc, semiboldFont ? semiboldFont : normalFont, oldFont)) return false;
+    bool truncated = false;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, text);
     RECT textRect = rect;
@@ -233,6 +240,13 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
         textRect.left += padding;
         textRect.right -= padding;
         if (state.popup) textRect.right -= ScaleDip(kButtonPopupChevronDip, dpi);
+        SIZE extent{};
+        if (!presentation.text.empty() && GetTextExtentPoint32W(dc, presentation.text.c_str(),
+                static_cast<int>(presentation.text.size()), &extent)) {
+            truncated = quicksift::core::caption::Truncated(static_cast<int>(extent.cx),
+                static_cast<int>(rect.right - rect.left), padding,
+                state.popup ? ScaleDip(kButtonPopupChevronDip, dpi) : 0);
+        }
         DrawTextW(dc, presentation.text.c_str(), -1, &textRect,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
         if (state.popup && !state.disabled) {
@@ -264,6 +278,7 @@ void MacOsUiFramework::PaintButton(HDC dc, const RECT& sourceRect,
         }
     }
     SelectObject(dc, oldFont);
+    return truncated;
 }
 
 void MacOsUiFramework::PaintPanel(HDC dc, const RECT& rect,
@@ -498,70 +513,18 @@ void MacOsUiFramework::PaintStatus(HDC dc, const RECT& sourceRect,
     paintContents(dc, sourceRect);
 }
 
-int MacOsUiFramework::MeasureVerticalTabTextExtent(std::wstring_view text, UINT dpi) const {
-    if (text.empty()) return 0;
-
-    // Keep this measurement exactly in lock-step with PaintVerticalTab():
-    // same family, size, weight, and GDI+ text renderer. The returned width
-    // becomes the vertical height of the rotated tab.
-    HDC dc = GetDC(nullptr);
-    if (!dc) return 0;
-
-    Gdiplus::Graphics graphics(dc);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
-        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::StringFormat format;
-    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoClip);
-
-    const std::wstring ownedText(text);
-    Gdiplus::RectF bounds{};
-    graphics.MeasureString(ownedText.c_str(), -1, &font, Gdiplus::PointF(0.0f, 0.0f),
-        &format, &bounds);
-
-    ReleaseDC(nullptr, dc);
-    return static_cast<int>(std::ceil(bounds.Width));
-}
-
-void MacOsUiFramework::PaintVerticalTab(HDC dc, const RECT& rect, std::wstring_view text,
-    bool active, const ThemePalette& palette, UINT dpi, float activeBlend) const {
-    (void)active; // activeBlend is the authoritative visual state for animated tabs.
-    if (!dc) return;
-    Gdiplus::Graphics graphics(dc);
-    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    activeBlend = std::clamp(activeBlend, 0.0f, 1.0f);
-    const COLORREF baseSurface = palette.panelStrong;
-    const COLORREF baseBorder = BlendColor(palette.border, palette.panelStrong, 0.18f);
-    const COLORREF surface = BlendColor(baseSurface, palette.accent, activeBlend);
-    const COLORREF border = BlendColor(baseBorder, palette.accentBorder, activeBlend);
-    // The tab HWND uses an aliased rounded region of the same radius; the 2 px (at
-    // 100%) border deliberately covers the region staircase, so it stays.
-    const float verticalTabRadius = static_cast<float>(ScaleDip(quicksift::ui::layout::kSidebarTabRadiusDip, dpi));
-    FillRoundedRectGp(graphics, rect, verticalTabRadius, ToGpColor(surface));
-    DrawRoundedRectGp(graphics, rect, verticalTabRadius,
-        ToGpColor(border), static_cast<float>(std::max(2, ScaleDip(1, dpi))));
-
-    const Gdiplus::GraphicsState state = graphics.Save();
-    const float cx = static_cast<float>((rect.left + rect.right) / 2);
-    const float cy = static_cast<float>((rect.top + rect.bottom) / 2);
-    graphics.TranslateTransform(cx, cy);
-    graphics.RotateTransform(-90.0f);
-    // Grid-fitted ClearType cannot be used on rotated text; grayscale AA keeps the
-    // rotated label smooth instead of the system default (aliased on some setups).
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(9, dpi)),
-        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, palette.accentText, activeBlend)));
-    Gdiplus::StringFormat format;
-    format.SetAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    const Gdiplus::RectF textRect(-static_cast<float>(rect.bottom - rect.top) / 2.0f,
-        -static_cast<float>(rect.right - rect.left) / 2.0f,
-        static_cast<float>(rect.bottom - rect.top), static_cast<float>(rect.right - rect.left));
-    const std::wstring ownedText(text);
-    graphics.DrawString(ownedText.c_str(), -1, &font, textRect, &format, &brush);
-    graphics.Restore(state);
+HFONT MacOsUiFramework::SidebarTabFont(UINT dpi) const noexcept {
+    if (dpi == 0) dpi = USER_DEFAULT_SCREEN_DPI;
+    if (sidebarTabFont_ && sidebarTabFontDpi_ == dpi) return sidebarTabFont_;
+    // Same metrics as the former GDI+ label: em size ScaleDip(10) px, bold.
+    HFONT created = CreateFontW(-ScaleDip(10, dpi), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE, tokens::kFamilyFallback);
+    if (!created) return sidebarTabFont_; // keep the previous one (any DPI) rather than none
+    if (sidebarTabFont_) DeleteObject(sidebarTabFont_);
+    sidebarTabFont_ = created;
+    sidebarTabFontDpi_ = dpi;
+    return sidebarTabFont_;
 }
 
 void MacOsUiFramework::PaintSidebarTab(HDC dc, const RECT& rect, std::wstring_view text,
@@ -571,7 +534,6 @@ void MacOsUiFramework::PaintSidebarTab(HDC dc, const RECT& rect, std::wstring_vi
     Gdiplus::Graphics graphics(dc);
     graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
-    graphics.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
     activeBlend = std::clamp(activeBlend, 0.0f, 1.0f);
     const COLORREF baseSurface = palette.panelStrong;
     const COLORREF baseBorder = BlendColor(palette.border, palette.panelStrong, 0.18f);
@@ -584,22 +546,22 @@ void MacOsUiFramework::PaintSidebarTab(HDC dc, const RECT& rect, std::wstring_vi
     DrawRoundedRectGp(graphics, rect, tabRadius,
         ToGpColor(border), static_cast<float>(std::max(2, ScaleDip(1, dpi))));
 
-    Gdiplus::Font font(tokens::kFamilyFallback, static_cast<Gdiplus::REAL>(ScaleDip(10, dpi)),
-        Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush brush(ToGpColor(BlendColor(palette.muted, palette.accentText, activeBlend)));
-    Gdiplus::StringFormat format;
-    format.SetAlignment(Gdiplus::StringAlignmentNear);
-    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-    format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
-    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
-    const float pad = static_cast<float>(ScaleDip(kSidebarTabPadDip, dpi));
-    const Gdiplus::RectF textRect(
-        static_cast<float>(rect.left) + pad,
-        static_cast<float>(rect.top),
-        std::max(1.0f, static_cast<float>(rect.right - rect.left) - pad * 2.0f),
-        static_cast<float>(rect.bottom - rect.top));
-    const std::wstring ownedText(text);
-    graphics.DrawString(ownedText.c_str(), -1, &font, textRect, &format, &brush);
+    graphics.Flush(Gdiplus::FlushIntentionSync); // shapes land before the GDI text
+
+    // GDI label (no GDI+ font: see SidebarTabFont). Left-aligned, vertically
+    // centred, single line, end ellipsis — the former StringFormat settings.
+    HFONT font = SidebarTabFont(dpi);
+    HFONT oldFont = nullptr;
+    if (!SelectFontObject(dc, font, oldFont)) return;
+    const int pad = ScaleDip(kSidebarTabPadDip, dpi);
+    RECT textRect{ rect.left + pad, rect.top, std::max(rect.left + pad + 1, rect.right - pad), rect.bottom };
+    const int oldMode = SetBkMode(dc, TRANSPARENT);
+    const COLORREF oldColor = SetTextColor(dc, BlendColor(palette.muted, palette.accentText, activeBlend));
+    DrawTextW(dc, text.data(), static_cast<int>(text.size()), &textRect,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SetTextColor(dc, oldColor);
+    SetBkMode(dc, oldMode);
+    if (oldFont) SelectObject(dc, oldFont);
 }
 
 void MacOsUiFramework::PaintMenuItem(HDC dc, const RECT& rect, const MenuItem& item,
@@ -728,6 +690,8 @@ void MacOsUiFramework::PaintSolidSurface(HDC dc, const RECT& rect,
 
 MacOsUiFramework::~MacOsUiFramework() {
     ClearPaneFrost();
+    if (sidebarTabFont_) DeleteObject(sidebarTabFont_);
+    sidebarTabFont_ = nullptr;
 }
 
 void MacOsUiFramework::ClearPaneFrost() noexcept {
@@ -991,3 +955,313 @@ void MacOsUiFramework::ApplyRoundedRegion(HWND window, int width, int height, in
 }
 
 } // namespace quicksift::ui::framework
+
+
+namespace quicksift::ui::framework {
+
+namespace { constexpr wchar_t kCheckboxCheckedProperty[] = L"QuickSift.CheckboxChecked"; }
+
+void MacOsUiFramework::SetCheckboxChecked(HWND checkbox, bool checked) noexcept {
+    if (!checkbox) return;
+    if (checked) SetPropW(checkbox, kCheckboxCheckedProperty, reinterpret_cast<HANDLE>(1));
+    else RemovePropW(checkbox, kCheckboxCheckedProperty);
+    InvalidateRect(checkbox, nullptr, FALSE);
+}
+
+bool MacOsUiFramework::IsCheckboxChecked(HWND checkbox) noexcept {
+    return checkbox && GetPropW(checkbox, kCheckboxCheckedProperty) != nullptr;
+}
+
+void MacOsUiFramework::PaintCheckbox(HDC dc, const RECT& rect, std::wstring_view text, bool checked,
+    bool hot, bool focused, bool disabled, const ThemePalette& palette, UINT dpi,
+    HFONT font, COLORREF parentSurface) const {
+    if (!dc) return;
+    const int scaleDpi = static_cast<int>(std::max<UINT>(USER_DEFAULT_SCREEN_DPI, dpi));
+    const auto px = [scaleDpi](int dip) { return std::max(1, MulDiv(dip, scaleDpi, USER_DEFAULT_SCREEN_DPI)); };
+    HBRUSH surface = CreateSolidBrush(parentSurface);
+    if (surface) { FillRect(dc, &rect, surface); DeleteObject(surface); }
+    const int box = px(16);
+    const int top = rect.top + (rect.bottom - rect.top - box) / 2;
+    RECT boxRect{ rect.left + px(2), top, rect.left + px(2) + box, top + box };
+    const COLORREF fill = checked ? palette.accent : (hot ? palette.buttonHot : palette.button);
+    const COLORREF border = checked ? palette.accentBorder : (hot || focused ? palette.accent : palette.border);
+    HBRUSH fillBrush = CreateSolidBrush(disabled ? palette.buttonDisabled : fill);
+    HPEN borderPen = CreatePen(PS_SOLID, px(1), border);
+    HGDIOBJ oldBrush = fillBrush ? SelectObject(dc, fillBrush) : nullptr;
+    HGDIOBJ oldPen = borderPen ? SelectObject(dc, borderPen) : nullptr;
+    RoundRect(dc, boxRect.left, boxRect.top, boxRect.right, boxRect.bottom, px(5), px(5));
+    if (oldBrush) SelectObject(dc, oldBrush);
+    if (oldPen) SelectObject(dc, oldPen);
+    if (fillBrush) DeleteObject(fillBrush);
+    if (borderPen) DeleteObject(borderPen);
+    if (checked) {
+        HPEN tick = CreatePen(PS_SOLID, px(2), palette.accentText);
+        HGDIOBJ previous = tick ? SelectObject(dc, tick) : nullptr;
+        const POINT points[3] = {
+            { boxRect.left + box * 4 / 16, boxRect.top + box * 8 / 16 },
+            { boxRect.left + box * 7 / 16, boxRect.top + box * 11 / 16 },
+            { boxRect.left + box * 12 / 16, boxRect.top + box * 5 / 16 } };
+        Polyline(dc, points, 3);
+        if (previous) SelectObject(dc, previous);
+        if (tick) DeleteObject(tick);
+    }
+    RECT textRect{ boxRect.right + px(8), rect.top, rect.right, rect.bottom };
+    HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, disabled ? palette.muted : palette.text);
+    DrawTextW(dc, text.data(), static_cast<int>(text.size()), &textRect,
+        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    if (focused) {
+        RECT measured = textRect;
+        DrawTextW(dc, text.data(), static_cast<int>(text.size()), &measured,
+            DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+        const int height = measured.bottom - measured.top;
+        RECT ring{ boxRect.left - px(2), (rect.top + rect.bottom - height) / 2 - px(2),
+            std::min(rect.right, measured.right + px(3)), (rect.top + rect.bottom + height) / 2 + px(2) };
+        ring.top = std::min(ring.top, boxRect.top - px(2));
+        ring.bottom = std::max(ring.bottom, boxRect.bottom + px(2));
+        HPEN focusPen = CreatePen(PS_SOLID, px(1), palette.accent);
+        HGDIOBJ previousPen = focusPen ? SelectObject(dc, focusPen) : nullptr;
+        HGDIOBJ previousBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        RoundRect(dc, ring.left, ring.top, ring.right, ring.bottom, px(6), px(6));
+        SelectObject(dc, previousBrush);
+        if (previousPen) SelectObject(dc, previousPen);
+        if (focusPen) DeleteObject(focusPen);
+    }
+    if (oldFont) SelectObject(dc, oldFont);
+}
+
+} // namespace quicksift::ui::framework
+
+namespace quicksift::ui::framework {
+
+namespace {
+// Overflow (ellipsis) tooltip: a framework-owned, self-painted popup. The comctl32
+// tracking tooltip used before was activated (TTM_TRACKACTIVATE, visible=1) but its
+// content depended on comctl32's own paint/theme/fade path; this window is painted
+// by us with the palette and is mouse-transparent (it can never cause the hovered
+// button's WM_MOUSELEAVE).
+HWND gOverflowTooltip = nullptr;
+HWND gOverflowTipOwner = nullptr;
+COLORREF gOverflowTipBackground = RGB(44, 48, 56);
+COLORREF gOverflowTipText = RGB(235, 238, 242);
+COLORREF gOverflowTipBorder = RGB(90, 96, 108);
+HFONT gOverflowTipFont = nullptr;
+UINT gOverflowTipDpi = USER_DEFAULT_SCREEN_DPI;
+constexpr wchar_t kOverflowTipClass[] = L"QuickSift.OverflowTip";
+} // namespace
+
+void MacOsUiFramework::StyleTooltip(HWND tooltip, const ThemePalette& palette, UINT dpi, HFONT font) noexcept {
+    if (!tooltip) return;
+    if (tooltip == gOverflowTooltip) {
+        gOverflowTipBackground = palette.dark ? palette.menu : palette.panelStrong;
+        gOverflowTipText = palette.text;
+        gOverflowTipBorder = palette.border;
+        gOverflowTipFont = font;
+        gOverflowTipDpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, dpi);
+        if (IsWindowVisible(tooltip)) InvalidateRect(tooltip, nullptr, TRUE);
+        return;
+    }
+    // Drop the visual style so the palette colours apply (themed tooltips ignore
+    // TTM_SETTIPBKCOLOR); the border comes from WS_BORDER drawn in the text colour.
+    SetWindowTheme(tooltip, L"", L"");
+    const COLORREF background = palette.dark ? palette.menu : palette.panelStrong;
+    SendMessageW(tooltip, TTM_SETTIPBKCOLOR, static_cast<WPARAM>(background), 0);
+    SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, static_cast<WPARAM>(palette.text), 0);
+    const int margin = ScaleDip(6, std::max<UINT>(USER_DEFAULT_SCREEN_DPI, dpi));
+    RECT margins{ margin, margin / 2, margin, margin / 2 };
+    SendMessageW(tooltip, TTM_SETMARGIN, 0, reinterpret_cast<LPARAM>(&margins));
+    SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, ScaleDip(390, std::max<UINT>(USER_DEFAULT_SCREEN_DPI, dpi)));
+    if (font) SendMessageW(tooltip, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+}
+
+HWND MacOsUiFramework::CreateSharedTooltip(HWND owner, HINSTANCE instance) noexcept {
+    if (!owner) return nullptr;
+    return CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOACTIVATE, TOOLTIPS_CLASSW, nullptr,
+        WS_POPUP | WS_BORDER | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
+        CW_USEDEFAULT, CW_USEDEFAULT, owner, nullptr, instance, nullptr);
+}
+
+void MacOsUiFramework::PaintDragGrip(ID2D1RenderTarget* target, D2D1_POINT_2F center,
+    ID2D1Brush* brush) const noexcept {
+    if (!target || !brush) return;
+    for (int dot = -2; dot <= 2; ++dot) {
+        target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(center.x + 6.0f * static_cast<float>(dot), center.y),
+            1.6f, 1.6f), brush);
+    }
+}
+
+namespace {
+MacOsUiFramework::TraceSink gOverflowTrace = nullptr;
+constexpr wchar_t kOverflowTextProperty[] = L"QuickSift.OverflowText";
+constexpr UINT_PTR kOverflowTipTimer = 0x51F7;
+constexpr UINT kOverflowTipDelayMs = 450;
+
+LRESULT CALLBACK OverflowTipProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_NCHITTEST:
+        return HTTRANSPARENT; // never takes the pointer from the hovered button
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        if (dc) {
+            RECT client{};
+            GetClientRect(window, &client);
+            HBRUSH background = CreateSolidBrush(gOverflowTipBackground);
+            HBRUSH border = CreateSolidBrush(gOverflowTipBorder);
+            if (background) FillRect(dc, &client, background);
+            if (border) FrameRect(dc, &client, border);
+            wchar_t text[512]{};
+            GetWindowTextW(window, text, static_cast<int>(std::size(text)));
+            HGDIOBJ oldFont = gOverflowTipFont ? SelectObject(dc, gOverflowTipFont) : nullptr;
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, gOverflowTipText);
+            RECT textRect = client;
+            const int marginX = MulDiv(8, static_cast<int>(gOverflowTipDpi), 96), marginY = MulDiv(4, static_cast<int>(gOverflowTipDpi), 96);
+            InflateRect(&textRect, -marginX, -marginY);
+            DrawTextW(dc, text, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            if (oldFont) SelectObject(dc, oldFont);
+            if (background) DeleteObject(background);
+            if (border) DeleteObject(border);
+        }
+        EndPaint(window, &paint);
+        return 0;
+    }
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+} // namespace
+
+void MacOsUiFramework::SetOverflowTraceSink(TraceSink sink) noexcept { gOverflowTrace = sink; }
+
+void MacOsUiFramework::TraceOverflow(HWND button, const wchar_t* event, const wchar_t* detail) noexcept {
+    if (!gOverflowTrace) return;
+    wchar_t line[512]{};
+    _snwprintf_s(line, _countof(line), _TRUNCATE, L"overflow-tip %ls button=%p id=%d tooltip=%p %ls",
+        event ? event : L"", static_cast<void*>(button), button ? GetDlgCtrlID(button) : 0,
+        static_cast<void*>(gOverflowTooltip), detail ? detail : L"");
+    gOverflowTrace(line);
+}
+
+HWND MacOsUiFramework::CreateOverflowTooltip(HWND owner, HINSTANCE instance) noexcept {
+    if (!owner) return nullptr;
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    if (!GetClassInfoExW(instance, kOverflowTipClass, &windowClass)) {
+        windowClass = WNDCLASSEXW{};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.style = CS_DROPSHADOW;
+        windowClass.lpfnWndProc = OverflowTipProc;
+        windowClass.hInstance = instance;
+        windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.lpszClassName = kOverflowTipClass;
+        if (!RegisterClassExW(&windowClass)) {
+            wchar_t detail[64]{};
+            _snwprintf_s(detail, _countof(detail), _TRUNCATE, L"RegisterClassExW error=%lu", GetLastError());
+            TraceOverflow(nullptr, L"create-failed", detail);
+            return nullptr;
+        }
+    }
+    HWND tooltip = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+        kOverflowTipClass, L"", WS_POPUP, 0, 0, 0, 0, owner, nullptr, instance, nullptr);
+    if (!tooltip) {
+        wchar_t detail[64]{};
+        _snwprintf_s(detail, _countof(detail), _TRUNCATE, L"CreateWindowExW error=%lu", GetLastError());
+        TraceOverflow(nullptr, L"create-failed", detail);
+        return nullptr;
+    }
+    TraceOverflow(nullptr, L"created");
+    return tooltip;
+}
+
+void MacOsUiFramework::SetOverflowTooltip(HWND tooltip) noexcept {
+    gOverflowTooltip = tooltip;
+    gOverflowTipOwner = nullptr;
+}
+
+void MacOsUiFramework::SetButtonOverflowText(HWND button, const wchar_t* text) noexcept {
+    if (!button) return;
+    if (text && *text) {
+        const bool had = GetPropW(button, kOverflowTextProperty) != nullptr;
+        SetPropW(button, kOverflowTextProperty, reinterpret_cast<HANDLE>(const_cast<wchar_t*>(text)));
+        if (!had) TraceOverflow(button, L"marked-truncated", text);
+    } else if (GetPropW(button, kOverflowTextProperty)) {
+        RemovePropW(button, kOverflowTextProperty);
+        HideOverflowTip(button);
+        TraceOverflow(button, L"unmarked");
+    }
+}
+
+void MacOsUiFramework::ArmOverflowTip(HWND button) noexcept {
+    if (!button) return;
+    if (!GetPropW(button, kOverflowTextProperty)) return; // caption fits: nothing to show
+    if (!gOverflowTooltip) {
+        TraceOverflow(button, L"arm-skipped", L"no tooltip window");
+        return;
+    }
+    const UINT_PTR timer = SetTimer(button, kOverflowTipTimer, kOverflowTipDelayMs, nullptr);
+    TraceOverflow(button, L"armed", timer ? L"timer set" : L"SetTimer FAILED");
+}
+
+void MacOsUiFramework::ShowOverflowTip(HWND button) noexcept {
+    if (!button) return;
+    KillTimer(button, kOverflowTipTimer);
+    const auto* text = static_cast<const wchar_t*>(GetPropW(button, kOverflowTextProperty));
+    if (!gOverflowTooltip || !text || !IsWindowVisible(button)) {
+        TraceOverflow(button, L"show-skipped", !gOverflowTooltip ? L"no tooltip" : (!text ? L"no text" : L"button hidden"));
+        return;
+    }
+    SetWindowTextW(gOverflowTooltip, text);
+    // Size from the real text extent (DPI-scaled font + margins).
+    RECT measure{ 0, 0, ScaleDip(390, gOverflowTipDpi), 0 };
+    if (HDC dc = GetDC(gOverflowTooltip)) {
+        HGDIOBJ oldFont = gOverflowTipFont ? SelectObject(dc, gOverflowTipFont) : nullptr;
+        DrawTextW(dc, text, -1, &measure, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        if (oldFont) SelectObject(dc, oldFont);
+        ReleaseDC(gOverflowTooltip, dc);
+    }
+    const int tipW = static_cast<int>(measure.right - measure.left) + 2 * ScaleDip(8, gOverflowTipDpi);
+    const int tipH = static_cast<int>(measure.bottom - measure.top) + 2 * ScaleDip(4, gOverflowTipDpi);
+    RECT rc{};
+    GetWindowRect(button, &rc); // screen coordinates
+    const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, GetDpiForWindow(button));
+    // Below the button, left-aligned with it; flipped above near the monitor
+    // bottom and kept inside the work area (never under the cursor).
+    int x = rc.left;
+    int y = rc.bottom + ScaleDip(4, dpi);
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(MONITORINFO);
+    if (GetMonitorInfoW(MonitorFromWindow(button, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        if (y + tipH > monitor.rcWork.bottom) y = rc.top - ScaleDip(4, dpi) - tipH;
+        if (x + tipW > monitor.rcWork.right) x = std::max<int>(monitor.rcWork.left, monitor.rcWork.right - tipW);
+        if (x < monitor.rcWork.left) x = monitor.rcWork.left;
+    }
+    SetWindowPos(gOverflowTooltip, HWND_TOPMOST, x, y, tipW, tipH,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    RedrawWindow(gOverflowTooltip, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    gOverflowTipOwner = button;
+    RECT shown{};
+    GetWindowRect(gOverflowTooltip, &shown);
+    wchar_t detail[200]{};
+    _snwprintf_s(detail, _countof(detail), _TRUNCATE, L"at=%d,%d size=%dx%d window=%ld,%ld,%ld,%ld visible=%d",
+        x, y, tipW, tipH, shown.left, shown.top, shown.right, shown.bottom,
+        IsWindowVisible(gOverflowTooltip) ? 1 : 0);
+    TraceOverflow(button, L"shown", detail);
+}
+
+void MacOsUiFramework::HideOverflowTip(HWND button) noexcept {
+    if (button) KillTimer(button, kOverflowTipTimer);
+    if (!gOverflowTooltip || !gOverflowTipOwner || (button && gOverflowTipOwner != button)) return;
+    SetWindowPos(gOverflowTooltip, nullptr, 0, 0, 0, 0,
+        SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    TraceOverflow(gOverflowTipOwner, L"hidden");
+    gOverflowTipOwner = nullptr;
+}
+
+} // namespace quicksift::ui::framework
+

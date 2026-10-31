@@ -27,8 +27,11 @@ enum class Rank : std::uint8_t {
     BatchWorkerMutex = 32,       // batchWorkerMutex_
     WorkerBlocked = 40,          // Worker::blockedMutex_
     WorkerReadAheadGate = 41,    // Worker::readAheadGateMutex_
-    WorkerDesired = 42,          // Worker::desiredMutex_
     WorkerQueue = 43,            // Worker::mutex_ (PopWork runs under it)
+    // Round 21 (t29u): was 42, below WorkerQueue, but Enqueue / the view-lane
+    // reconcile take desiredMutex_ while holding mutex_. It is a leaf (nothing is
+    // locked inside it), so the real order is mutex_ -> desiredMutex_.
+    WorkerDesired = 44,          // Worker::desiredMutex_ (leaf)
     CacheDatabase = 50,          // PersistentCache::databaseMutex_
     CacheDeferred = 51,          // PersistentCache::deferredMutex_
     LogStream = 60,              // diagnostic log streamMutex

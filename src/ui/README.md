@@ -1,5 +1,7 @@
 # QuickSift UI Code Map
 
+Read [`../../CODE_GUIDE.md`](../../CODE_GUIDE.md) first (§0 rules, §2 owner table, §8.1 threads and shutdown).
+
 QuickSift uses native Win32 controls and a Direct2D/Direct3D photo canvas, but ordinary interface components are no longer painted independently by feature modules. A central macOS-inspired UI framework owns reusable control creation, interaction state, component rendering, popups, toasts, alerts, title-bar traffic lights, panels, labels, badges, cards, and overlay chrome.
 
 No UI implementation file is included textually into another file. CMake compiles every module independently, and source verification rejects `.inl` implementation fragments and ordinary feature code that bypasses the central component renderer.
@@ -9,7 +11,8 @@ No UI implementation file is included textually into another file. CMake compile
 - `framework/ui_models.h/.cpp` — platform-neutral popup navigation, toast queue/timing, alert state, hit testing, and shared component presentation models.
 - `framework/macos_ui_framework.h` — the single component facade used by application UI modules.
 - `framework/macos_ui_framework.cpp` — native control creation plus shared button hover/focus behavior.
-- `framework/macos_ui_framework_gdi.cpp` — macOS-style buttons, panels, labels, status surfaces, menus, title bar, traffic lights, tabs, and overlay scrollbars.
+- `framework/macos_ui_framework_gdi.cpp` — macOS-style buttons, panels, labels, status surfaces, menus, title bar, traffic lights, tabs, and overlay scrollbars. It also owns the self-painted overflow tooltip (`QuickSift.OverflowTip`, `ArmOverflowTip`/`ShowOverflowTip`/`HideOverflowTip`). It appears when button paint detects a truncated caption via `core::caption::Truncated`. Feature code never adds its own tooltip for a truncated caption.
+- `framework/macos_ui_framework_form.cpp` — the reusable owned modal form dialog (Batch Processing) and `PickFolder`.
 - `framework/macos_ui_framework_popup.cpp` — centralized dropdown window, work-area placement, high-DPI scrolling, keyboard/mouse routing, and rendering.
 - `framework/macos_ui_framework_d2d.cpp` — toasts, modal alerts, photo cards, badges, and shared DirectWrite text rendering.
 
@@ -40,7 +43,8 @@ Specialized photo work remains in `canvas_rendering_and_overlays.cpp`: bitmap co
 
 - `ui_command_ids.h` — authoritative stable command/control IDs.
 - `ui_control_catalog.h` — authoritative persistent main-window button definitions and memberships.
-- `ui_layout_metrics.h` — shared device-independent geometry.
+- `ui_layout_metrics.h` — shared device-independent geometry used across areas (`quicksift::ui::layout::k*Dip`: title bar, status height, left-pane widths, radii).
+- `ui_layout_constants.h` — per-area named DIPs: `main_window` (minimum track size), `left_pane` (Folders/Info/button-flow/Settings sections), `status_bar`, `document` (Help/About/Diagnostic log chrome). It includes `ui_layout_metrics.h`. The layout helpers take every number from here; integer literals are rejected by the verifiers.
 - `ui_design_tokens.h` — design tokens (radii, spacing, strokes, type, motion, glass material, accessibility policy); see `docs/DESIGN_SYSTEM.md`.
 - `ui_design_system.h/.cpp` — semantic palettes, contrast, DPI helpers, and low-level failure-safe drawing primitives used by the framework.
 - `framework/ui_animation.h/.cpp` — the central Animator (element registry, motion presets, easing curves, completions). Every slide/fade/drop-down/pop goes through it; feature code never runs its own animation timer (see "Animation system" in `docs/DESIGN_SYSTEM.md`).
@@ -52,6 +56,7 @@ Specialized photo work remains in `canvas_rendering_and_overlays.cpp`: bitmap co
 ## Feature modules
 
 - `app_theme_documents_and_localization.cpp` — theme application, localization, help/about/diagnostics, tooltips, and global shortcuts.
+- `session_log_browser_controller.cpp` — the Diagnostic log window's **Previous sessions…** button (`ID_DOCUMENT_PREVIOUS_SESSIONS`). A worker lists or reads a log (`WM_APP_SESSION_LOG_WORKER_DONE`), the dropdown shows date · size labels (`ID_DOCUMENT_SESSION_LOG_FIRST…LAST`, unlocalized via `TrackDropdownMenuVerbatim`), and the chosen log opens read-only as a `DocumentKind::SessionLog` window. Policy is in `core/session_log_browser.h`, file access in `diagnostics::ReadSessionLogTail`; it never deletes.
 - `main_window_chrome_and_messages.cpp` — class registration, message routing, fullscreen, sizing, DPI, timers, and shutdown coordination.
 - `main_window_controls_layout_and_painting.cpp` — component declarations, semantic state mapping, fonts, layout, and left hover-pane composition.
 - `popup_menus_commands_and_folder_tree.cpp` — dropdown requests, command dispatch, folder tree behavior, visible-catalog rebuild, and status text.
@@ -63,9 +68,14 @@ Specialized photo work remains in `canvas_rendering_and_overlays.cpp`: bitmap co
 - `viewport_prefetch_controller.cpp` — conversion of viewport state into ordered decode requests.
 - `navigation_input_and_session.cpp` — keyboard/mouse navigation, zoom/pan/rotation, mode changes, face scheduling, and session persistence.
 - `metadata_history_and_file_safety.cpp` — metadata/file transaction-plan construction, asynchronous completion integration, and history replay orchestration.
-- `settings_filters_and_file_commands.cpp` — settings/filter menu declarations and high-level copy/move/delete planning.
+- `settings_filters_and_file_commands.cpp` — settings/filter menu declarations (including the "Write metadata into RAW / JPG/PNG / TIFF files" toggles, `ID_SETTING_METADATA_*`) and high-level copy/move/delete planning.
+- `metadata_write_lane_controller.cpp` — UI side of the metadata write lane: edit coalescing, urgent slot, retry/Skip.
+- `thumbnail_search_controller.cpp` — the Thumbnail search field and search-worker hand-off.
+- `ratings_exchange_commands.cpp` / `batch_processing_commands.cpp` — Import/Export Ratings and Batch Processing orchestration.
+- `blocking_wait_controller.cpp` — the live "QuickSift is waiting for…" dialog for Close, ratings import/export and Batch (text model: `../core/blocking_wait.h`).
+- `performance_policy_controller.cpp` — fixed performance-policy plumbing and telemetry (HUD text model: `../core/hud_snapshot.h`).
 
-`../app/quicksift_application.h` is the thin public facade. Remaining native orchestration state lives in `../app/quicksift_application_internal.h`; independently testable invariants belong in stores, services, or framework models instead of loose controller fields.
+`../app/quicksift_application.h` is the thin public facade. Orchestration methods, services and COM objects live in `../app/quicksift_application_internal.h`; its plain fields live in the data-only structs in `../app/state/*.h` ([README](../app/state/README.md)); independently testable invariants belong in stores, services, or framework models instead of loose controller fields.
 
 ## Important non-UI owners
 
@@ -87,6 +97,11 @@ UI modules submit immutable plans and integrate results. They must not perform l
 | Add/change an animation or transition | a preset in `framework/ui_animation.h`, wired through `MacOsUiFramework::TickAnimations` |
 | Add/change a color or semantic visual role | `ui_design_system.*` |
 | Change shared spacing or pane dimensions | `ui_layout_metrics.h` |
+| Change a per-area layout number (section, Settings row, status bar, minimum window, document chrome) | `ui_layout_constants.h` |
+| Change left-pane scrolling (per-tab offset, wheel step, focus-into-view, thumb) | geometry in `../core/pane_scroll_policy.h`; wiring in `main_window_controls_layout_and_painting.cpp`; offsets in `../app/state/pane_state.h` |
+| Change overflow-tooltip behavior | `framework/macos_ui_framework_gdi.cpp` |
+| Change when the title bar re-lays out | `LayoutTitleControls` / `TitleLayoutKey` in `main_window_controls_layout_and_painting.cpp`; call `MarkTitleLayoutDirty()` when an input outside the key changes (DPI, fonts, language, theme) |
+| Change a blocking-wait dialog | text model `../core/blocking_wait.h`; dialog `blocking_wait_controller.cpp` |
 | Add a command/control ID | `ui_command_ids.h` |
 | Add a persistent main-window button | `ui_control_catalog.h` plus the behavior owner; creation/painting still routes through the framework |
 | Add a dropdown command | owning feature module builds `MenuItem` data; `MacOsUiFramework::TrackDropdown` owns the window and rendering |
@@ -107,7 +122,10 @@ UI modules submit immutable plans and integrate results. They must not perform l
 - Required control and subclass creation is checked. `WM_CREATE` returns `-1` rather than leave a half-built interface alive.
 - Optional controls log and degrade safely.
 - Use `StartUiTimer`; direct main-window `SetTimer` calls are rejected.
-- Keep layout semantics in the feature owner, but take dimensions from `ui_layout_metrics.h` and component appearance from the framework.
+- Keep layout semantics in the feature owner, but take dimensions from `ui_layout_constants.h` / `ui_layout_metrics.h` and component appearance from the framework.
+- `LayoutControls` calls the guarded `LayoutTitleControls(width, false)`; do not force a title relayout from a hot path.
+- `catch (...)` in a UI module logs through `QS_LOG_AND_CONTINUE` or is marked `QS_CATCH_SILENT_BY_DESIGN("reason")`. The framework reports through its error sink instead.
+- A UI-side worker thread captures `token = workerLifetime_.Issue()` and posts through `PostFromWorker`; it never reads `hwnd_`.
 - Monitor/work-area queries require fallbacks because display topology can change at runtime.
 - Cross-thread messages are wake-ups only; object ownership remains in a synchronized queue or transaction service.
 

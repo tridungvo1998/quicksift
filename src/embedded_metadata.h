@@ -48,6 +48,15 @@ bool EmbeddedMetadataAvailable() noexcept;
 // successful prefer with a release. In-flight Exiv2 calls still finish; the
 // library is not safe to preempt.
 void PreferEmbeddedMetadataWrites() noexcept;
+// Marks the current thread as the metadata writer for the scope of one write so
+// its own embedded reads pass the write preference (core/metadata_gate_policy.h).
+class EmbeddedMetadataWriterScope {
+public:
+    EmbeddedMetadataWriterScope() noexcept;
+    ~EmbeddedMetadataWriterScope();
+    EmbeddedMetadataWriterScope(const EmbeddedMetadataWriterScope&) = delete;
+    EmbeddedMetadataWriterScope& operator=(const EmbeddedMetadataWriterScope&) = delete;
+};
 void ReleaseEmbeddedMetadataWritePreference() noexcept;
 [[nodiscard]] bool EmbeddedMetadataWritePreferred() noexcept;
 

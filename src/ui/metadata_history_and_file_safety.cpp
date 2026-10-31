@@ -174,6 +174,9 @@ QuickSiftApplicationImpl::WriteMetadataPatchFile(const fs::path& path,
     const MetadataPatch& patch, MetadataStorageKind storage, bool jpeg,
     bool safeJpegWrites) {
     quicksift::transactions::MetadataWriteOutcome outcome;
+    // This thread holds the Exiv2 write preference (BeginExclusivePathWrites); its
+    // own reads must pass it or a RAW sidecar write waits on itself forever.
+    const quicksift::EmbeddedMetadataWriterScope writerScope;
     if (storage == MetadataStorageKind::Sidecar) {
         const SidecarMetadataWriteResult sidecar = WritePhotoMetadataPatch(path, patch);
         outcome.ok = sidecar.ok;
@@ -797,7 +800,6 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         const auto refreshPath = [&](const fs::path& path) {
             if (path.empty()) return;
             const std::wstring key = path.wstring();
-            wicImageSources_.erase(key);
             displayedViewKeys_.erase(key);
             if (const auto index = CatalogIndexForPath(key)) {
                 catalog_.EditPhoto(*index, [&](PhotoItem& item) {
@@ -880,7 +882,6 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         for (const fs::path& path : paths) {
             if (path.empty()) continue;
             const std::wstring key = path.wstring();
-            wicImageSources_.erase(key);
             displayedViewKeys_.erase(key);
             if (const auto index = CatalogIndexForPath(key)) {
                 catalog_.EditPhoto(*index, [&](PhotoItem& item) {
@@ -1079,7 +1080,6 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
                 }
                 if (change.before.storage == MetadataStorageKind::Embedded) {
                     const std::wstring key = change.before.path.wstring();
-                    wicImageSources_.erase(key);
                     displayedViewKeys_.erase(key);
                 }
                 transaction.changes.push_back(std::move(change));
@@ -1171,7 +1171,6 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
                 }
                 if (change.after.storage == MetadataStorageKind::Embedded) {
                     const std::wstring key = change.after.path.wstring();
-                    wicImageSources_.erase(key);
                     displayedViewKeys_.erase(key);
                 }
                 transaction.changes.push_back(std::move(change));
@@ -1265,6 +1264,18 @@ void QuickSiftApplicationImpl::FinishMetadataTransaction(
         record.hasFaceSelection = photo.faceSelectionKnown && photo.faceSelection.has_value();
         if (record.hasFaceSelection) record.faceSelection = *photo.faceSelection;
         record.exifText = exifText;
+        // Carry the camera-settings index too. Leaving it default (unknown) made
+        // every rating/label/pick persist wipe the folder's camera index, so the
+        // ISO/aperture/shutter/camera filters had to re-read every file again.
+        if (photo.cameraSettingsKnown) {
+            record.iso = photo.iso;
+            record.aperture = photo.aperture;
+            record.focalLength = photo.focalLength;
+            record.shutterSpeed = photo.shutterSpeed;
+            record.camera = photo.camera;
+            record.lens = photo.lens;
+            record.cameraSettingsKnown = true;
+        }
         // SQLite is intentionally kept off the UI thread. The worker deduplicates
         // repeated changes for the same path and preserves cached EXIF/faces when
         // this partial record does not carry a newly completed scan.

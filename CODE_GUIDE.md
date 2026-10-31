@@ -8,6 +8,61 @@ The central rule is simple:
 
 If a source comment says `CODE GUIDE`, it points back to this document. The comment should stay short; the explanation belongs here.
 
+This file is the hub; every other document defers to it. Folders with their own `README.md` (`src/ui`, `src/app/state`, `src/review`, `src/metadata`) map their files. When two documents disagree, the code wins, then this guide; fix the other document.
+
+## Documentation map
+
+| You want to… | Read |
+|---|---|
+| Use QuickSift: features, shortcuts, settings | [`USER_GUIDE.md`](USER_GUIDE.md) |
+| Understand or change the code: owners, rules, recipes | [`CODE_GUIDE.md`](CODE_GUIDE.md) (this file) |
+| Module boundaries and runtime flows | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| Find the file that owns a change, fast | [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md) |
+| Build, sign or package; what a build error means | [`BUILDING.md`](BUILDING.md) |
+| Automated checks and manual tests | [`TESTING.md`](TESTING.md) |
+| Colours, spacing, type and motion tokens | [`docs/DESIGN_SYSTEM.md`](docs/DESIGN_SYSTEM.md) |
+| Which UI file owns a window, control or menu | [`src/ui/README.md`](src/ui/README.md) |
+| The application's state structs | [`src/app/state/README.md`](src/app/state/README.md) |
+| What changed in each release | [`CHANGELOG.md`](CHANGELOG.md) |
+
+---
+
+## 0. Design philosophy and priorities
+
+When goals conflict, they rank in this order:
+
+1. **The photographer's files.** Original media is authoritative. Mutation is verified, non-overwriting and guarded by rollback; caches are disposable.
+2. **A responsive UI thread.** The UI thread (P0) never does disk I/O, decoding or blocking waits.
+3. **What the user is looking at.** Foreground work outranks visible work, which outranks predictive work, which outranks idle work (§8.1).
+4. **One checkable owner per rule.** Decisions live in portable code that `scripts/checks/` can test off Windows.
+5. **Throughput and polish**, within the limits above.
+
+Rules that follow from this:
+
+| Do | Never |
+|---|---|
+| Give each decision one owner (§2, §3) and extend it. | Copy a list, constant, rule or renderer into a second place. |
+| Build an immutable plan in `src/ui` and submit it through `TransactionCoordinator` (`src/transactions`). | Mutate files or metadata from UI code or on the UI thread. |
+| Let workers mirror review epochs to cancel stale work and push owned results into `BackgroundCompletionQueue`. | Let a worker own or edit review state, `PhotoItem`, `CatalogStore`, an `HWND` or a UI container. Workers read `CatalogSnapshot` only. |
+| Put portable policy in `src/core` or `src/review` (no `windows.h`). | Put Win32 calls in `src/core`/`src/review`, or policy math in a message handler. |
+| Put native orchestration in `src/ui`, `src/work` and `src/transactions`. | Grow `src/main.cpp` or the public facade `src/app/quicksift_application.h`. |
+| Start app-owned threads with `token = workerLifetime_.Issue()`, post only through `PostFromWorker`, and join them in `StopAllWorkersForTeardown`. | Capture raw `this` in a thread, `PostMessageW` a worker completion directly, or tear down services before workers are joined. |
+| Keep metadata (rating/pick/label) reads in their own lane below decode, with guaranteed progress (`core/metadata_lane_policy.h`). | Let metadata reads starve, or let them delay visible decoding. |
+| Take layout sizes from named constants (`ui_layout_constants.h`, `ui_layout_metrics.h`). | Pass integer literals to `DipToPx`/`px`/`Px` in layout helpers. |
+| Log a contained failure with `QS_LOG_AND_CONTINUE(category, site)`, or mark it `QS_CATCH_SILENT_BY_DESIGN("reason")`. | Write an empty `catch (...) {}` in the Windows app layer. |
+| Name files after the one responsibility they own. | Add `helpers`, `misc`, `utils` or a second controller-shaped file. (`src/app/state/app_state_common.h` holds shared includes only.) |
+| Pin an important invariant with a rule in **both** verifiers (§16). | Rely on a comment alone to keep an invariant. |
+
+### How an AI (or a new human) should approach a change
+
+1. Read §0–§3 of this guide; skim [`ARCHITECTURE.md`](ARCHITECTURE.md) for the flow you touch.
+2. Find the owner row in §2. If none fits, create a responsibility-named owner and add a row; never a helper file.
+3. Change only that owner. Callers adapt; they do not get a private copy of the rule.
+4. If the rule is deterministic, put it in portable code and extend the matching `scripts/checks/*.cpp` program.
+5. Run the checks in §14: both verifiers, `check-localization.py` and the check programs. Report anything you could not run, especially the native Windows build.
+6. If users can see the change, update `CHANGELOG.md`, the EN and VI Help text in `src/localization.cpp`, and `USER_GUIDE.md`.
+7. Never claim a Windows build or run that did not happen (§13).
+
 ---
 
 ## 1. The 60-second map
@@ -19,6 +74,12 @@ Windows starts the process
         |
         v
 src/main.cpp                         Composition and startup only
+        |
+        v
+src/app/quicksift_application.h      Public PIMPL facade (no state)
+src/app/quicksift_application_internal.h
+        |                            QuickSiftApplicationImpl: private orchestration surface
+        +-- src/app/state/*.h        Its plain data, split into data-only structs
         |
         v
 src/ui/*.cpp                         Native windows, commands, rendering, UI orchestration
@@ -42,7 +103,7 @@ Use this shortcut:
 - **File or metadata mutation** goes through the appropriate service under `src/transactions`.
 - **Startup and object wiring only** belong in `src/main.cpp`.
 
-Never add feature behavior or state to `../app/quicksift_application.h`; it is a thin public PIMPL facade. Private Win32 orchestration declarations belong in `../app/quicksift_application_internal.h`, and independently testable invariants belong in their own store or service.
+Never add feature behavior or state to `src/app/quicksift_application.h`; it is a thin public PIMPL facade. Private Win32 orchestration method declarations belong in `src/app/quicksift_application_internal.h`. New plain fields belong in the matching struct in `src/app/state/` (see [`src/app/state/README.md`](src/app/state/README.md)). Independently testable invariants belong in their own store or service.
 
 ---
 
@@ -56,6 +117,24 @@ Start with the first matching row.
 | Catalog format/date/rating/label/pick filtering or sorting | `src/core/catalog_policy.*` |
 | Decoded-memory reservations | `src/core/decode_budget.*` |
 | Worker priority ranking or queue promotion | `src/core/work_queue_policy.h` |
+| Work tiers P0–P5, foreground-demand signal, yield and starvation rules | `src/core/priority_policy.*` |
+| Metadata read lane: when a read may start (750 ms aging, 10 s cap behind pending writes) | `src/core/metadata_lane_policy.h` |
+| Metadata read terminal states (apply, bounded retry, mark unreadable) | `src/core/metadata_progress.h` |
+| Exiv2 gate admission (pending writes hold readers; the writer's own reads pass) | `src/core/metadata_gate_policy.h` |
+| Visible-first order of the pending metadata queue | `src/core/metadata_queue_order.h` |
+| Merging background-hydrated facts into the catalog | `src/core/hydrated_facts.h` |
+| Distinct values behind the Date/Hour/ISO/Aperture/Focal/Shutter/Camera filter menus | `src/core/filter_value_index.h` |
+| XMP sidecar write plan | `src/core/sidecar_write_policy.h` |
+| Adaptive decode timeout per attempt and file type | `src/core/decode_timeout_policy.h` |
+| Largest embedded JPEG preview in a RAW file | `src/core/embedded_jpeg_scan.h` |
+| Interactive metadata edit coalescing | `src/core/metadata_edit_queue.h` |
+| Write-lane failure classification and lock-resolution retry | `src/core/write_retry_policy.h`; UI side `src/ui/metadata_write_lane_controller.cpp` |
+| "What is QuickSift waiting for?" text model | `src/core/blocking_wait.h`; dialog in `src/ui/blocking_wait_controller.cpp` |
+| Performance HUD text model | `src/core/hud_snapshot.h` |
+| Left-pane scroll geometry and caption-fit (truncation) test | `src/core/pane_scroll_policy.h` (`core::pane`, `core::caption::Truncated`) |
+| Left-pane timing records (`[Pane]` / `[Startup]` lines) | `src/core/pane_timing.h` |
+| Early theme value shared by the pre-window read and `LoadSession` | `src/core/presentation_settings.h` |
+| Debug lock-order ranks | `src/core/lock_order.h` |
 | Undo/redo item partitioning | `src/core/history_partition.h` |
 | Rename-stable file identity for guarded Undo | `src/core/stable_file_identity.h` |
 | Temporary boolean state that must survive exceptions | `src/core/scoped_boolean_flag.h` |
@@ -71,6 +150,14 @@ Start with the first matching row.
 | Metadata-folder component map and extension rules | `src/metadata/README.md` |
 | Canonical executable-adjacent runtime-data paths | `src/platform/application_data_paths.h` |
 | Session logs, manual log export, crash reports | `src/diagnostics/diagnostic_log.*` |
+| Which diagnostic files are old enough to delete (7-day age, own names only, never the current log, never a reparse point) | `src/core/log_retention.h` (decision); `diagnostics::CleanupOldDiagnosticFiles` in `src/diagnostics/diagnostic_log.cpp` (listing and deleting) |
+| Previous-session log browser: which logs are listed (own names, not the current session, no reparse points), newest-first order, menu labels, the 2 MiB read cap | `src/core/session_log_browser.h` (decision); `diagnostics::ListPreviousSessionLogs` / `ReadSessionLogTail` in `src/diagnostics/diagnostic_log.cpp` (read-only file access); `src/ui/session_log_browser_controller.cpp` (button, worker, dropdown, viewer window) |
+| Crash-incident count cap (newest 20) and the 16 MiB session-log cap | `src/diagnostics/diagnostic_log.cpp` (`kRetainedCrashIncidents`, `kMaximumSessionLogBytes`) |
+| Logging a failure inside `catch (...)` and continuing | `src/core/log_and_continue.h` (portable message format and per-site limit); `src/diagnostics/log_and_continue.h` (`QS_LOG_AND_CONTINUE`, `QS_CATCH_SILENT_BY_DESIGN`) |
+| Rate limiting a repeating log line | `src/core/log_rate_limiter.h` |
+| Log category names, `file=` / `path_id=` fields | `src/diagnostics/log_categories.h` |
+| Internal error code to log event and user message | `src/core/user_error_catalog.h` |
+| Shutdown token for app-owned worker threads | `src/core/worker_lifetime.h`; the app holds `workerLifetime_` and `PostFromWorker` (`src/app/quicksift_application_internal.h`) |
 | SQLite and thumbnail cache persistence | `src/persistent_cache.*` |
 | WIC/RAW/AVIF/WebP decoding | `src/bundled_codecs.*` |
 | Embedded metadata read/write | `src/embedded_metadata.*` |
@@ -92,11 +179,13 @@ Start with the first matching row.
 | Portable popup/toast/alert state and hit testing | `src/ui/framework/ui_models.*` |
 | Reusable native controls, component painting, dropdowns, toasts, alerts, cards, badges, and title bar | `src/ui/framework/macos_ui_framework*` |
 | UI colors, contrast, DPI conversion, and low-level drawing primitives | `src/ui/ui_design_system.*` |
-| UI spacing, dimensions, radii | `src/ui/ui_layout_metrics.h` |
+| Shared UI dimensions used across areas (title bar, status height, left-pane widths, radii) | `src/ui/ui_layout_metrics.h` (`quicksift::ui::layout::k*Dip`) |
+| Per-area layout numbers (window minimum size, left-pane sections, Settings rows, status bar, document windows) | `src/ui/ui_layout_constants.h` (namespaces `main_window`, `left_pane`, `status_bar`, `document`; includes `ui_layout_metrics.h`) |
+| Overflow tooltip for truncated button captions (`QuickSift.OverflowTip`) | `src/ui/framework/macos_ui_framework_gdi.cpp` (framework-owned; feature code never adds its own) |
 | Design tokens (radius/spacing/motion/type scale, glass, accessibility policy) | `src/ui/ui_design_tokens.h` (`docs/DESIGN_SYSTEM.md`) |
 | Stable command/control IDs | `src/ui/ui_command_ids.h` |
 | Persistent main-window buttons and membership | `src/ui/ui_control_catalog.h` |
-| Window messages, timers, subclass IDs, class names | `src/ui/../app/application_support.h` |
+| Window messages, timers, subclass IDs, class names | `src/app/application_support.h` |
 | Help/About/Diagnostics/popup window models | `src/ui/document_and_menu_models.cpp` |
 | Theme, localization, help/about/diagnostics windows | `src/ui/app_theme_documents_and_localization.cpp` |
 | Main-window message routing, title bar, fullscreen, DPI | `src/ui/main_window_chrome_and_messages.cpp` |
@@ -109,7 +198,19 @@ Start with the first matching row.
 | Mouse/keyboard navigation, zoom, session persistence | `src/ui/navigation_input_and_session.cpp` |
 | Transaction-plan construction and result/history integration | `src/ui/metadata_history_and_file_safety.cpp` |
 | Settings/filter menus and high-level file commands | `src/ui/settings_filters_and_file_commands.cpp` |
-| Remaining private Win32 orchestration fields only | `src/app/quicksift_application_internal.h` |
+| Settings "Write metadata into RAW / JPG/PNG / TIFF files" toggles | `src/ui/settings_filters_and_file_commands.cpp` (`ID_SETTING_METADATA_*`) |
+| Metadata write lane on the UI side (coalescing, urgent slot, retry and Skip) | `src/ui/metadata_write_lane_controller.cpp` |
+| Thumbnail search box | `src/ui/thumbnail_search_controller.cpp` |
+| Import / Export Ratings commands | `src/ui/ratings_exchange_commands.cpp` |
+| Batch Processing commands | `src/ui/batch_processing_commands.cpp` |
+| Performance-policy plumbing and telemetry | `src/ui/performance_policy_controller.cpp` |
+| Title-bar relayout skip guard (`TitleLayoutKey`, `MarkTitleLayoutDirty`) | `src/ui/main_window_controls_layout_and_painting.cpp` |
+| Background worker job loop (`Worker::Run` and its named helpers) | `src/work/background_work_engine.cpp` (`JobActivity`, `JobRunContext` in `background_work_engine.h`) |
+| RAW decode-mode switching and visual decode coalescing | `src/work/background_decode_policy.cpp` |
+| Sidecar read/write and metadata precedence | `src/app/application_support.cpp` (`ReadSidecarMetadata`, `WritePhotoMetadataPatch`, `ReadPhotoMetadata`) |
+| Atomic text-file publication (XMP, session) | `src/app/application_text_io.cpp` |
+| Plain `QuickSiftApplicationImpl` fields | the matching struct in `src/app/state/*.h` |
+| Private orchestration method declarations, COM objects, services | `src/app/quicksift_application_internal.h` |
 
 When no row fits, do not create `helpers.*`, `misc.*`, or `utils.*`. Name the new component after the single responsibility it owns and add it to this table.
 
@@ -131,10 +232,17 @@ These rules must exist in exactly one place:
 - Persistent main-window control declarations: `ui_control_catalog.h`.
 - Shared visual roles and low-level primitives: `ui_design_system`.
 - Reusable UI component creation, state behavior, and rendering: `ui/framework`.
-- Shared dimensions: `ui_layout_metrics.h`.
-- Timer IDs, private messages, subclass IDs, and property names: `../app/application_support.h`.
-- Public application ABI: `../app/quicksift_application.h`.
-- Remaining private Win32 orchestration fields: `../app/quicksift_application_internal.h`.
+- Shared dimensions: `ui_layout_metrics.h`; per-area layout numbers: `ui_layout_constants.h`.
+- Work tiers and yielding: `core/priority_policy`; metadata read-lane admission: `core/metadata_lane_policy.h`.
+- Worker shutdown token: `core/worker_lifetime.h`; the shutdown order: `OnMainWindowDestroyed` (`ui/main_window_chrome_and_messages.cpp`).
+- Diagnostic retention: `core/log_retention.h` deletes files older than 7 days at startup. The crash-incident cap (newest 20) and the 16 MiB session-log cap are in `diagnostics/diagnostic_log.cpp`. There is no session-log count limit.
+- Log-and-continue message and rate limit: `core/log_and_continue.h`.
+- Caption truncation test: `core::caption::Truncated` (`core/pane_scroll_policy.h`).
+- Canonical rating/pick/label vocabulary: `core/metadata_vocabulary.h`; filter and search predicate engine: `core/photo_predicate`.
+- `QuickSiftApplicationImpl` plain state: `src/app/state/*.h`.
+- Timer IDs, private messages, subclass IDs, and property names: `src/app/application_support.h`.
+- Public application ABI: `src/app/quicksift_application.h`.
+- Private Win32 orchestration methods, COM objects and services: `src/app/quicksift_application_internal.h`.
 
 Before writing a list, switch, constant, or lookup table, search for its owner. If an owner already exists, extend it instead of copying it.
 
@@ -171,6 +279,8 @@ The build has one owner: `scripts/build.ps1`. The root `.cmd` files are intentio
 - `build.cmd` verifies the source and builds a Debug configuration by default.
 - `build-release.cmd` verifies, builds, checks, and packages Release.
 - `open-in-visual-studio.cmd` configures an external solution and opens it.
+
+When any of them fails, the trap in each script prints `Build failed:` (one-sentence cause), `What to do:` (1–3 steps) and `Technical detail:`, and keeps the non-zero exit code. Causes and steps live in one table, `scripts/build-failure-help.ps1` (ASCII only). Add a new known failure there, not in the calling script.
 
 Do not add dependency discovery, generator selection, signing, or packaging logic to another script. Extend `scripts/build.ps1` and add a regression/source-verifier rule when practical.
 
@@ -318,6 +428,9 @@ Rules added in 0.9.4.0 (polishing pass):
 - **Rate limiting**: anything that can repeat per file or per frame goes through a function-local `static core::LogRateLimiter limiter(burst, window)`; pass the `suppressed=` count it returns. Terminal outcomes (gave up, marked failed) are always logged.
 - **Hot paths** (dequeue loops, per-frame code) log only at `Trace` and only behind `diagnostics::VerboseLogging()`, so arguments are not even built otherwise.
 - **The logger never does disk I/O on the calling thread.** Producers only append to the in-memory ring and queue under the state mutex. A Warning or Error asks the writer thread to flush the OS buffer on its next pass; only `Critical` drains synchronously (so the line is on disk if a crash follows). Disk writes happen under a separate stream mutex (lock order: stream mutex → state mutex).
+- **Retention**: about 3 s after startup, a background-priority thread (`StartDiagnosticsCleanup`) deletes QuickSift's own session logs, crash reports and minidumps older than 7 days (`core/log_retention.h`), logging `event=old_file_deleted` and `cleanup_complete`. Crash files are also capped at the newest 20 incidents, and one session log at 16 MiB.
+- **Previous sessions** (0.9.5.0 round 20): the Diagnostic log window's **Previous sessions…** button lists earlier session logs from `Logs` (newest first, start time and size, current session left out) and opens one read-only in a `DocumentKind::SessionLog` window. Listing and the bounded read (newest 2 MiB, cut at a line start) run on `sessionLogWorker_` with a lifetime token. The browser never writes, renames or deletes; only the 7-day cleanup removes logs. It logs `session_logs_listed` and `session_log_opened` (file name only).
+- **Contained failures**: `catch (...)` in the Windows app layer uses `QS_LOG_AND_CONTINUE(category, site)`, which writes `<site> failed and continued: <what>`. It allows 3 lines per site per 30 s and reports the rest as `(N similar suppressed)`.
 - **Crash reports** include a "Subsystem state" block read from lock-free atomics: the priority demand snapshot (highest tier, pending metadata writes, interactive write queued, view decodes, search active/focused).
 
 ---
@@ -344,7 +457,7 @@ The UI handler should gather state, call the decision, update state, and redraw.
 
 ### Step 3: Add the deterministic test first or beside the change
 
-Use `tests/core_tests.cpp` for portable policy. Add a focused native test only when Win32 behavior is essential.
+Use the matching program in `scripts/checks/*.cpp` for portable policy. Each check program links against the portable `QuickSiftCore` library, and both verifiers require it to exist; see [`TESTING.md`](TESTING.md). Add a new program only for a new owner. Add a focused native test only when Win32 behavior is essential.
 
 A bug fix is incomplete until the old bad input is represented by a regression test whenever the behavior can be tested deterministically.
 
@@ -439,9 +552,45 @@ Follow these rules:
 - Metadata direct-write batches acquire and release decoder exclusion once per batch, not once per file.
 - UI progress counters increase only after a queue or service accepts the work.
 - Cancellation stops at safe boundaries; never terminate a worker thread forcibly.
-- Shutdown prevents new work, requests cancellation, stops transaction services before the decoder worker, and discards queue-owned completions safely.
+- Shutdown prevents new work, requests cancellation, revokes the worker token and joins every app-owned thread, then stops transaction services before the decoder worker, and only then closes the persistent cache (§8.1).
 
 When adding a queue or transaction rule, extract deterministic sequencing into a portable module with a regression test.
+
+### 8.1 Threads, shutdown, and priority lanes
+
+**Threads.**
+- The UI thread owns windows and UI state.
+- The decode pool and the view lane (`viewThread_`) live in `src/work/background_work_engine.*`.
+- `FolderScanner` enumerates folders.
+- `TransactionCoordinator` owns the file and metadata service threads.
+- App-owned threads are the ratings, batch, search, deferred-startup, diagnostics-cleanup and session-log-browser workers.
+
+**Worker lifetime.**
+- Every app-owned thread captures `token = workerLifetime_.Issue()` (`core/worker_lifetime.h`).
+- It checks `token.StopRequested()` and wakes the UI only through `PostFromWorker(token, window, message, ...)`. That call posts only while the token is alive.
+- It never reads `hwnd_`.
+- `StopAllWorkersForTeardown` revokes the token first and then joins every thread.
+
+**Shutdown order.** `WM_DESTROY` (normal close and Force quit) calls `OnMainWindowDestroyed`, which runs these steps in order:
+1. `RequestBackgroundStopForShutdown`
+2. `KillMainTimersForShutdown`
+3. animation and brush teardown
+4. `KillInteractionTimersForShutdown`
+5. `StopAllWorkersForTeardown`
+6. `CloseBatchDialog`
+7. `StopServicesForShutdown`: resource-pressure monitor, then transactions, then scanner, then worker, then completion drain, then `persistentCache_.CloseForShutdown()`
+8. `PostQuitMessage`
+
+The log records each step as `event=shutdown_stage` (`app_workers_stop … tokens_left_N`, `resource_pressure_stop`, `transactions_stop`, `scanner_cancel`, `worker_stop`, `drain_completions`, `cache_close`, then `shutdown_sequence_complete`). Never close the cache, release COM objects or free state before step 5.
+
+**Lanes.** There are two vocabularies:
+- Queue priority (`JobPriority` in `core/app_types.h`): `Interactive` > `Visible` > `Predictive` > `Face` > `Idle` > `Analysis`. `core/work_queue_policy.h` ranks and promotes jobs between these lanes.
+- Process-wide tiers (`core/priority_policy.h`): P0 UI, P1 metadata write, P2 Single/Compare view load (its own lane, thread and decode budget), P3 search reads, P4 visible thumbnails, P5 background. Lower tiers poll `priority::Demand()` and yield within bounded starvation thresholds.
+
+**Metadata aging.**
+- Metadata (rating/pick/label) reads stay below decode and user work. Once the lane has yielded with reads queued for 750 ms (`kMinShareAge`), a read may start even while foreground visual work (Interactive/Visible or a view-lane decode) is active or queued. Idle/Predictive prefetch and face analysis never hold reads back (`core/metadata_lane_policy.h`).
+- Pending writes outrank reads for at most 10 s (`kWriteYieldCap`).
+- A read that keeps failing is retried a bounded number of times and then marked Unreadable (`core/metadata_progress.h`), so "metadata pending" always ends.
 
 ---
 
@@ -522,7 +671,7 @@ When the implementation changes, update the guide and comment together.
 
 A coding assistant working on QuickSift should follow this checklist before editing:
 
-1. Read this file and `ARCHITECTURE.md`.
+1. Read this file (start with §0) and `ARCHITECTURE.md`.
 2. State the one component that owns the requested behavior.
 3. Search for existing registries, policies, and tests before adding anything.
 4. Do not create a duplicate format list, ID list, control list, palette, UI component renderer, popup host, filter, timer wrapper, metadata parser, or queue-priority rule.
@@ -543,9 +692,12 @@ A coding assistant must not claim the Win32 executable was compiled or run unles
 ### On any supported development host
 
 ```text
-python scripts/verify-source-portable.py .
+python scripts/verify-source-portable.py          # or --source-dir <root>; also runs check-localization.py
+python scripts/check-localization.py
+pwsh -NoProfile -File scripts/verify-source.ps1   # PowerShell 7 also works off Windows
 cmake -S . -B build -DQS_WARNINGS_AS_ERRORS=ON
 cmake --build build --config Release
+# then build and run each scripts/checks/*.cpp against libQuickSiftCore (see TESTING.md); each must exit 0
 ```
 
 Run sanitizer builds where the compiler supports them.
@@ -586,6 +738,23 @@ A change is done when:
 - Required Windows validation is completed or explicitly reported as not run.
 
 That is the whole philosophy: **small owners, explicit flows, tested decisions, visible failures, and extreme caution around photographers’ files.**
+
+---
+
+## 16. Structural conventions enforced by the verifiers (0.9.5.0)
+
+These conventions were added in 0.9.5.0 rounds 19 and 20. Both `scripts/verify-source-portable.py` and `scripts/verify-source.ps1` enforce them, except the function-size guideline; [`TESTING.md`](TESTING.md) lists the rule names.
+
+- **Function size (guideline, not verified).** Prefer keeping the historically huge functions under about 160 lines by splitting them into named helpers: `Worker::Run`, `FileOperation`, `OnWorkReady`, `HandleMainMessage`, `LayoutControls`, `DocumentWindowSubclassProcImpl`, `Worker::Enqueue`, `HandleCanvasMessage`, `WriteEmbeddedMetadataAtomic`, `EvictBitmapCache`, `OnCommand`. New code in those areas should not grow them back into multi-hundred-line bodies. Add a named helper beside the function instead; for example, `Worker::Run` delegates to `WaitForNextJob`, `ExecuteJobKind`, `PublishJobResult` and similar helpers. This is advice for reviewers; no verifier enforces a line count.
+- **State lives in `src/app/state/`.** `QuickSiftApplicationImpl` privately inherits `ChromeState`, `PaneState`, `ViewerState`, `BrowseState`, `MetadataState`, `RatingsExchangeState`, `BatchState`, `SearchState`, `HudState` and `SessionLogBrowserState`. The structs hold data only: no methods and no `ComPtr`, because COM release order stays in the main class. Each header must be registered in `CMakeLists.txt`.
+- **Worker lifetime** as in §8.1.
+- **Diagnostic retention** as in §5.6. The cleanup deletes only through `DeleteOwnDiagnosticFile`, which re-checks the opened handle, and never recurses.
+- **The removed `wicImageSources_` cache stays removed.** The UI thread never decodes.
+- **Title layout.** `LayoutTitleControls(width, false)` re-lays the title bar only when its `TitleLayoutKey` changes or `MarkTitleLayoutDirty()` was called (DPI, fonts, language, theme).
+- **Log-and-continue** as in §0 and §5.6. Exempt: the logger (`diagnostic_log.cpp`), `main.cpp`, the `QuickSiftCore` library and `src/core/`, `src/ui/framework/` (which reports through its error sink) and `src/platform/`.
+- **Session log browser (round 20)** as in §5.6. Read-only: the controller contains no delete, move or file-open call; `ReadSessionLogTail` validates the name, opens with `GENERIC_READ` and `FILE_FLAG_OPEN_REPARSE_POINT`, rejects reparse points and reads at most `kMaxDisplayBytes`. Teardown joins `sessionLogWorker_`, and `lifecycle_checks` runs `SessionLogBrowserChecks`.
+- **Build failure help (round 20)** as in §4.1. Each build script dot-sources `build-failure-help.ps1` and has a trap that calls `Write-QuickSiftFailure` and exits 1. The `.cmd` wrappers keep `%ERRORLEVEL%` and explain a missing PowerShell (exit 9009).
+- **Layout constants.** The left-pane section layouts, the status bar, `OnGetMinMaxInfo` and the document-window chrome take DIPs from `ui_layout_constants.h`.
 
 ### Thumbnail viewport priority (2026-08-16)
 

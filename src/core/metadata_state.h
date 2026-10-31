@@ -62,6 +62,15 @@ struct MetadataPatch {
 };
 
 [[nodiscard]] MetadataFieldValue KnownMetadataValue(int value);
+// After every metadata source of a READABLE file was consulted, a field no source
+// mentions is "not set": rating 0 (unrated), no label, unmarked. This is what the
+// thumbnails show and what Exiv2 and the sidecar reader already report for an
+// absent tag. Unreadable (I/O failure) and Unsupported (custom value) are kept,
+// so they still never pretend to be unrated. Returns true if anything changed.
+bool ResolveUnsetMetadataAsNone(PhotoMetadataValues& values);
+// Every Unknown field becomes terminal: 0/None when the file opens, Unreadable when
+// it does not. Returns true if anything changed.
+bool ResolveMetadataReadOutcome(PhotoMetadataValues& values, bool fileOpens);
 [[nodiscard]] MetadataFieldValue UnknownMetadataValue() noexcept;
 [[nodiscard]] MetadataFieldValue UnreadableMetadataValue() noexcept;
 [[nodiscard]] MetadataFieldValue UnsupportedMetadataValue(std::wstring rawValue);

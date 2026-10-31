@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
+#include <span>
 
 namespace quicksift::core::search {
 namespace {
@@ -425,9 +427,187 @@ private:
             AddText(token.text, TextTarget::NameOrComment, 1);
             return;
         }
-        if (StepBareTwoToken()) return;
-        if (StepBareSingle()) return;
-        AddText(token.text, TextTarget::NameOrComment, 1);
+        // Rating ranges first: "không quá 4 sao" / "not less than 3 stars" start
+        // with a word that is otherwise the negation operator.
+        if (StepRatingRange()) return;
+        // Negation: "not" / "không" / "-" applies to the next clause.
+        bool negate = false;
+        if (lower == L"not" || lower == L"khong" || lower == L"không" || lower == L"-") {
+            if (!HasNext()) { Report(1, TokenRole::Ignored); return; }
+            negate = true;
+            ++index_;
+        } else if (lower == L"+") {
+            // Explicit AND; clauses are already AND. Skip the operator.
+            Report(1, TokenRole::Ignored);
+            return;
+        }
+        if (StepRatingRange()) { if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true; return; }
+        if (StepRelativeDate()) { if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true; return; }
+        if (StepBareTwoToken()) { if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true; return; }
+        if (StepBareSingle()) { if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true; return; }
+        if (StepFormat()) { if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true; return; }
+        AddText(tokens_[index_].text, TextTarget::NameOrComment, 1);
+        if (negate && !query_.clauses.empty()) query_.clauses.back().negated = true;
+    }
+
+    // ---- rating ranges ------------------------------------------------------------------
+    // "<modifier> N stars" or "N stars <modifier>" in English and Vietnamese
+    // (diacritics optional): "at least 3 stars", "3 stars or more", "ít nhất 3 sao",
+    // "5 sao trở xuống", "≥ 3 stars". The star unit is required, so a bare number
+    // stays text and "9/10" and other forms keep their existing meaning.
+    std::wstring FoldedAt(std::size_t at) const {
+        return at < tokens_.size() && !Quoted(at) ? predicate::SearchFold(tokens_[at].text) : std::wstring();
+    }
+    struct RangePhrase {
+        std::initializer_list<const wchar_t*> words;
+        Comparison op;
+    };
+    // Longest match of `phrases` starting at token `at`; returns tokens used (0 = none).
+    std::size_t MatchPhrase(std::size_t at, std::span<const RangePhrase> phrases, Comparison& op) const {
+        std::size_t best = 0;
+        for (const RangePhrase& phrase : phrases) {
+            std::size_t offset = 0;
+            bool all = true;
+            for (const wchar_t* word : phrase.words) {
+                if (FoldedAt(at + offset) != word) { all = false; break; }
+                ++offset;
+            }
+            if (all && offset > best) { best = offset; op = phrase.op; }
+        }
+        return best;
+    }
+    // "N stars" / "N sao" / "3*" / "3stars" at `at`: value and tokens used (0 = none).
+    std::size_t MatchStarCount(std::size_t at, int& value) const {
+        if (at >= tokens_.size() || Quoted(at)) return 0;
+        const auto form = ParseStarForm(lowered_[at], true);
+        if (!form || form->op != Comparison::Equal || AllOf(lowered_[at], kBlackStar)) return 0;
+        value = form->value;
+        if (form->hasUnit) return 1;
+        if (at + 1 < tokens_.size() && !Quoted(at + 1) && IsStarUnit(lowered_[at + 1])) return 2;
+        return 0;
+    }
+    bool StepRatingRange() {
+        static const RangePhrase kBefore[] = {
+            { { L"at", L"least" }, Comparison::AtLeast }, { { L"no", L"less", L"than" }, Comparison::AtLeast },
+            { { L"not", L"less", L"than" }, Comparison::AtLeast }, { { L"minimum" }, Comparison::AtLeast },
+            { { L"min" }, Comparison::AtLeast }, { { L"it", L"nhat" }, Comparison::AtLeast },
+            { { L"toi", L"thieu" }, Comparison::AtLeast }, { { L"tu" }, Comparison::AtLeast },
+            { { L"khong", L"duoi" }, Comparison::AtLeast },
+            { { L">=" }, Comparison::AtLeast }, { { L"\u2265" }, Comparison::AtLeast },
+            { { L"at", L"most" }, Comparison::AtMost }, { { L"no", L"more", L"than" }, Comparison::AtMost },
+            { { L"not", L"more", L"than" }, Comparison::AtMost }, { { L"up", L"to" }, Comparison::AtMost },
+            { { L"maximum" }, Comparison::AtMost }, { { L"max" }, Comparison::AtMost },
+            { { L"toi", L"da" }, Comparison::AtMost }, { { L"khong", L"qua" }, Comparison::AtMost },
+            { { L"khong", L"tren" }, Comparison::AtMost },
+            { { L"<=" }, Comparison::AtMost }, { { L"\u2264" }, Comparison::AtMost },
+            { { L"more", L"than" }, Comparison::Greater }, { { L"greater", L"than" }, Comparison::Greater },
+            { { L"over" }, Comparison::Greater }, { { L"above" }, Comparison::Greater },
+            { { L"tren" }, Comparison::Greater }, { { L"nhieu", L"hon" }, Comparison::Greater },
+            { { L"hon" }, Comparison::Greater }, { { L">" }, Comparison::Greater },
+            { { L"less", L"than" }, Comparison::Less }, { { L"fewer", L"than" }, Comparison::Less },
+            { { L"under" }, Comparison::Less }, { { L"below" }, Comparison::Less },
+            { { L"duoi" }, Comparison::Less }, { { L"it", L"hon" }, Comparison::Less },
+            { { L"<" }, Comparison::Less },
+        };
+        static const RangePhrase kAfter[] = {
+            { { L"and", L"up" }, Comparison::AtLeast }, { { L"or", L"more" }, Comparison::AtLeast },
+            { { L"and", L"more" }, Comparison::AtLeast }, { { L"and", L"above" }, Comparison::AtLeast },
+            { { L"or", L"above" }, Comparison::AtLeast }, { { L"and", L"higher" }, Comparison::AtLeast },
+            { { L"or", L"higher" }, Comparison::AtLeast }, { { L"or", L"better" }, Comparison::AtLeast },
+            { { L"and", L"over" }, Comparison::AtLeast }, { { L"or", L"over" }, Comparison::AtLeast },
+            { { L"tro", L"len" }, Comparison::AtLeast }, { { L"hoac", L"hon" }, Comparison::AtLeast },
+            { { L"hoac", L"nhieu", L"hon" }, Comparison::AtLeast },
+            { { L"and", L"lower" }, Comparison::AtMost }, { { L"or", L"lower" }, Comparison::AtMost },
+            { { L"and", L"below" }, Comparison::AtMost }, { { L"or", L"below" }, Comparison::AtMost },
+            { { L"and", L"down" }, Comparison::AtMost }, { { L"and", L"under" }, Comparison::AtMost },
+            { { L"or", L"under" }, Comparison::AtMost }, { { L"or", L"less" }, Comparison::AtMost },
+            { { L"and", L"less" }, Comparison::AtMost }, { { L"or", L"fewer" }, Comparison::AtMost },
+            { { L"tro", L"xuong" }, Comparison::AtMost }, { { L"hoac", L"it", L"hon" }, Comparison::AtMost },
+        };
+        Comparison op = Comparison::Equal;
+        const std::size_t before = MatchPhrase(index_, kBefore, op);
+        int value = 0;
+        const std::size_t count = MatchStarCount(index_ + before, value);
+        if (count == 0) return false;
+        Comparison afterOp = Comparison::Equal;
+        std::size_t after = MatchPhrase(index_ + before + count, kAfter, afterOp);
+        if (before == 0) {
+            if (after == 0) return false; // plain "N stars": the existing two-token rule
+            op = afterOp;
+        } else if (after != 0 && afterOp != op) {
+            after = 0; // "at least 3 stars or less": keep the leading meaning, rest is text
+        }
+        Add(RatingClause(op, value), before + count + after, TokenRole::Rating);
+        return true;
+    }
+
+    static bool IsFormatToken(std::wstring_view t) noexcept {
+        static constexpr std::wstring_view kFmts[] = {
+            L"jpg", L"jpeg", L"png", L"tif", L"tiff", L"webp", L"heif", L"heic", L"avif",
+            L"bmp", L"gif", L"nef", L"arw", L"cr2", L"cr3", L"raf", L"orf", L"rw2",
+            L"dng", L"pef", L"srw", L"raw", L"nrw", L"3fr", L"fff", L"iiq", L"rwl"
+        };
+        for (const auto fmt : kFmts) if (t == fmt) return true;
+        return false;
+    }
+
+    bool StepFormat() {
+        const std::wstring& lower = lowered_[index_];
+        if (!IsFormatToken(lower)) return false;
+        Clause clause;
+        clause.kind = ClauseKind::Format;
+        clause.text = lower == L"jpeg" ? L"jpg" : lower;
+        Add(std::move(clause), 1, TokenRole::Text);
+        return true;
+    }
+
+    // "older than 7 days", "newer than 2 months", "today", "hôm nay", "cũ hơn 7 ngày"
+    bool StepRelativeDate() {
+        const std::wstring& lower = lowered_[index_];
+        const bool today = lower == L"today" || lower == L"homnay" || lower == L"hôm" ||
+            lower == L"nay";
+        if (today || lower == L"yesterday" || lower == L"homqua") {
+            Clause clause;
+            clause.kind = ClauseKind::Age;
+            clause.a = lower == L"yesterday" || lower == L"homqua" ? 1 : 0;
+            clause.b = 0;
+            clause.op = Comparison::Equal;
+            // today ordinal filled by caller? leave c = 0 and match any if unknown.
+            // Parser cannot know today's date portably here; store 0 and let
+            // evaluation treat Equal+0 as "needs runtime today". For now encode
+            // a sentinel and resolve at match time is not available, so we set
+            // a large ordinal and document that Age Equal is a same-day window
+            // resolved by the UI. Use a = 0 (today) / 1 (yesterday) with op Equal.
+            Add(std::move(clause), 1, TokenRole::Date);
+            return true;
+        }
+        const bool older = lower == L"older" || lower == L"cu" || lower == L"cũ";
+        const bool newer = lower == L"newer" || lower == L"moi" || lower == L"mới";
+        if (!older && !newer) return false;
+        // Expect: [than|hơn] <n> [days|ngày|months|tháng]
+        std::size_t used = 1;
+        std::size_t at = index_ + 1;
+        if (at < tokens_.size() && (lowered_[at] == L"than" || lowered_[at] == L"hon" || lowered_[at] == L"hơn")) {
+            ++used; ++at;
+        }
+        if (at >= tokens_.size()) return false;
+        int count = 0;
+        try { count = std::stoi(lowered_[at]); } catch (...) { return false; }
+        if (count < 0) return false;
+        ++used; ++at;
+        int unit = 0; // days
+        if (at < tokens_.size()) {
+            const std::wstring& u = lowered_[at];
+            if (u == L"month" || u == L"months" || u == L"thang" || u == L"tháng") { unit = 1; ++used; }
+            else if (u == L"day" || u == L"days" || u == L"ngay" || u == L"ngày") { ++used; }
+        }
+        Clause clause;
+        clause.kind = ClauseKind::Age;
+        clause.a = count;
+        clause.b = unit;
+        clause.op = older ? Comparison::AtLeast : Comparison::AtMost;
+        Add(std::move(clause), used, TokenRole::Date);
+        return true;
     }
 
     void StepPrefixed(Prefix prefix, std::size_t colon) {
@@ -637,9 +817,18 @@ private:
             const auto slash = lower.find(L'/');
             if (slash > 0 && slash + 1 < lower.size()) {
                 try {
-                    const double n = std::stod(lower.substr(0, slash));
-                    const double d = std::stod(lower.substr(slash + 1));
-                    if (d > 0.0 && n > 0.0 && n / d < 100.0) {
+                    std::size_t nUsed = 0;
+                    std::size_t dUsed = 0;
+                    const std::wstring numText = lower.substr(0, slash);
+                    const std::wstring denText = lower.substr(slash + 1);
+                    const double n = std::stod(numText, &nUsed);
+                    const double d = std::stod(denText, &dUsed);
+                    // Whole-token numbers only ("1/125x" is text), and a bare "9/10"
+                    // reads as a day/month, not a shutter: only 1/x or a denominator
+                    // that cannot be a month is taken as a bare shutter speed.
+                    const bool wholeToken = nUsed == numText.size() && dUsed == denText.size();
+                    const bool shutterLike = n == 1.0 || d > 12.0;
+                    if (wholeToken && shutterLike && d > 0.0 && n > 0.0 && n / d < 100.0) {
                         Clause clause;
                         clause.kind = ClauseKind::Shutter;
                         clause.a = static_cast<int>((n / d) * 1000.0 + 0.5);

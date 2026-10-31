@@ -39,8 +39,26 @@ D2D1_RECT_F QuickSiftApplicationImpl::ViewAreaForPath(const std::wstring& path) 
             }
         }
     }
+    return SingleImageArea(bounds);
+}
+
+// Round 22: one Single View image area for geometry (Fit, zoom anchors, pan
+// clamping) and RenderSingle. An open filmstrip reserves its band, so Fit no
+// longer hides the photo's right edge under the strip.
+float QuickSiftApplicationImpl::FilmstripReservedDip(const D2D1_RECT_F& bounds) const {
+    bool stripShown = false;
+    if (reviewState_.Mode() == ViewMode::Single && filmstripVisible_) {
+        const FilmstripLayout layout = CurrentFilmstripLayout(bounds);
+        stripShown = layout.maxThumbs > 0 && layout.lastIndex > layout.firstIndex;
+    }
+    return quicksift::core::filmstrip::ReservedRightDip(
+        reviewState_.Mode() == ViewMode::Single, stripShown);
+}
+
+D2D1_RECT_F QuickSiftApplicationImpl::SingleImageArea(const D2D1_RECT_F& bounds) const {
+    const float reserved = FilmstripReservedDip(bounds);
     return D2D1::RectF(8.0f, 8.0f,
-        std::max(9.0f, bounds.right - 8.0f), std::max(9.0f, bounds.bottom - 8.0f));
+        std::max(9.0f, bounds.right - reserved - 8.0f), std::max(9.0f, bounds.bottom - 8.0f));
 }
 
 quicksift::review::transform::ViewGeometry QuickSiftApplicationImpl::ViewGeometryForPath(

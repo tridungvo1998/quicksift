@@ -127,11 +127,24 @@ public:
         bool includeExifText = true,
         bool includeFaces = true);
 
-    // Camera-settings index (schema v3). Stamp-independent so search never re-reads.
-    // Lookup returns nullopt when no row or camera_settings_known=0.
-    std::optional<CachedImageRecord> LookupCameraSettings(const std::filesystem::path& path);
-    // Updates only the camera columns; never touches rating, faces, dimensions, or stamps.
-    void UpdateCameraSettings(const std::filesystem::path& path, const CachedImageRecord& settings);
+    // Camera-settings index (schema v3). Lookup returns nullopt when there is no
+    // row, camera_settings_known=0, or (when the caller passes the image's size and
+    // modification stamp) the indexed settings belong to a different image version.
+    // 0/0 stamps mean "unknown" and accept any row (legacy behaviour).
+    std::optional<CachedImageRecord> LookupCameraSettings(const std::filesystem::path& path,
+        std::uint64_t fileSize = 0, std::int64_t modifiedStamp = 0);
+    struct CameraLookupKey {
+        std::filesystem::path path;
+        std::uint64_t fileSize = 0;
+        std::int64_t modifiedStamp = 0;
+    };
+    // Bulk form: one prepared statement, lock taken per chunk of 256 paths.
+    std::vector<std::optional<CachedImageRecord>> LookupCameraSettingsBatch(
+        const std::vector<CameraLookupKey>& keys);
+    // Updates only the camera columns (never rating, faces or dimensions) of the
+    // row for this image version, or inserts a camera-only stub row.
+    void UpdateCameraSettings(const std::filesystem::path& path, const CachedImageRecord& settings,
+        std::uint64_t fileSize = 0, std::int64_t modifiedStamp = 0);
 
     void UpsertRecord(const std::filesystem::path& path, CachedImageRecord record);
     void UpsertRecords(std::vector<std::pair<std::filesystem::path, CachedImageRecord>> records);

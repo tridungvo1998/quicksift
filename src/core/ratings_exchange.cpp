@@ -363,7 +363,7 @@ ParseResult ParseDocumentUtf8(std::string_view bytes) {
         ColumnHeaderOrData, Data, Footer, AfterFooter };
     Stage stage = Stage::Header;
     std::size_t declaredDataCount = 0;
-    std::unordered_map<std::string, std::size_t> seen;
+    std::unordered_map<std::wstring, std::size_t> seen;
     std::size_t lineNumber = 0;
     std::size_t position = 0;
     bool sawAnyContent = false;
@@ -420,6 +420,13 @@ ParseResult ParseDocumentUtf8(std::string_view bytes) {
                 line.size() - kDataCountPrefix.size() - kDataCountSuffix.size()));
             if (!count) return fail(ParseError::BadDataCount, lineNumber, rawLine);
             declaredDataCount = *count;
+            {
+                // Pre-size from the declared count, bounded by what the bytes could hold
+                // (a hostile count must not trigger a huge allocation).
+                const std::size_t plausible = std::min(declaredDataCount, bytes.size() / 8 + 1);
+                result.document.entries.reserve(plausible);
+                seen.reserve(plausible);
+            }
             stage = Stage::FirstSeparator;
             break;
         }
@@ -461,10 +468,10 @@ ParseResult ParseDocumentUtf8(std::string_view bytes) {
                 std::any_of(name->begin(), name->end(), IsForbiddenFileNameChar) ||
                 *name == L"." || *name == L"..")
                 return fail(ParseError::BadDataLine, lineNumber, rawLine);
-            const std::wstring folded = AsciiFold(*name);
-            const std::string key = WideToUtf8(folded);
-            if (seen.contains(key)) return fail(ParseError::DuplicateEntry, lineNumber, rawLine);
-            seen.emplace(key, result.document.entries.size());
+            // Keyed by the folded wide name directly (was re-encoded to UTF-8 per line).
+            std::wstring key = AsciiFold(*name);
+            if (!seen.emplace(std::move(key), result.document.entries.size()).second)
+                return fail(ParseError::DuplicateEntry, lineNumber, rawLine);
             RatingsEntry entry;
             entry.fileName = std::move(*name);
             entry.starRating = *star;

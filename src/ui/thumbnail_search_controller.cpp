@@ -19,6 +19,7 @@
 #include "core/log_rate_limiter.h"
 
 #include "core/exif_capture_time.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <algorithm>
 #include <functional>
@@ -48,7 +49,6 @@ constexpr std::size_t kInlineSearchLimit = 2000;
 constexpr UINT kSearchDebounceMs = 150;
 constexpr UINT kSearchRefreshMs = 400;
 constexpr std::size_t kHydrateBatch = 32;
-constexpr DWORD kCaptureFirstReadBytes = 64u * 1024u;
 constexpr std::uint8_t kQueuedCapture = 1;
 constexpr std::uint8_t kQueuedComment = 2;
 constexpr std::uint8_t kQueuedCamera = 4;
@@ -87,29 +87,6 @@ std::optional<pred::LocalDateTime> FileModifiedLocalTime(const fs::path& path) n
     if (!SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) return std::nullopt;
     const pred::LocalDateTime result = FromSystemTime(local);
     if (!result.Valid()) return std::nullopt;
-    return result;
-}
-
-// Reads the first 64 KB (JPEG APP1 / most RAW IFDs), then up to 512 KB when no
-// DateTimeOriginal was found there. Shared read access; never locks the file.
-std::optional<exif::CaptureTimeResult> ReadCaptureTime(const fs::path& path) {
-    FileHandle file(CreateFileW(path.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-        FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-    if (!file.Valid()) return std::nullopt;
-    std::vector<std::uint8_t> buffer(kCaptureFirstReadBytes);
-    DWORD read = 0;
-    if (!ReadFile(file.Get(), buffer.data(), kCaptureFirstReadBytes, &read, nullptr)) return std::nullopt;
-    buffer.resize(read);
-    std::optional<exif::CaptureTimeResult> result = exif::FindCaptureTime(buffer);
-    if ((result && result->tag == exif::CaptureTag::Original) || read < kCaptureFirstReadBytes) return result;
-    const std::size_t total = exif::kCaptureTimeReadBytes;
-    buffer.resize(total);
-    DWORD more = 0;
-    if (!ReadFile(file.Get(), buffer.data() + read, static_cast<DWORD>(total - read), &more, nullptr)) return result;
-    buffer.resize(static_cast<std::size_t>(read) + more);
-    const std::optional<exif::CaptureTimeResult> wider = exif::FindCaptureTime(buffer);
-    if (wider && (!result || wider->tag > result->tag)) return wider;
     return result;
 }
 
@@ -241,10 +218,6 @@ void QuickSiftApplicationImpl::LayoutSearchField() {
     }
 }
 
-bool QuickSiftApplicationImpl::SearchFieldAnimating() const noexcept {
-    return searchInput_ && uiFramework_.Motion().IsAnimating(quicksift::ui::animation::element::kSearchField);
-}
-
 void QuickSiftApplicationImpl::SyncSearchFieldTransition(std::chrono::steady_clock::time_point now) {
     if (!searchInput_) return;
     namespace anim = quicksift::ui::animation;
@@ -316,7 +289,9 @@ std::wstring QuickSiftApplicationImpl::SearchCountText() const {
     text = ReplaceAllTokens(std::move(text), L"{shown}", sq::GroupThousands(catalog_.VisibleCount(), separator));
     text = ReplaceAllTokens(std::move(text), L"{total}", sq::GroupThousands(searchBaseCount_, separator));
     if (searchHydrateDone_.load(std::memory_order_acquire) < searchHydrateTotal_.load(std::memory_order_acquire) ||
-        searchInFlightSerial_ != 0) {
+        searchInFlightSerial_ != 0 ||
+        (pendingRatings_ > 0 && pred::NeedsRatingFacts(searchQuery_.clauses))) {
+        // Ratings still being read can still join a star/pick/label result.
         text += L" \u2026";
     }
     return text;
@@ -596,6 +571,7 @@ void QuickSiftApplicationImpl::OnSearchFolderChanged() {
     searchHydrateCheckedCount_ = 0;
     searchHydrateNeedCapture_ = false;
     searchHydrateNeedComments_ = false;
+    searchHydrateNeedCamera_ = false; // was not reset: a new folder skipped camera hydration
     searchHydrateGeneration_ = generation_;
     searchHydrateDone_.store(0, std::memory_order_release);
     searchHydrateTotal_.store(0, std::memory_order_release);
@@ -616,6 +592,10 @@ void QuickSiftApplicationImpl::EnsureSearchFactsHydrated() {
     const bool needCapture = pred::NeedsCaptureTime(searchQuery_.clauses);
     const bool needComments = pred::NeedsComments(searchQuery_.clauses);
     const bool needCamera = pred::NeedsCameraSettings(searchQuery_.clauses);
+    QueueFactHydration(needCapture, needComments, needCamera);
+}
+
+void QuickSiftApplicationImpl::QueueFactHydration(bool needCapture, bool needComments, bool needCamera) {
     if (searchHydrateGeneration_ != generation_) {
         std::vector<std::uint8_t>().swap(searchHydrateQueued_);
         searchHydrateCheckedCount_ = 0;
@@ -653,6 +633,8 @@ void QuickSiftApplicationImpl::EnsureSearchFactsHydrated() {
         if (item.comment) queued |= kQueuedComment;
         if (item.camera) queued |= kQueuedCamera;
         item.path = photo.path;
+        item.fileSize = static_cast<std::uint64_t>(photo.fileSize);
+        item.modifiedStamp = photo.modifiedStamp;
         items.push_back(std::move(item));
     }
     searchHydrateCheckedCount_ = count;
@@ -684,6 +666,7 @@ void QuickSiftApplicationImpl::ApplySearchFactUpdates() {
         generation = searchFactGeneration_;
     }
     if (updates.empty() || generation != generation_) return;
+    bool filterFactsChanged = false;
     for (const SearchFactUpdate& update : updates) {
         std::size_t index = update.index;
         if (index >= catalog_.PhotoCount() || catalog_.PhotoAt(index).path != update.path) {
@@ -691,28 +674,19 @@ void QuickSiftApplicationImpl::ApplySearchFactUpdates() {
             if (!found) continue;
             index = *found;
         }
-        // The store is the single authority: fill only facts it does not know yet
-        // (a comment saved by the user meanwhile wins over the hydrated one).
-        catalog_.EditPhoto(index, [&update](PhotoItem& photo) {
-            if (update.hasCapture && photo.captureTimeSource == pred::CaptureTimeSource::Unknown) {
-                photo.captureTime = update.capture;
-                photo.captureTimeSource = update.source;
-            }
-            if (update.hasComment && !photo.userCommentKnown) {
-                photo.userComment = update.comment;
-                photo.userCommentKnown = true;
-            }
-            if (update.hasCamera && !photo.cameraSettingsKnown) {
-                photo.iso = update.iso;
-                photo.aperture = update.aperture;
-                photo.focalLength = update.focalLength;
-                photo.shutterSpeed = update.shutterSpeed;
-                photo.camera = update.camera;
-                photo.lens = update.lens;
-                photo.cameraSettingsKnown = update.cameraKnown;
-            }
+        bool changed = false;
+        catalog_.EditPhoto(index, [&update, &changed](PhotoItem& photo) {
+            const auto change = quicksift::core::MergeHydratedFacts(photo, update);
+            changed = change.capture || change.camera;
         });
+        filterFactsChanged = filterFactsChanged || changed;
     }
+    // Filter menus no longer read files on the UI thread: facts arrive here in
+    // batches, so an active date/camera filter is re-applied as they land.
+    if (filterFactsChanged && (dateFilter_ != DateFilter::Any || !dateExactFilter_.empty() ||
+        hourFilter_ >= 0 || isoFilter_ >= 0 || apertureFilter_ > 0.0 || focalFilter_ > 0.0 ||
+        shutterFilter_ > 0.0 || !cameraFilter_.empty()))
+        RebuildVisiblePhotos();
 }
 
 void QuickSiftApplicationImpl::OnSearchWorkerMessage() {
@@ -732,14 +706,18 @@ void QuickSiftApplicationImpl::OnSearchWorkerMessage() {
 
 bool QuickSiftApplicationImpl::StartSearchWorker() {
     if (searchWorker_.joinable()) return true;
+    if (workersStoppedForTeardown_) return false;
     {
         std::lock_guard lock(searchMutex_);
         searchWorkerStop_ = false;
         searchWorkerGeneration_ = generation_;
     }
     try {
-        searchWorker_ = std::thread([this]() noexcept { SearchWorkerLoop(); });
+        searchWorker_ = std::thread([this, window = hwnd_, token = workerLifetime_.Issue()]() noexcept {
+            SearchWorkerLoop(window, token);
+        });
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Search", L"StartSearchWorker");
         return false;
     }
     return true;
@@ -756,18 +734,20 @@ void QuickSiftApplicationImpl::StopSearchWorker() noexcept {
         searchCv_.notify_all();
         if (searchWorker_.joinable()) searchWorker_.join();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Search", L"StopSearchWorker");
     }
 }
 
-void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
-    const HWND window = hwnd_;
-    const auto post = [this, window]() noexcept {
+void QuickSiftApplicationImpl::SearchWorkerLoop(HWND window,
+    quicksift::core::worker_lifetime::Token token) noexcept {
+    // `window` was captured on the UI thread; this thread never reads hwnd_.
+    const auto post = [this, window, &token]() noexcept {
         searchUnconsumed_.store(true, std::memory_order_release);
         if (!searchMessagePosted_.exchange(true, std::memory_order_acq_rel) && window) {
             // 0.9.4.0 polish: a failed post (queue full / window closing) used to
             // leave the flag set forever, so no later batch could wake the UI and
             // search stalled. Reset it; the animation tick also polls.
-            if (!PostMessageW(window, WM_APP_SEARCH_WORKER, 0, 0))
+            if (!PostFromWorker(token, window, WM_APP_SEARCH_WORKER))
                 searchMessagePosted_.store(false, std::memory_order_release);
         }
     };
@@ -806,6 +786,7 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
                 }
             }
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Search", L"SearchWorkerLoop");
             return;
         }
 
@@ -822,12 +803,13 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
                     QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kSearch,
                         L"evaluate_failed", { L"error_code", L"worker.exception" },
                         { L"fallback", L"per_record" });
-                } catch (...) {}
+                } catch (...) { QS_CATCH_SILENT_BY_DESIGN("the guarded statement is the evaluate_failed log write"); }
             }
             try {
                 std::lock_guard lock(searchMutex_);
                 searchEvalResult_ = std::move(result);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Search", L"SearchWorkerLoop [3]");
             }
             post();
             continue;
@@ -839,7 +821,7 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
             // A file inside a metadata write (exclusive path gate) is not opened
             // now: the write must not see our handle. Re-queued at the back.
             for (auto it = batch.begin(); it != batch.end();) {
-                if (it->capture && worker_.IsPathBlockedForDecoder(it->path)) {
+                if ((it->capture || it->camera) && worker_.IsPathBlockedForDecoder(it->path)) {
                     deferred.push_back(std::move(*it));
                     it = batch.erase(it);
                 } else {
@@ -856,10 +838,16 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
                 SearchFactUpdate update;
                 update.index = item.index;
                 update.path = item.path;
+                std::optional<CachedImageRecord> cached;
+                if (item.camera) cached = persistentCache_.LookupCameraSettings(item.path, item.fileSize, item.modifiedStamp);
+                const bool readCamera = item.camera && !cached;
+                ExifHeaderFacts facts;
+                // One open + one bounded header read serves capture time AND camera.
+                if (item.capture || readCamera) facts = ReadExifHeaderFacts(item.path, item.capture, readCamera);
                 if (item.capture) {
-                    if (const auto exifTime = ReadCaptureTime(item.path)) {
+                    if (facts.capture) {
                         update.hasCapture = true;
-                        update.capture = exifTime->time;
+                        update.capture = facts.capture->time;
                         update.source = pred::CaptureTimeSource::Exif;
                     } else if (const auto modified = FileModifiedLocalTime(item.path)) {
                         update.hasCapture = true;
@@ -867,52 +855,35 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
                         update.source = pred::CaptureTimeSource::FileModified;
                     }
                 }
-                if (item.camera) {
-                    // Prefer the stamp-independent camera index (no file re-read).
-                    bool fromCache = false;
-                    if (auto cached = persistentCache_.LookupCameraSettings(item.path)) {
-                        update.hasCamera = true;
-                        update.iso = cached->iso;
-                        update.aperture = cached->aperture;
-                        update.focalLength = cached->focalLength;
-                        update.shutterSpeed = cached->shutterSpeed;
-                        update.camera = std::move(cached->camera);
-                        update.lens = std::move(cached->lens);
-                        update.cameraKnown = true;
-                        fromCache = true;
-                    }
-                    if (!fromCache) {
-                        // Same bounded read used for capture time.
-                        FileHandle file(CreateFileW(item.path.c_str(), GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                            FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
-                        if (file.Valid()) {
-                            std::vector<std::uint8_t> buffer(exif::kCaptureTimeReadBytes);
-                            DWORD read = 0;
-                            if (ReadFile(file.Get(), buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr) && read > 0) {
-                                buffer.resize(read);
-                                const auto settings = exif::FindCameraSettings(buffer);
-                                update.hasCamera = true;
-                                update.iso = settings.iso;
-                                update.aperture = settings.aperture;
-                                update.focalLength = settings.focalLength;
-                                update.shutterSpeed = settings.shutterSpeed;
-                                update.camera = settings.camera;
-                                update.lens = settings.lens;
-                                update.cameraKnown = settings.known;
-                                // Persist only camera columns; never overwrite rating/faces.
-                                CachedImageRecord rec;
-                                rec.iso = settings.iso;
-                                rec.aperture = settings.aperture;
-                                rec.focalLength = settings.focalLength;
-                                rec.shutterSpeed = settings.shutterSpeed;
-                                rec.camera = settings.camera;
-                                rec.lens = settings.lens;
-                                rec.cameraSettingsKnown = settings.known;
-                                persistentCache_.UpdateCameraSettings(item.path, rec);
-                            }
-                        }
-                    }
+                if (cached) {
+                    update.hasCamera = true;
+                    update.iso = cached->iso;
+                    update.aperture = cached->aperture;
+                    update.focalLength = cached->focalLength;
+                    update.shutterSpeed = cached->shutterSpeed;
+                    update.camera = std::move(cached->camera);
+                    update.lens = std::move(cached->lens);
+                    update.cameraKnown = true;
+                } else if (readCamera && facts.opened) {
+                    const auto& settings = facts.camera;
+                    update.hasCamera = true;
+                    update.iso = settings.iso;
+                    update.aperture = settings.aperture;
+                    update.focalLength = settings.focalLength;
+                    update.shutterSpeed = settings.shutterSpeed;
+                    update.camera = settings.camera;
+                    update.lens = settings.lens;
+                    update.cameraKnown = settings.known;
+                    // Persist only camera columns; never overwrite rating/faces.
+                    CachedImageRecord rec;
+                    rec.iso = settings.iso;
+                    rec.aperture = settings.aperture;
+                    rec.focalLength = settings.focalLength;
+                    rec.shutterSpeed = settings.shutterSpeed;
+                    rec.camera = settings.camera;
+                    rec.lens = settings.lens;
+                    rec.cameraSettingsKnown = settings.known;
+                    persistentCache_.UpdateCameraSettings(item.path, rec, item.fileSize, item.modifiedStamp);
                 }
                 if (item.comment) {
                     update.hasComment = true;
@@ -930,7 +901,7 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
                         L"hydrate_failed", { L"error_code", L"search.read_failed" },
                         { L"batch", std::to_wstring(batch.size()) },
                         { L"suppressed", std::to_wstring(suppressed) });
-                } catch (...) {}
+                } catch (...) { QS_CATCH_SILENT_BY_DESIGN("the guarded statement is the hydrate_failed log write"); }
             }
         }
         try {
@@ -943,6 +914,7 @@ void QuickSiftApplicationImpl::SearchWorkerLoop() noexcept {
             if (generation == searchWorkerGeneration_)
                 for (SearchHydrateItem& item : deferred) searchHydrateQueue_.push_back(std::move(item));
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Search", L"SearchWorkerLoop [5]");
         }
         searchHydrateDone_.fetch_add(batch.size(), std::memory_order_acq_rel);
         if (!deferred.empty() && batch.empty()) {

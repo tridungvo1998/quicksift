@@ -291,6 +291,9 @@ struct MediaCardBrushes {
     ID2D1Brush* border = nullptr;
     ID2D1Brush* accent = nullptr;
     ID2D1Brush* danger = nullptr;
+    // Round 23: optional style for the warning stroke (the grid's dashed blur
+    // outline); nullptr = solid.
+    ID2D1StrokeStyle* warningStroke = nullptr;
 };
 
 class MacOsUiFramework {
@@ -373,8 +376,42 @@ public:
     void ApplyRoundedControlRegion(HWND window, int width, int height, int radius,
         bool redraw = true) const noexcept;
 
-    void PaintButton(HDC dc, const RECT& rect, const ButtonPresentation& presentation,
+    // Returns true when the caption did not fit and was drawn with an ellipsis
+    // (callers show the full text in a tooltip).
+    bool PaintButton(HDC dc, const RECT& rect, const ButtonPresentation& presentation,
         const ThemePalette& palette, UINT dpi, HFONT normalFont, HFONT semiboldFont) const;
+    // Palette-coloured, DPI-scaled tooltip (call again on theme / DPI / font change).
+    static void StyleTooltip(HWND tooltip, const ThemePalette& palette, UINT dpi, HFONT font) noexcept;
+    // Empty tooltip window for tools added later (e.g. the ellipsis tooltips).
+    static HWND CreateSharedTooltip(HWND owner, HINSTANCE instance) noexcept;
+    // Overflow (ellipsis) tooltips, driven by the button subclass's own hover
+    // tracking instead of comctl32 TTF_SUBCLASS relaying: `tooltip` is a tracking
+    // tooltip from CreateOverflowTooltip; SetButtonOverflowText(button, text) marks a
+    // truncated caption (nullptr clears it). `text` must stay valid until cleared.
+    static HWND CreateOverflowTooltip(HWND owner, HINSTANCE instance) noexcept;
+    static void SetOverflowTooltip(HWND tooltip) noexcept;
+    static void SetButtonOverflowText(HWND button, const wchar_t* text) noexcept;
+    static void ArmOverflowTip(HWND button) noexcept;
+    static void ShowOverflowTip(HWND button) noexcept;
+    static void HideOverflowTip(HWND button) noexcept;
+    // Debug-level trace of every overflow-tooltip decision (the app routes it to the
+    // diagnostic log at TRACE; enable "Verbose logging" to see it).
+    using TraceSink = void (*)(const wchar_t* message) noexcept;
+    static void SetOverflowTraceSink(TraceSink sink) noexcept;
+    static void TraceOverflow(HWND button, const wchar_t* event, const wchar_t* detail = L"") noexcept;
+    // Posted to the button's parent when a framework button gains keyboard focus
+    // (wParam = button HWND) so scrollable containers can bring it into view.
+    static constexpr UINT kButtonFocusedMessage = WM_APP + 0x3F1;
+    // Five-dot grip (drag handle) centred on `center`, in DIPs.
+    void PaintDragGrip(ID2D1RenderTarget* target, D2D1_POINT_2F center, ID2D1Brush* brush) const noexcept;
+    // Shared custom-drawn checkbox (theme-, DPI-, hover-, focus- and disabled-aware).
+    // Create with CreateButton (BS_OWNERDRAW); keep the checked state in a window
+    // property via SetCheckboxChecked/IsCheckboxChecked and paint it in WM_DRAWITEM.
+    void PaintCheckbox(HDC dc, const RECT& rect, std::wstring_view text, bool checked,
+        bool hot, bool focused, bool disabled, const ThemePalette& palette, UINT dpi,
+        HFONT font, COLORREF parentSurface) const;
+    static void SetCheckboxChecked(HWND checkbox, bool checked) noexcept;
+    [[nodiscard]] static bool IsCheckboxChecked(HWND checkbox) noexcept;
     void PaintPanel(HDC dc, const RECT& rect, const PanelPresentation& presentation,
         const ThemePalette& palette, UINT dpi) const;
     // Stroke-only rounded border for content HWNDs that already have an opaque fill
@@ -389,13 +426,10 @@ public:
         const ThemePalette& palette, UINT dpi, HFONT normalFont, HFONT semiboldFont) const;
     void PaintStatus(HDC dc, const RECT& rect, const StatusPresentation& presentation,
         const ThemePalette& palette, UINT dpi, HFONT normalFont, HFONT semiboldFont) const;
-    // Returns the horizontal text extent used by the rotated vertical-tab renderer.
-    // Callers use this value to size the tab's vertical geometry before painting.
-    int MeasureVerticalTabTextExtent(std::wstring_view text, UINT dpi) const;
-
-    void PaintVerticalTab(HDC dc, const RECT& rect, std::wstring_view text, bool active,
-        const ThemePalette& palette, UINT dpi, float activeBlend = 1.0f) const;
     // Horizontal-label tab for a vertical sidebar column inside the left pane.
+    // The label is GDI text with a cached per-DPI font: GDI+ text (Gdiplus::Font
+    // from a family name) loads GDI+'s whole installed-font collection on first
+    // use, which froze the first pane paint for seconds on font-heavy systems.
     void PaintSidebarTab(HDC dc, const RECT& rect, std::wstring_view text, bool active,
         const ThemePalette& palette, UINT dpi, float activeBlend = 1.0f) const;
     void PaintMenuItem(HDC dc, const RECT& rect, const MenuItem& item, bool selected,
@@ -555,6 +589,10 @@ private:
     HDC paneFrostDc_ = nullptr;     // memory DC holding the frost DIB
     HBITMAP paneFrostBitmap_ = nullptr;
     HGDIOBJ paneFrostPrevious_ = nullptr;
+    // PaintSidebarTab label font (bold kFamilyFallback, 10 DIP), created per DPI.
+    mutable HFONT sidebarTabFont_ = nullptr;
+    mutable UINT sidebarTabFontDpi_ = 0;
+    HFONT SidebarTabFont(UINT dpi) const noexcept;
     int paneFrostWidth_ = 0;
     int paneFrostHeight_ = 0;
     std::wstring toastGhostText_;   // painted while a cleared toast fades out

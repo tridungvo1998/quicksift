@@ -39,22 +39,6 @@ bool CaptureAtomicFileSnapshot(const fs::path& path, AtomicFileSnapshot& snapsho
     CloseHandle(handle);
     return captured;
 }
-std::uint64_t WicFileIdentity(const fs::path& path) {
-    AtomicFileSnapshot snapshot{};
-    if (!CaptureAtomicFileSnapshot(path, snapshot) || !snapshot.exists) return 0;
-
-    const std::uint64_t fileIndex =
-        (static_cast<std::uint64_t>(snapshot.fileIndexHigh) << 32) | snapshot.fileIndexLow;
-    const std::uint64_t lastWriteTime =
-        (static_cast<std::uint64_t>(snapshot.lastWrite.dwHighDateTime) << 32) |
-        snapshot.lastWrite.dwLowDateTime;
-    std::uint64_t identity = static_cast<std::uint64_t>(quicksift::core::StableFileIdentityStamp({
-        snapshot.volumeSerial, fileIndex, lastWriteTime
-    }));
-    // Size catches coarse-timestamp filesystems and keeps same-path replacements distinct.
-    identity ^= snapshot.size + 0x9E3779B97F4A7C15ull + (identity << 6) + (identity >> 2);
-    return identity == 0 ? 1 : identity;
-}
 bool SameAtomicFileSnapshot(const AtomicFileSnapshot& left, const AtomicFileSnapshot& right) {
     if (left.exists != right.exists) return false;
     if (!left.exists) return true;

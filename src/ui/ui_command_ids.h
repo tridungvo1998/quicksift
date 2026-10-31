@@ -173,6 +173,12 @@ inline constexpr int ID_DOCUMENT_TEXT = 5001;
 inline constexpr int ID_DOCUMENT_EXPORT = 5002;
 inline constexpr int ID_DOCUMENT_REFRESH = 5003;
 inline constexpr int ID_DOCUMENT_VERBOSE = 5004;
+inline constexpr int ID_DOCUMENT_AUTO_REFRESH = 5005;
+// Diagnostic log window: "Previous sessions…" button and its dropdown entries
+// (one per listed log, newest first; at most core::session_logs::kMaxListed).
+inline constexpr int ID_DOCUMENT_PREVIOUS_SESSIONS = 5006;
+inline constexpr int ID_DOCUMENT_SESSION_LOG_FIRST = 5100;
+inline constexpr int ID_DOCUMENT_SESSION_LOG_LAST = 5159;
 
 inline constexpr std::array kAllIds{
     ID_PICK_FOLDER,
@@ -317,6 +323,24 @@ inline constexpr std::array kAllIds{
     ID_DOCUMENT_EXPORT,
     ID_DOCUMENT_REFRESH,
     ID_DOCUMENT_VERBOSE,
+    ID_DOCUMENT_AUTO_REFRESH,
+    ID_DOCUMENT_PREVIOUS_SESSIONS,
 };
+
+// Buttons that open a dropdown menu (TrackDropdownMenu) and therefore draw the
+// popup chevron and reserve its width. The single source for both paint and
+// layout; scripts/verify-source-portable.py fails if a TrackDropdownMenu anchor
+// is missing here (Labels and the camera-settings/Hour filters once were).
+inline constexpr std::array kPopupMenuButtonIds{
+    ID_FORMATS, ID_DATE_FILTER, ID_SORT, ID_THUMB_SIZE, ID_ZOOM_MODE,
+    ID_STAR_FILTER, ID_PICK_FILTER, ID_LABEL_FILTER, ID_COLOR_LABEL,
+    ID_RATING_MENU, ID_PICK_STATE_MENU, ID_SETTING_LANGUAGE_SELECTOR,
+    ID_ISO_FILTER, ID_APERTURE_FILTER, ID_FOCAL_FILTER, ID_SHUTTER_FILTER,
+    ID_CAMERA_FILTER, ID_HOUR_FILTER,
+};
+[[nodiscard]] constexpr bool IsPopupMenuButton(int id) noexcept {
+    for (const int popup : kPopupMenuButtonIds) if (popup == id) return true;
+    return false;
+}
 
 } // namespace quicksift::ui::command_id

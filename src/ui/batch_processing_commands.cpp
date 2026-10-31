@@ -6,6 +6,7 @@
 // and live in core/batch_match_policy (scripts/checks/batch_match_checks.cpp).
 #include "app/quicksift_application_internal.h"
 #include "diagnostics/log_categories.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <algorithm>
 #include <functional>
@@ -98,8 +99,9 @@ bool ListImageFileNames(const std::wstring& folder, const std::atomic<bool>& can
         error = L"Windows error " + std::to_wstring(code);
         return false;
     }
+    bool cancelled = false;
     do {
-        if (cancel.load(std::memory_order_acquire)) break;
+        if (cancel.load(std::memory_order_acquire)) { cancelled = true; break; }
         if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN |
             FILE_ATTRIBUTE_SYSTEM)) continue;
         const std::wstring_view name(data.cFileName);
@@ -108,7 +110,15 @@ bool ListImageFileNames(const std::wstring& folder, const std::atomic<bool>& can
         if (!bm::IsSupportedImageExtension(bm::NormalizeExtensionToken(name.substr(dot)))) continue;
         names.emplace_back(name);
     } while (FindNextFileW(find, &data));
+    // A failed FindNextFileW (network drop, device removed) used to end the listing
+    // silently and report a partial folder as complete.
+    const DWORD endCode = cancelled ? ERROR_NO_MORE_FILES : GetLastError();
     FindClose(find);
+    if (endCode != ERROR_NO_MORE_FILES) {
+        names.clear();
+        error = L"Windows error " + std::to_wstring(endCode);
+        return false;
+    }
     std::sort(names.begin(), names.end(), [](const std::wstring& a, const std::wstring& b) {
         return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(),
             static_cast<int>(b.size()), TRUE) == CSTR_LESS_THAN;
@@ -129,6 +139,7 @@ void QuickSiftApplicationImpl::StopBatchWorker() noexcept {
     try {
         if (batchWorker_.joinable()) batchWorker_.join();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Batch", L"StopBatchWorker");
         // Shutdown boundary: never throw.
     }
     batchWorkerRunning_.store(false, std::memory_order_release);
@@ -136,7 +147,7 @@ void QuickSiftApplicationImpl::StopBatchWorker() noexcept {
 
 bool QuickSiftApplicationImpl::StartBatchWorker(bool folderLoad,
     std::function<void(BatchWorkerResult&)> work) {
-    if (BatchWorkerBusy()) return false;
+    if (BatchWorkerBusy() || workersStoppedForTeardown_) return false;
     StopBatchWorker(); // joins a finished previous worker (never a running one)
     batchWorkerCancel_.store(false, std::memory_order_release);
     batchWorkerRunning_.store(true, std::memory_order_release);
@@ -148,7 +159,7 @@ bool QuickSiftApplicationImpl::StartBatchWorker(bool folderLoad,
     const std::uint64_t generation = generation_;
     const HWND window = hwnd_;
     try {
-        batchWorker_ = std::thread([this, window, serial, generation, folderLoad,
+        batchWorker_ = std::thread([this, window, serial, generation, folderLoad, token = workerLifetime_.Issue(),
             work = std::move(work)]() noexcept {
             BatchWorkerResult result;
             result.folderLoad = folderLoad;
@@ -158,6 +169,7 @@ bool QuickSiftApplicationImpl::StartBatchWorker(bool folderLoad,
             try {
                 work(result);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Batch", L"StartBatchWorker");
                 result.ok = false;
                 if (result.error.empty()) result.error = L"Unexpected error.";
             }
@@ -169,12 +181,14 @@ bool QuickSiftApplicationImpl::StartBatchWorker(bool folderLoad,
                 std::lock_guard lock(batchWorkerMutex_);
                 batchWorkerResult_ = std::move(result);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Batch", L"StartBatchWorker [2]");
             }
             batchWorkerRunning_.store(false, std::memory_order_release);
             // A lost post is recovered by OnTimer (worker joinable && not busy).
-            static_cast<void>(PostMessageW(window, WM_APP_BATCH_WORKER_DONE, 0, 0));
+            static_cast<void>(PostFromWorker(token, window, WM_APP_BATCH_WORKER_DONE));
         });
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Batch", L"StartBatchWorker [3]");
         batchWorkerRunning_.store(false, std::memory_order_release);
         return false;
     }
@@ -194,6 +208,8 @@ void QuickSiftApplicationImpl::OpenBatchProcessingDialog() {
         ShowGlassAlert(L"Batch Processing", L"Open a folder first.", GlassAlertKind::Information);
         return;
     }
+    // Live blocking-wait dialog (what, which file, how many left, elapsed, why).
+    if (ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::Batch)) return;
     if (transactions_.Busy() || RatingsWorkerBusy() || ratingsImportToken_ != 0) {
         ShowGlassAlert(L"Batch Processing",
             L"Wait for the current file, metadata or ratings operation to finish, then try again.",
@@ -446,7 +462,7 @@ void QuickSiftApplicationImpl::OnBatchWorkerCompleted() {
         batchWorkerResult_.reset();
     }
     if (batchWorker_.joinable() && !BatchWorkerBusy()) {
-        try { batchWorker_.join(); } catch (...) {}
+        try { batchWorker_.join(); } catch (...) { QS_LOG_AND_CONTINUE(L"Batch", L"OnBatchWorkerCompleted"); }
     }
     UpdateStatus();
     if (!taken || taken->serial != batchWorkerSerial_ || !batchDialog_) return;

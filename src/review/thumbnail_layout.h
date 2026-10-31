@@ -40,6 +40,15 @@ struct ThumbnailRect {
     std::size_t itemCount, float scrollOffset, float x, float y) noexcept;
 [[nodiscard]] float ScrollToRevealThumbnail(const ThumbnailLayoutMetrics& metrics,
     std::size_t index, float currentScroll) noexcept;
+// Rows intersecting [scrollOffset, scrollOffset + viewportHeight) in canvas space;
+// empty (last < first) for no rows or degenerate geometry. Paint virtualizes with it.
+struct ThumbnailRowRange {
+    int first = 0;
+    int last = -1;
+    [[nodiscard]] bool Empty() const noexcept { return last < first; }
+};
+[[nodiscard]] ThumbnailRowRange VisibleThumbnailRows(const ThumbnailLayoutMetrics& metrics,
+    float scrollOffset, float viewportHeight) noexcept;
 [[nodiscard]] float ScrollToCenterThumbnail(const ThumbnailLayoutMetrics& metrics,
     std::size_t index) noexcept;
 

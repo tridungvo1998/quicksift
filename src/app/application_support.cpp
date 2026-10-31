@@ -1,6 +1,8 @@
 // OWNER: Shared native helpers used by UI and background services.
+#include "core/sidecar_write_policy.h"
 #include "app/application_support.h"
 #include "core/metadata_vocabulary.h"
+#include "diagnostics/log_and_continue.h"
 
 namespace quicksift::app {
 
@@ -321,24 +323,12 @@ MetadataFieldValue LabelFieldFromInspection(
     return UnsupportedMetadataValue(inspected.value);
 }
 
-PhotoMetadataValues ReadSidecarMetadata(const fs::path& image, bool absentIsKnown) {
-    const fs::path sidecar = SidecarPathFor(image);
-    TextFileEncoding encoding = TextFileEncoding::Utf8;
-    bool decoded = false;
-    const std::wstring text = ReadTextFile(sidecar, &encoding, &decoded);
-    if (ExistingTextFileCouldNotBeDecoded(sidecar, decoded)) {
-        return { UnreadableMetadataValue(), UnreadableMetadataValue(),
-            UnreadableMetadataValue() };
-    }
-    std::error_code ec;
-    const bool exists = fs::exists(sidecar, ec) && !ec;
-    if (!exists || text.empty()) {
-        const MetadataFieldValue empty = absentIsKnown ? KnownMetadataValue(0) :
-            UnknownMetadataValue();
+PhotoMetadataValues SidecarValuesFromText(const std::wstring& text, bool absentIsKnown) {
+    PhotoMetadataValues values;
+    if (text.empty()) {
+        const MetadataFieldValue empty = absentIsKnown ? KnownMetadataValue(0) : UnknownMetadataValue();
         return { empty, empty, empty };
     }
-
-    PhotoMetadataValues values;
     values.rating = IntegerFieldFromInspection(
         quicksift::metadata::InspectXmpSimpleValue(text, kRatingQuery), 0, 5,
         absentIsKnown);
@@ -346,7 +336,34 @@ PhotoMetadataValues ReadSidecarMetadata(const fs::path& image, bool absentIsKnow
         quicksift::metadata::InspectXmpSimpleValue(text, kLabelQuery), absentIsKnown);
     values.pickState = IntegerFieldFromInspection(
         quicksift::metadata::InspectXmpSimpleValue(text, kPickQuery), -1, 1, absentIsKnown);
+    quicksift::core::sidecar_write::CompleteQuickSiftSidecar(values);
     return values;
+}
+
+PhotoMetadataValues ReadSidecarMetadata(const fs::path& image, bool absentIsKnown) {
+    const fs::path sidecar = SidecarPathFor(image);
+    TextFileEncoding encoding = TextFileEncoding::Utf8;
+    bool decoded = false;
+    const std::wstring text = ReadTextFile(sidecar, &encoding, &decoded);
+    // One existence probe at most (was up to three per image: the read, then
+    // ExistingTextFileCouldNotBeDecoded, then fs::exists). Most photos have no
+    // sidecar, so this runs for nearly every file during indexing.
+    std::error_code ec;
+    const bool exists = (decoded && !text.empty()) || (fs::exists(sidecar, ec) && !ec);
+    if (!decoded && exists) {
+        std::error_code sizeError;
+        if (fs::file_size(sidecar, sizeError) > 0 && !sizeError) {
+            return { UnreadableMetadataValue(), UnreadableMetadataValue(),
+                UnreadableMetadataValue() };
+        }
+    }
+    if (!exists || text.empty()) {
+        const MetadataFieldValue empty = absentIsKnown ? KnownMetadataValue(0) :
+            UnknownMetadataValue();
+        return { empty, empty, empty };
+    }
+
+    return SidecarValuesFromText(text, absentIsKnown);
 }
 
 MetadataFieldValue ChooseMetadataField(const MetadataFieldValue& preferred,
@@ -389,7 +406,12 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
             result.detail = L"The existing XMP sidecar could not be decoded, so QuickSift preserved it unchanged.";
             return result;
         }
-        result.before = ReadPhotoMetadata(image);
+        // Sidecar-first: the text in memory answers "before"; the full multi-source
+        // read (Exiv2 parse of the RAW + Shell property store) runs only when the
+        // sidecar does not answer every field (core/sidecar_write_policy.h).
+        const PhotoMetadataValues sidecarBefore = SidecarValuesFromText(text, false);
+        result.before = quicksift::core::sidecar_write::NeedsFullRead(sidecarBefore) ?
+            ReadPhotoMetadata(image) : sidecarBefore;
         MetadataFieldId conflict{};
         if (!MetadataExpectedMatches(result.before, patch, &conflict)) {
             result.conflict = true;
@@ -409,23 +431,24 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
 <?xpacket end="w"?>
 )";
         }
-        if (patch.rating.active && !UpdateXmpSimpleValue(text,
-            { kRatingQuery.qualifiedName, kRatingQuery.namespaceName,
-                kRatingQuery.namespaceUri, std::to_wstring(patch.rating.desired) })) {
-            result.detail = L"The rating property could not be updated without rewriting unfamiliar XMP.";
-            return result;
-        }
-        if (patch.colorLabel.active && !UpdateXmpSimpleValue(text,
-            { kLabelQuery.qualifiedName, kLabelQuery.namespaceName,
-                kLabelQuery.namespaceUri, LabelName(patch.colorLabel.desired) })) {
-            result.detail = L"The color-label property could not be updated without rewriting unfamiliar XMP.";
-            return result;
-        }
-        if (patch.pickState.active && !UpdateXmpSimpleValue(text,
-            { kPickQuery.qualifiedName, kPickQuery.namespaceName,
-                kPickQuery.namespaceUri, std::to_wstring(patch.pickState.desired) })) {
-            result.detail = L"The pick-state property could not be updated without rewriting unfamiliar XMP.";
-            return result;
+        // The edit plus every Known value the sidecar lacks, so the next read and
+        // write of this photo are sidecar-only.
+        for (const auto& write : quicksift::core::sidecar_write::PlanWrites(sidecarBefore, result.before, patch)) {
+            bool updated = false;
+            if (write.field == MetadataFieldId::Rating) {
+                updated = UpdateXmpSimpleValue(text, { kRatingQuery.qualifiedName, kRatingQuery.namespaceName,
+                    kRatingQuery.namespaceUri, std::to_wstring(write.value) });
+                if (!updated) result.detail = L"The rating property could not be updated without rewriting unfamiliar XMP.";
+            } else if (write.field == MetadataFieldId::ColorLabel) {
+                updated = UpdateXmpSimpleValue(text, { kLabelQuery.qualifiedName, kLabelQuery.namespaceName,
+                    kLabelQuery.namespaceUri, LabelName(write.value) });
+                if (!updated) result.detail = L"The color-label property could not be updated without rewriting unfamiliar XMP.";
+            } else {
+                updated = UpdateXmpSimpleValue(text, { kPickQuery.qualifiedName, kPickQuery.namespaceName,
+                    kPickQuery.namespaceUri, std::to_wstring(write.value) });
+                if (!updated) result.detail = L"The pick-state property could not be updated without rewriting unfamiliar XMP.";
+            }
+            if (!updated) return result;
         }
         TextFileWriteStatus writeStatus;
         if (!WriteTextFile(sidecar, text, encoding, expectedSidecar, &writeStatus)) {
@@ -441,17 +464,21 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
                     L"The XMP sidecar could not be published atomically.");
             return result;
         }
-        result.after = ReadPhotoMetadata(image);
+        // Verify against the sidecar only (the sidecar is the authority for this
+        // photo's edits); the full re-read of the RAW is not repeated.
+        const PhotoMetadataValues written = ReadSidecarMetadata(image, false);
         const PhotoMetadataValues requested = ApplyMetadataPatch(result.before, patch);
-        if ((patch.rating.active && !MetadataFieldEquivalent(result.after.rating, requested.rating)) ||
-            (patch.colorLabel.active && !MetadataFieldEquivalent(result.after.colorLabel, requested.colorLabel)) ||
-            (patch.pickState.active && !MetadataFieldEquivalent(result.after.pickState, requested.pickState))) {
+        result.after = requested;
+        if ((patch.rating.active && !MetadataFieldEquivalent(written.rating, requested.rating)) ||
+            (patch.colorLabel.active && !MetadataFieldEquivalent(written.colorLabel, requested.colorLabel)) ||
+            (patch.pickState.active && !MetadataFieldEquivalent(written.pickState, requested.pickState))) {
             result.detail = L"The sidecar was written but the requested metadata could not be verified.";
             return result;
         }
         result.ok = true;
         return result;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Metadata", L"WritePhotoMetadataPatch");
         result.detail = L"An unexpected XMP sidecar error occurred.";
         return result;
     }
@@ -513,6 +540,23 @@ PhotoMetadataValues ReadPhotoMetadata(const fs::path& image) {
     if (!values.rating.IsAuthoritative()) {
         if (const auto shellRating = ReadShellRating(image))
             values.rating = KnownMetadataValue(*shellRating);
+    }
+    // Every source answered "nothing here" (no sidecar, no XMP/EXIF rating that
+    // Exiv2 could read, no shell rating). For a file that opens, that is an unset
+    // value (0 stars), not "still unknown": leaving it Unknown made the photo
+    // display as unrated but never match "0 stars"/"unrated" or the Unrated filter.
+    // A file that cannot be opened becomes Unreadable (terminal).
+    if (values.rating.knowledge == MetadataKnowledge::Unknown ||
+        values.colorLabel.knowledge == MetadataKnowledge::Unknown ||
+        values.pickState.knowledge == MetadataKnowledge::Unknown) {
+        HANDLE probe = CreateFileW(image.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr);
+        const bool opens = probe != INVALID_HANDLE_VALUE;
+        if (opens) CloseHandle(probe);
+        // Terminal either way: a file that cannot be opened is Unreadable, not
+        // Unknown (Unknown kept "Rating pending" and the filters waiting forever).
+        ResolveMetadataReadOutcome(values, opens);
     }
     return values;
 }
@@ -613,6 +657,39 @@ std::optional<fs::path> PickFolder(HWND owner, const wchar_t* title) {
     fs::path result(path);
     CoTaskMemFree(path);
     return result;
+}
+
+ExifHeaderFacts ReadExifHeaderFacts(const fs::path& image, bool wantCapture, bool wantCamera) {
+    namespace exif = quicksift::core::exif;
+    ExifHeaderFacts facts;
+    HANDLE file = CreateFileW(image.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return facts;
+    constexpr DWORD kFirst = 64u * 1024u;
+    thread_local std::vector<std::uint8_t> buffer; // reused: no 512 KB allocation per file
+    buffer.resize(exif::kCaptureTimeReadBytes);
+    DWORD read = 0;
+    if (!ReadFile(file, buffer.data(), kFirst, &read, nullptr) || read == 0) { CloseHandle(file); return facts; }
+    facts.opened = true;
+    auto evaluate = [&](std::size_t size) {
+        const std::span<const std::uint8_t> bytes(buffer.data(), size);
+        if (wantCapture) {
+            auto found = exif::FindCaptureTime(bytes);
+            if (found && (!facts.capture || found->tag > facts.capture->tag)) facts.capture = found;
+        }
+        if (wantCamera && !facts.camera.known) facts.camera = exif::FindCameraSettings(bytes);
+    };
+    evaluate(read);
+    const bool missing = (wantCapture && (!facts.capture || facts.capture->tag != exif::CaptureTag::Original)) ||
+        (wantCamera && !facts.camera.known);
+    if (missing && read == kFirst) {
+        DWORD more = 0;
+        if (ReadFile(file, buffer.data() + read, static_cast<DWORD>(buffer.size() - read), &more, nullptr) && more > 0)
+            evaluate(static_cast<std::size_t>(read) + more);
+    }
+    CloseHandle(file);
+    return facts;
 }
 
 } // namespace quicksift::app

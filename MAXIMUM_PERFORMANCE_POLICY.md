@@ -26,3 +26,5 @@ The Settings menu exposes a live, click-through performance overlay. It updates 
 ## Shutdown policy
 
 Shutdown is cancellation-first and handle-release-first. Background work is signaled to stop before waiting for any subsystem, queued speculative cache writes are discarded, and the persistent cache is closed without forcing a WAL checkpoint. The cache is disposable; committed WAL frames remain recoverable on the next startup. This prevents shutdown from turning into a synchronous disk-maintenance operation after the UI has disappeared.
+
+Since 0.9.5.0, every app-owned worker thread (ratings, batch, search, deferred startup, diagnostics cleanup) holds a shutdown token (`core/worker_lifetime.h`). `StopAllWorkersForTeardown` revokes the token and joins those threads before the decoder worker stops and the cache closes (CODE_GUIDE §8.1). Old diagnostic files (older than 7 days) are deleted on a background-priority thread about 3 s after startup, so cleanup never competes with first-frame work. The unused Direct2D image-source cache (`wicImageSources_`) was removed; the UI thread never decodes.

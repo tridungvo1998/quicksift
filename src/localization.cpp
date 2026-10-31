@@ -58,6 +58,12 @@ const std::initializer_list<TranslationPair> kTranslations{
     TranslationPair{L"Format: All", L"Định dạng: Tất cả"},
     TranslationPair{L"Format: None", L"Định dạng: Không có"},
     TranslationPair{L"Date: Any", L"Ngày: Bất kỳ"},
+    TranslationPair{L"ISO: All", L"ISO: Tất cả"},
+    TranslationPair{L"Aperture: All", L"Khẩu độ: Tất cả"},
+    TranslationPair{L"Focal: All", L"Tiêu cự: Tất cả"},
+    TranslationPair{L"Shutter: All", L"Tốc độ màn trập: Tất cả"},
+    TranslationPair{L"Camera: All", L"Máy ảnh: Tất cả"},
+    TranslationPair{L"Hour: All", L"Giờ: Tất cả"},
     TranslationPair{L"Date: 24h", L"Ngày: 24 giờ"},
     TranslationPair{L"Date: 7d", L"Ngày: 7 ngày"},
     TranslationPair{L"Date: 30d", L"Ngày: 30 ngày"},
@@ -129,8 +135,8 @@ const std::initializer_list<TranslationPair> kTranslations{
     TranslationPair{L"Loading…", L"Đang tải…"},
     TranslationPair{L"loading…", L"đang tải…"},
     TranslationPair{L"Couldn't load image", L"Không thể tải ảnh"},
-    TranslationPair{L"Red border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.",
-        L"Viền đỏ: ít nhất một khuôn mặt được phát hiện có vẻ bị nhòe (lệch nét hoặc nhòe chuyển động) hoặc đang nhắm mắt. Các phép kiểm tra được đặt thận trọng; đây là cảnh báo, không phải phép kiểm tra tuyệt đối."},
+    TranslationPair{L"Red dashed border: at least one detected face looks blurred (out of focus or motion blur) or has its eyes closed. The checks are deliberately conservative; treat this as a warning, not a definitive test.",
+        L"Viền đỏ nét đứt: ít nhất một khuôn mặt được phát hiện có vẻ bị nhòe (lệch nét hoặc nhòe chuyển động) hoặc đang nhắm mắt. Các phép kiểm tra được đặt thận trọng; đây là cảnh báo, không phải phép kiểm tra tuyệt đối."},
     TranslationPair{L"Face Lock centers the view on the face closest to the image centre, or on the face you click. Detection runs locally through Windows Media FaceAnalysis.",
         L"Khóa khuôn mặt căn vùng nhìn vào khuôn mặt gần tâm ảnh nhất, hoặc vào khuôn mặt bạn nhấp chọn. Việc phát hiện chạy cục bộ qua Windows Media FaceAnalysis."},
     TranslationPair{L"Face", L"Khuôn mặt"},
@@ -172,8 +178,44 @@ const std::initializer_list<TranslationPair> kTranslations{
         L"QuickSift vẫn đang thay đổi tệp. Đóng ứng dụng sẽ hủy các thao tác đang chờ tại ranh giới tệp an toàn tiếp theo. Các tệp đã hoàn tất và xác minh sẽ được giữ nguyên; QuickSift sẽ không dừng giữa một nhóm phương tiện nguyên tử."},
     TranslationPair{L"Close anyway", L"Vẫn đóng"},
     TranslationPair{L"Wait", L"Chờ"},
-    TranslationPair{L"Cancelling file operations at a safe boundary before closing…",
-        L"Đang hủy thao tác tệp tại ranh giới an toàn trước khi đóng…"},
+    TranslationPair{L"Write metadata into RAW files", L"Ghi metadata vào tệp RAW"},
+    TranslationPair{L"Write metadata into JPG/PNG files", L"Ghi metadata vào tệp JPG/PNG"},
+    TranslationPair{L"Write metadata into TIFF files", L"Ghi metadata vào tệp TIFF"},
+    TranslationPair{L"Write metadata into the file (off: XMP sidecar)", L"Ghi metadata vào tệp (tắt: tệp XMP đi kèm)"},
+    TranslationPair{L"Save", L"Lưu"},
+    TranslationPair{L"Remove from library", L"Xóa khỏi thư viện"},
+    TranslationPair{L"Auto refresh", L"Tự động làm mới"},
+    TranslationPair{L"Verbose logging", L"Ghi nhật ký chi tiết"},
+    TranslationPair{L"Previous sessions…", L"Các phiên trước…"},
+    TranslationPair{L"No previous session logs", L"Không có nhật ký phiên trước"},
+    TranslationPair{L"Previous session log", L"Nhật ký phiên trước"},
+    TranslationPair{L"Log file: {file}", L"Tệp nhật ký: {file}"},
+    TranslationPair{L"Showing the newest {shown} of {total}. Open the file itself to see older entries.",
+        L"Đang hiển thị {shown} mới nhất trong tổng số {total}. Mở chính tệp đó để xem các mục cũ hơn."},
+    TranslationPair{L"QuickSift could not read that session log.", L"QuickSift không đọc được nhật ký phiên đó."},
+    TranslationPair{L"QuickSift could not list the previous session logs.",
+        L"QuickSift không liệt kê được các nhật ký phiên trước."},
+    TranslationPair{L"Closing QuickSift is waiting", L"Đóng QuickSift đang chờ"},
+    TranslationPair{L"Ratings import is waiting", L"Nhập xếp hạng đang chờ"},
+    TranslationPair{L"Ratings export is waiting", L"Xuất xếp hạng đang chờ"},
+    TranslationPair{L"Batch Processing is waiting", L"Xử lý hàng loạt đang chờ"},
+    TranslationPair{L"The file is locked by another app.", L"Tệp đang bị ứng dụng khác khóa."},
+    TranslationPair{L"Retrying a metadata write that failed temporarily.", L"Đang thử lại một lần ghi siêu dữ liệu bị lỗi tạm thời."},
+    TranslationPair{L"Writing ratings, pick states or labels.", L"Đang ghi xếp hạng, trạng thái chọn hoặc nhãn."},
+    TranslationPair{L"Copying, moving or deleting files.", L"Đang sao chép, di chuyển hoặc xóa tệp."},
+    TranslationPair{L"Importing or exporting ratings.", L"Đang nhập hoặc xuất xếp hạng."},
+    TranslationPair{L"Batch processing is running.", L"Xử lý hàng loạt đang chạy."},
+    TranslationPair{L"Rating, pick or label edits are not saved yet.", L"Các thay đổi xếp hạng, chọn hoặc nhãn chưa được lưu."},
+    TranslationPair{L"File: {file}", L"Tệp: {file}"},
+    TranslationPair{L"{left} of {total} left", L"Còn {left} trên {total}"},
+    TranslationPair{L"Waiting for {elapsed}", L"Đã chờ {elapsed}"},
+    TranslationPair{L"Nothing is blocking any more.", L"Không còn gì cản trở nữa."},
+    TranslationPair{L"Force quit", L"Buộc thoát"},
+    TranslationPair{L"Cancel operation", L"Hủy thao tác"},
+    TranslationPair{L"Stop waiting", L"Ngừng chờ"},
+    TranslationPair{L"Ready. You can start it again now.", L"Đã sẵn sàng. Bạn có thể bắt đầu lại ngay."},
+    TranslationPair{L"Cancelling at the next safe point…", L"Đang hủy tại điểm an toàn tiếp theo…"},
+    TranslationPair{L"QuickSift is still waiting. Close again to see progress.", L"QuickSift vẫn đang chờ. Đóng lại lần nữa để xem tiến độ."},
     TranslationPair{L"Dark appearance", L"Giao diện tối"},
     TranslationPair{L"Enable all", L"Bật tất cả"},
     TranslationPair{L"Camera RAW", L"RAW máy ảnh"},
@@ -1136,7 +1178,7 @@ PHÍM TẮT
 • Xếp hạng: 0 (xóa), 1–5 (xếp hạng).
 • Chọn/Loại: P (chọn), X (loại), U (bỏ đánh dấu).
 • Nhãn màu: 6 (Đỏ), 7 (Vàng), 8 (Xanh lá), 9 (Xanh dương), Ctrl+5 (Tím), Ctrl+0 (xóa nhãn).
-• Xem ảnh: Con lăn (thu phóng), Kéo (di chuyển), F (vừa khung), Z (100%), R (xoay), F11 (toàn màn hình), F7 (thanh phim).
+• Xem ảnh: Con lăn (thu phóng), Kéo (di chuyển), F (vừa khung), Z (100%), R (xoay), F11 (toàn màn hình), F7 (thanh phim: hiện/ẩn mờ dần; nhấp hoặc lăn chuột trên thanh để chuyển ảnh; ảnh thu nhỏ có huy hiệu số sao và Chọn/Loại; trạng thái bật/tắt được ghi nhớ).
 • Lịch sử: Ctrl+Z (hoàn tác), Ctrl+Y (làm lại).
 • Tìm kiếm (chế độ Ảnh thu nhỏ): Ctrl+F (đặt con trỏ vào ô tìm kiếm), Enter/Tab/Mũi tên xuống (áp dụng và về lưới), Esc (xóa nội dung; bấm lần nữa để rời ô).
 
@@ -1160,19 +1202,29 @@ XEM ẢNH
 • Sync: trong chế độ so sánh, đồng bộ thu phóng và vị trí giữa các ảnh.
 • Face Lock: khi có khuôn mặt, tự căn vùng nhìn vào khuôn mặt gần tâm ảnh nhất khi đổi ảnh hoặc thu phóng. Mỗi khuôn mặt được phát hiện có một khung mờ; nhấp vào khung để chọn khuôn mặt đó làm mục tiêu và phóng to để khuôn mặt chiếm khoảng 70% khung nhìn. Lựa chọn được ghi nhớ cho từng ảnh (bị xóa khi nội dung tệp thay đổi).
 • Toàn màn hình / F11: lấp đầy màn hình và thu thanh tiêu đề vào mép trên. Giữ con trỏ ở vùng mép trên trong chốc lát để hiện thanh. Thanh tiêu đề nổi trên ảnh thay vì làm vùng xem ảnh đổi kích thước; đưa chuột ra xa để thanh tự ẩn lại.
-• Viền đỏ quanh ảnh thu nhỏ: ít nhất một khuôn mặt có vẻ lệch nét, nhòe chuyển động hoặc đang nhắm mắt. Di chuột lên viền để xem khuôn mặt nào và lý do (ví dụ “Khuôn mặt 2: nhắm mắt”). Các ngưỡng được đặt thận trọng; khuôn mặt quá nhỏ không được đánh giá. Kính râm, mặt nghiêng hoặc nheo mắt có thể gây cảnh báo sai; nên kiểm tra ở 100% trước khi loại ảnh.
+• Viền đỏ nét đứt quanh ảnh thu nhỏ (cả trên thanh phim): ít nhất một khuôn mặt có vẻ lệch nét, nhòe chuyển động hoặc đang nhắm mắt. Di chuột lên viền để xem khuôn mặt nào và lý do (ví dụ “Khuôn mặt 2: nhắm mắt”). Các ngưỡng được đặt thận trọng; khuôn mặt quá nhỏ không được đánh giá. Kính râm, mặt nghiêng hoặc nheo mắt có thể gây cảnh báo sai; nên kiểm tra ở 100% trước khi loại ảnh.
 • Xoay trái / phải: xoay cách hiển thị; tệp gốc không bị thay đổi.
 
 LỌC VÀ SẮP XẾP
 • Stars, Pick state, Labels, Format và Date chỉ thay đổi những ảnh được hiển thị; không xóa tệp.
 • Vùng chọn được giới hạn có chủ ý trong kết quả đang hiển thị. Khi bộ lọc ẩn một ảnh đã chọn, ảnh đó được bỏ khỏi vùng chọn để không trở thành mục tiêu lệnh vô hình.
 • Bộ lọc metadata chỉ nhận giá trị đã đọc chắc chắn; ảnh đang chờ đọc, không đọc được hoặc có giá trị tùy chỉnh không bị giả vờ là chưa xếp hạng/chưa đánh dấu/chưa gắn nhãn.
+• Format và Date chỉ liệt kê các đuôi tệp và ngày chụp thực sự có trong thư mục.
+• ISO, Khẩu độ, Tiêu cự, Tốc độ màn trập, Máy ảnh và Giờ lọc theo thông số chụp. Danh sách chỉ gồm các giá trị có trong thư mục; tên máy ảnh là tên đầy đủ, không lặp hãng (“Canon EOS R5”, không phải “Canon Canon EOS R5”).
+• Thông số chụp và ngày chụp được đọc ở chế độ nền, sau việc hiển thị ảnh và các thao tác của bạn, nên giao diện không bị khựng khi mở menu lọc. Thư mục lớn có thể chưa có đủ giá trị ở lần mở đầu tiên; mở lại menu để thấy thêm. Bộ lọc đang bật tự cập nhật khi giá trị được đọc xong. Đổi thư mục sẽ dừng việc đọc của thư mục cũ.
+• Thông số đã đọc được lưu lại và tự đọc lại khi tệp ảnh thay đổi, nên giá trị cũ không còn xuất hiện sau khi chỉnh sửa ảnh.
+• Danh sách giá trị của các menu lọc được cập nhật liên tục khi giá trị được đọc, nên menu mở ngay lập tức kể cả với thư mục rất lớn.
+• Khi chưa bật bộ lọc Stars, Pick state hoặc Labels, xếp hạng/nhãn của các ảnh đang hiện trên màn hình và ảnh lân cận được đọc trước; phần còn lại được đọc khi máy rảnh. Khi bạn bật một trong các bộ lọc đó, toàn bộ phần còn lại được ưu tiên đọc ngay. Trạng thái “metadata đang chờ” vẫn hiển thị cho tới khi đọc xong mọi ảnh. Việc đọc luôn tiếp tục kể cả khi đang giải mã ảnh, và tệp không đọc được sẽ được đánh dấu “không đọc được” thay vì chờ mãi.
 • Sort thay đổi thứ tự hiển thị theo tên, ngày, xếp hạng hoặc định dạng.
 • Thumbnail size thay đổi kích thước lưới.
 
 TÌM KIẾM
 • Ô tìm kiếm nổi ở góc trên bên phải, chỉ có trong chế độ Ảnh thu nhỏ. Bấm Ctrl+F hoặc nhấp vào ô. Kết quả cập nhật khi bạn gõ.
 • Tìm theo tên tệp hoặc ghi chú người dùng (không phân biệt dấu: “dam cuoi” tìm được “đám cưới”), giờ chụp (8AM, 20h15), ngày (date:12, date:thứ sáu, 2026-10-12), số sao (5 sao, >=4 stars, unrated), nhãn màu (đỏ, xanh lá) và trạng thái chọn (đã chọn, loại).
+• Tìm theo định dạng (NEF, ARW, CR2, JPG; JPG cũng khớp tệp .jpeg), ngày tương đối (cũ hơn 7 ngày, mới hơn 2 tháng, hôm nay) và thông số chụp (iso:400, f/4 hoặc f:2.8, 50mm hoặc focal:50, 1/125 hoặc shutter:1/125, camera:nikon, lens:24-70). Một phân số như 9/10 không được hiểu là tốc độ màn trập (gõ date:9/10 để tìm theo ngày).
+• Khoảng số sao: 3 sao trở lên, từ 3 sao, ít nhất 3 sao, tối thiểu 3 sao, 5 sao trở xuống, tối đa 4 sao, không quá 4 sao, dưới 5 sao, ít hơn 5 sao, trên 2 sao, nhiều hơn 2 sao, hơn 2 sao; có thể gõ không dấu (3 sao tro len). Dạng ký hiệu: >=3*, <5 sao, ≥3 sao, ≤4 sao. Cần có chữ “sao”/“stars” (hoặc *), nên một con số đứng một mình vẫn là tìm theo tên tệp: “0” tìm tên chứa số 0, còn “0 sao” tìm ảnh chưa xếp hạng.
+• Ảnh không có xếp hạng ở bất kỳ nguồn nào (XMP, sidecar, thuộc tính Windows) được tính là 0 sao, giống như cách hiển thị và bộ lọc Unrated. Ảnh chưa đọc xong chưa khớp; bộ đếm hiện “…” cho tới khi đọc xong. Ảnh không đọc được hoặc có giá trị tùy chỉnh không bị coi là 0 sao.
+• Đặt “không”, not hoặc dấu - trước một điều kiện để loại trừ nó; + là phép VÀ tường minh.
 • Đặt chữ trong dấu ngoặc kép (“red”) hoặc dùng name:/comment: để tìm đúng chữ đó trong tên hoặc ghi chú.
 • Tìm kiếm kết hợp với các bộ lọc (mọi điều kiện đều phải khớp) và vẫn được giữ khi mở một kết quả ở chế độ Một ảnh. Bộ đếm hiển thị số ảnh hiện ra trên tổng số.
 
@@ -1184,6 +1236,8 @@ LƯU XẾP HẠNG, CHỌN/LOẠI VÀ NHÃN
 NHẬP/XUẤT XẾP HẠNG VÀ XỬ LÝ HÀNG LOẠT
 • Xuất xếp hạng lưu số sao, trạng thái chọn và nhãn màu của các tệp trong thư mục vào một tệp văn bản UTF-8; Nhập xếp hạng áp dụng lại cho các tệp cùng tên. Định dạng tệp xuất (dòng đầu, dòng cuối và tên cột) luôn bằng tiếng Anh để có thể dùng chung giữa các ngôn ngữ.
 • Xử lý hàng loạt áp dụng xếp hạng, trạng thái chọn hoặc nhãn cho danh sách tên tệp được dán hoặc nạp từ một thư mục khác.
+• Nếu một tệp bị ứng dụng khác khóa quá lâu, chỉ tệp đó bị bỏ qua; các tệp còn lại trong lô vẫn được xử lý.
+• Nếu không đọc hết được thư mục nguồn (mất kết nối mạng, rút ổ đĩa), QuickSift báo lỗi thay vì âm thầm dùng danh sách thiếu.
 
 QUẢN LÝ TỆP
 • Copy: sao chép ảnh đã chọn sang thư mục khác và hiện thông báo hoàn tất trong 2 giây.
@@ -1197,6 +1251,18 @@ THÔNG TIN VÀ CÀI ĐẶT
 • INFO hiển thị EXIF của ảnh đang hoạt động.
 • Settings điều khiển huy hiệu, giao diện, ngôn ngữ và cách ghi metadata.
 • Đổi ngôn ngữ cập nhật ngay mọi nhãn, tiêu đề, trạng thái và phần nội dung đang mở.
+• Giao diện Sáng/Tối được áp dụng trước khi cửa sổ xuất hiện (không còn chớp tối) và đổi giao diện vẽ lại mọi phần, kể cả chỉ báo ở khung trái.
+• Khi đóng ứng dụng, nhập/xuất xếp hạng hoặc xử lý hàng loạt phải chờ, một hộp thoại cập nhật liên tục cho biết đang chờ gì: thao tác, tệp, số còn lại, thời gian chờ và lý do (tệp bị ứng dụng khác khóa, đang thử ghi lại, tiến trình xếp hạng, thay đổi chưa lưu). Khi đóng có nút Buộc thoát (hủy tác vụ, lưu những gì có thể và ghi lại phần bị bỏ); với các thao tác khác có Hủy thao tác hoặc Ngừng chờ. Chi tiết được ghi vào nhật ký chẩn đoán.
+• Metadata: "Ghi metadata vào tệp RAW", "… JPG/PNG" và "… TIFF" là công tắc (sáng = bật). Bật: xếp hạng, chọn/loại và nhãn được ghi vào chính tệp đó (an toàn: bản sao tạm được kiểm tra rồi thay thế). Tắt: ghi vào tệp XMP đi kèm (ví dụ IMG_0001.xmp cho RAW), không đụng tới ảnh gốc. Mặc định: RAW dùng XMP, JPG/PNG/TIFF ghi vào tệp. "Ghi JPG an toàn" dùng bản sao tạm có kiểm tra cho JPG (chậm hơn nhưng không làm hỏng tệp gốc).
+• Xếp hạng/chọn ảnh RAW hiển thị ngay; tệp XMP được ghi nền và chỉ đọc lại tệp XMP, không phân tích lại toàn bộ tệp RAW.
+• HUD hiệu năng: mặc định nằm dưới thanh tìm kiếm, trong vùng ảnh; kéo bằng tay nắm ở cạnh trên để di chuyển; vị trí được ghi nhớ và không bao giờ bị che bởi thanh tìm kiếm hay nút khác. Phần còn lại của HUD không chặn chuột.
+• Ngăn bên trái cuộn được khi nội dung dài hơn ngăn (con lăn chuột, thanh cuộn theo giao diện, phím Tab tự cuộn tới nút đang chọn); mỗi thẻ nhớ vị trí cuộn riêng.
+• Nút có chữ bị cắt (…) hiện chú giải đầy đủ khi rê chuột; chú giải theo giao diện Sáng/Tối.
+• Nhật ký chẩn đoán: Làm mới cuộn tới mục mới nhất; ô "Tự động làm mới" (mặc định tắt) làm mới mỗi giây.
+• Nhật ký các phiên trước: trong cửa sổ Nhật ký chẩn đoán, bấm "Các phiên trước…" để chọn một nhật ký đã lưu (mới nhất ở trên, kèm thời điểm bắt đầu và dung lượng). Nhật ký mở ở chế độ chỉ đọc; với tệp lớn chỉ hiển thị 2 MB mới nhất. Không có gì bị xóa ở đây; nhật ký cũ hơn 7 ngày vẫn được tự động dọn.
+• Dọn tệp chẩn đoán cũ: vài giây sau khi khởi động, một luồng nền ưu tiên thấp xóa nhật ký phiên (QuickSiftData\Logs) và báo cáo sự cố/minidump (QuickSiftData\CrashReports) cũ hơn 7 ngày (theo thời gian sửa đổi cuối). Nhật ký của phiên hiện tại không bao giờ bị xóa; chỉ các tệp mang tên do QuickSift tạo trong hai thư mục này mới bị xóa, không đi theo liên kết (reparse point). Mỗi tệp đã xóa được ghi vào nhật ký chẩn đoán.
+• Lỗi đã được khắc phục: khi một bước nội bộ gặp lỗi và QuickSift tiếp tục an toàn, nhật ký chẩn đoán ghi một cảnh báo nêu tên bước đó ("… failed and continued: …"). Lỗi lặp lại được đếm ("N similar suppressed") thay vì làm tràn nhật ký.
+• HUD hiệu năng hiển thị hàng đợi theo từng làn, tác vụ đang chạy, số mục còn chờ (metadata, xếp hạng, chọn), tuổi tác vụ chờ lâu nhất, bộ nhớ đệm và tỉ lệ trúng, thời gian giải mã RAW/JPEG gần nhất, trạng thái tiến trình và lý do đang chặn.
 
 
 TÀI LIỆU KỸ THUẬT
@@ -1211,20 +1277,22 @@ GIẢI MÃ VÀ LẬP LỊCH
 • Số worker, số luồng codec, ngân sách buffer, mức đọc trước và độ sâu cache được suy ra từ RAM, CPU, GPU và loại ổ đĩa.
 • Yêu cầu lỗi thời bị hủy bằng generation/navigation epoch. Yêu cầu cùng nguồn được hợp nhất; chất lượng cao hơn có thể phục vụ các mức thấp hơn.
 • Cảnh báo khuôn mặt đánh giá từng khuôn mặt trên ảnh giải mã độ phân giải cao: độ chi tiết Laplacian chuẩn hóa theo kích thước và độ tương phản (lệch nét), độ dị hướng của chi tiết (nhòe chuyển động), và một phép kiểm tra lòng trắng mắt thận trọng (nhắm mắt). Tất cả chạy trên luồng nền và được lưu vào bộ nhớ đệm.
+• Mọi nút lọc (Stars, Pick state, Labels, Format, Date, ISO, Khẩu độ, Tiêu cự, Tốc độ màn trập, Máy ảnh, Giờ) đều có mũi tên thả xuống và cùng cách căn chỉnh.
+• Khi bật “Chỉ tải ảnh xem trước JPG cho RAW”, chế độ Một ảnh hiển thị JPG nhúng lớn nhất trong tệp RAW ở chất lượng đầy đủ.
+• Ảnh RAW đang xem (Một ảnh hoặc So sánh) có đủ thời gian giải mã; trước đây nhiều ảnh bị hủy sau 1,5 giây và thử lại nên trông như bị khựng hoặc kẹt.
 • JPEG dùng đường TurboJPEG khi có lợi; WIC là đường tương thích. RAW ưu tiên preview nhúng trước khi demosaic. AVIF dùng libavif/dav1d với libyuv.
-• WIC native transforms, thumbnail nhúng, progressive refinement và Direct2D image source theo nhu cầu được dùng khi codec/driver hỗ trợ.
+• WIC native transforms, thumbnail nhúng và progressive refinement được dùng khi codec/driver hỗ trợ.
 
 BỘ NHỚ
 • Mọi decode giữ reservation cho tới khi chủ sở hữu pixel cuối cùng giải phóng.
 • Cache RAM dùng admission chống quét: mục mới ở vùng thử nghiệm; mục được truy cập lại chuyển sang vùng bảo vệ. Prefetch nhàn rỗi không được đẩy ảnh tương tác ra khỏi cache.
-• Sự kiện bộ nhớ thấp của Windows, ngân sách DXGI và áp lực GPU có thể hạ giới hạn, hủy prefetch, trim image source và nhả buffer pool.
+• Sự kiện bộ nhớ thấp của Windows, ngân sách DXGI và áp lực GPU có thể hạ giới hạn, hủy prefetch, trim tile và nhả buffer pool.
 • Luồng nền dùng memory priority thấp và EcoQoS; luồng tương tác giữ ưu tiên bình thường.
 • Buffer tái sử dụng có giới hạn; vùng lớn nhàn rỗi có thể được decommit/offer cho Windows thay vì bị giữ vô thời hạn.
-• Sau khi rời So sánh, bitmap độ phân giải cao, tile, image source và phiên decoder không còn hoạt động được giải phóng sau một khoảng nhàn rỗi ngắn. Chế độ Một ảnh giữ ảnh hiện tại; máy nhiều RAM có thể giữ thêm ảnh lân cận. Windows có thể tạm giữ các trang đã giải phóng trong working set cho tới khi hệ thống cần RAM.
+• Sau khi rời So sánh, bitmap độ phân giải cao, tile và phiên decoder không còn hoạt động được giải phóng sau một khoảng nhàn rỗi ngắn. Chế độ Một ảnh giữ ảnh hiện tại; máy nhiều RAM có thể giữ thêm ảnh lân cận. Windows có thể tạm giữ các trang đã giải phóng trong working set cho tới khi hệ thống cần RAM.
 
 ĐỒ HỌA
-• Trên Windows 10+ với driver phù hợp, ảnh WIC lớn dùng ID2D1ImageSourceFromWic theo nhu cầu. Direct2D có thể giữ JPEG ở dạng luminance/chrominance và chỉ nạp tile cần thiết.
-• Nếu đường hiện đại không khả dụng, ứng dụng quay về bitmap BGRA và tile WIC.
+• Ảnh được vẽ từ bitmap BGRA và tile WIC chuẩn bị trên luồng nền.
 • Chất lượng hiển thị chỉ tăng: preview, thumbnail hoặc tile đến muộn không được thay thế nguồn sắc nét hơn đang hiển thị. Bitmap nền và tile dùng cùng tọa độ nguồn và tâm pan đã giới hạn.
 • Khi thu nhỏ hoặc thiếu bộ nhớ, tài nguyên đồ họa ngoài vùng nhìn được trim/offer; DXGI Trim chỉ chạy ở ranh giới nhàn rỗi thực sự.
 
@@ -1233,6 +1301,7 @@ I/O VÀ BỘ NHỚ ĐỆM Ổ ĐĨA
 • Đọc tuần tự dùng hint tuần tự; phiên pan/tile dùng hint ngẫu nhiên.
 • Tệp nén có thể được memory-map và prefetch có giới hạn; số lượt đọc trước phụ thuộc loại ổ đĩa và RAM.
 • Metadata dùng SQLite WAL với page-cache và mmap giới hạn. Bitmap/tile vẫn là tệp riêng để tránh làm phình database.
+• Với JPEG, xếp hạng/nhãn/trạng thái chọn được đọc trực tiếp từ gói XMP ở phần đầu tệp (một lần đọc có giới hạn); trường hợp bất thường vẫn dùng Exiv2 như trước. Ngày chụp và thông số chụp được đọc từ phần đầu tệp (64 KB, mở rộng tới 512 KB khi cần) trong một lần mở tệp.
 • Cache đĩa có giới hạn dung lượng, giới hạn khoảng trống, tuổi thọ, LRU gần đúng và dọn tệp mồ côi/tạm.
 • Pyramid nhiều độ phân giải chỉ được tạo cho ảnh rất lớn hoặc ảnh được xem lặp lại, và luôn nằm trong ngân sách ổ đĩa.
 
@@ -1252,6 +1321,15 @@ https://quicksift.pages.dev/
 GPL-2.0-or-later (See About QuickSift for the written offer for source code)
 
 QuickSift — Plain-language Help
+
+KEYBOARD SHORTCUTS
+• Navigation: Arrow keys (move), Home/End (first/last), Esc (back to thumbnails), Enter (open the selected photo).
+• Rating: 0 (clear), 1–5 (rate).
+• Pick/Reject: P (pick), X (reject), U (unmark).
+• Color labels: 6 (Red), 7 (Yellow), 8 (Green), 9 (Blue), Ctrl+5 (Purple), Ctrl+0 (clear label).
+• Viewing: Mouse wheel (zoom), Drag (pan), F (fit), Z (100%), R (rotate), F11 (fullscreen), F7 (filmstrip: fades in and out; click or scroll over the strip to change images; thumbnails show star-rating and Pick/Reject badges; on/off is remembered).
+• History: Ctrl+Z (undo), Ctrl+Y (redo).
+• Search (Thumbnail view): Ctrl+F (focus the search field), Enter/Tab/Down (apply and return to the grid), Esc (clear; press again to leave the field).
 
 GETTING STARTED
 • Open: choose a folder containing photos. The folder strip on the left lets you move into subfolders quickly.
@@ -1273,19 +1351,29 @@ VIEWING
 • Sync: in Compare view, keeps zoom and pan aligned between panes.
 • Face Lock: when a face is available, recenters on the face closest to the image centre when changing photos or zooming. Every detected face gets a faint outline; click an outline to make that face the target and zoom so it fills about 70% of the pane. The choice is remembered per photo (cleared if the file content changes).
 • Fullscreen / F11 fills the monitor and retracts the title bar into the top edge. Rest the pointer briefly against the top edge to reveal it. The bar floats over the photograph without resizing the image view; move away and it hides again.
-• Red thumbnail border: at least one face looks out of focus, motion-blurred, or has its eyes closed. Hover the border to see which face and why (for example “Face 2: eyes closed”). Thresholds are conservative and very small faces are not judged. Sunglasses, profiles, or squinting can cause false warnings; verify at 100% before rejecting the photo.
+• Red dashed thumbnail border (also on the filmstrip): at least one face looks out of focus, motion-blurred, or has its eyes closed. Hover the border to see which face and why (for example “Face 2: eyes closed”). Thresholds are conservative and very small faces are not judged. Sunglasses, profiles, or squinting can cause false warnings; verify at 100% before rejecting the photo.
 • Rotate left / right changes only the display orientation; it does not rotate the original file.
 
 FILTERING AND SORTING
 • Stars, Pick state, Labels, Format, and Date change what is visible; they do not delete files.
 • Selection is intentionally limited to visible results. If a filter hides a selected photo, it is removed from selection so it cannot remain an invisible command target.
 • Metadata filters accept only authoritative values; pending, unreadable, and unsupported custom values do not masquerade as unrated, unmarked, or unlabeled.
+• Format and Date list only the extensions and capture dates actually present in the folder.
+• ISO, Aperture, Focal length, Shutter, Camera, and Hour filter by shooting settings. Their lists contain only values present in the folder; camera names are the full model without a repeated make (“Canon EOS R5”, not “Canon Canon EOS R5”).
+• Shooting settings and capture dates are read in the background, after image display and your own actions, so opening a filter menu never freezes the window. In a large folder the first opening may not list every value yet; reopen the menu to see more. Active filters update by themselves as values arrive. Changing folders stops reading for the previous folder.
+• Settings that have been read are remembered and re-read automatically when a photo file changes, so edited photos no longer show stale values.
+• Filter-menu value lists are kept up to date as values arrive, so menus open instantly even in very large folders.
+• When no Stars, Pick state or Labels filter is on, ratings and labels of the photos on screen and nearby are read first; the rest are read when the computer is idle. Turning one of those filters on moves all remaining photos up the queue. “Metadata pending” stays shown until every photo has been read. Reading keeps making progress even while images decode, and a file that cannot be read is marked “unreadable” instead of staying pending.
 • Sort changes display order by name, date, rating, or format.
 • Thumbnail size changes the grid density.
 
 SEARCH
 • Thumbnail view has a floating search field at the top right. Press Ctrl+F or click it; results update as you type. Enter, Tab or Down apply the query and return to the grid; Esc clears it, and a second Esc leaves the field.
 • Search matches file names and user comments (accent-insensitive: “dam cuoi” finds “đám cưới”), capture times (8AM, 20h15), dates (date:12, date:friday, 2026-10-12), stars (5 stars, >=4 stars, unrated), colour labels (red, green) and pick states (picked, rejected).
+• Search by format (NEF, ARW, CR2, JPG; JPG also matches .jpeg files), relative dates (older than 7 days, newer than 2 months, today) and shooting settings (iso:400, f/4 or f:2.8, 50mm or focal:50, 1/125 or shutter:1/125, camera:nikon, lens:24-70). A fraction such as 9/10 is not read as a shutter speed (type date:9/10 to search by day).
+• Star ranges: 0 stars and up, 3 stars or more, 3 stars and above, at least 3 stars, no less than 3 stars, 5 stars and lower, 5 stars or less, at most 4 stars, no more than 4 stars, up to 4 stars, less than 5 stars, under 3 stars, below 3 stars, more than 2 stars, over 2 stars, above 2 stars; “star” works too. Symbol forms: >=3*, <5 stars, ≥3 stars, ≤4 stars. A star word (or *) is required, so a lone number is still a file-name search: “0” finds names containing 0, while “0 stars” finds unrated photos.
+• A photo with no rating in any source (XMP, sidecar, Windows properties) counts as 0 stars, as it is displayed and as the Unrated filter treats it. Photos not read yet do not match until read; the counter shows “…” meanwhile. Unreadable photos and custom values never count as 0 stars.
+• Put not, - or “không” before a term to exclude it; + is an explicit AND.
 • Quote a word (“red”) or use name:/comment: to search for that literal text.
 • Search is combined with the Filter tab (every term must match) and stays applied when you open a result in Single view. The counter shows shown of total.
 
@@ -1297,6 +1385,8 @@ SAVING RATINGS, PICKS AND LABELS
 IMPORT/EXPORT RATINGS AND BATCH PROCESSING
 • Export Ratings saves the stars, pick state and colour label of the folder's files to a UTF-8 text file; Import Ratings applies them again to files with the same names. The export file format (header, footer and column names) is always English so files can be shared between languages.
 • Batch Processing applies a rating, pick state or label to a list of file names that you paste or load from another folder.
+• If one file stays locked by another app for too long, only that file is skipped; the rest of the batch continues.
+• If the source folder cannot be listed completely (network drop, drive removed), QuickSift reports an error instead of silently using a partial list.
 
 FILE MANAGEMENT
 • Copy copies selected photos to another folder and shows a two-second completion toast.
@@ -1310,6 +1400,18 @@ INFO AND SETTINGS
 • INFO shows EXIF for the active photo.
 • Settings controls badges, appearance, language, and metadata-writing behavior.
 • Changing language immediately refreshes every caption, title, status string, and open documentation surface.
+• Light/Dark appearance is applied before the window appears (no dark flash), and switching theme redraws everything, including the left-pane indicator.
+• When closing, ratings import/export or Batch Processing has to wait, a live dialog shows what it is waiting for: the operation, file, how many are left, elapsed time and the reason (file locked by another app, write retry, ratings worker, unsaved edits). Close offers Force quit (cancels workers, flushes what it can and logs what was abandoned); the others offer Cancel operation or Stop waiting. Details are written to the diagnostic log.
+• Metadata: "Write metadata into RAW files", "… JPG/PNG files" and "… TIFF files" are switches (highlighted = on). On: ratings, pick states and labels are written inside that file (safely: a verified temporary copy replaces the original). Off: they go to an XMP sidecar next to it (e.g. IMG_0001.xmp for a RAW) and the image is never touched. Defaults: RAW uses XMP sidecars; JPG/PNG/TIFF write into the file. "Safe JPG writes" uses the verified temporary copy for JPGs too (slower, but cannot damage the original).
+• Rating or picking a RAW shows instantly; the XMP sidecar is written in the background and verified by re-reading only the sidecar, not by re-parsing the RAW.
+• Performance HUD: by default it sits inside the image area below the search bar. Drag it by the grip at its top edge; its position is remembered and is never left under the search bar or another control. The rest of the HUD stays click-through.
+• The left pane scrolls when its content is taller than the pane (mouse wheel, themed scrollbar, Tab scrolls the focused button into view); each tab remembers its own scroll position.
+• Buttons whose text is cut off (…) show the full text in a tooltip on hover; tooltips follow the Light/Dark theme.
+• Diagnostic log: Refresh scrolls to the newest entry; "Auto refresh" (off by default) refreshes every second.
+• Previous session logs: in the Diagnostic log window, click "Previous sessions…" and pick a saved log (newest first, with its start time and size). It opens read-only; for a large file only the newest 2 MB is shown. Nothing is deleted here; logs older than 7 days are still cleaned up automatically.
+• Old diagnostic files: a few seconds after startup, a low-priority background thread deletes session logs (QuickSiftData\Logs) and crash reports/minidumps (QuickSiftData\CrashReports) older than 7 days (by last-modified time). The current session's log is never deleted; only files with QuickSift's own names in those two folders are touched, and links (reparse points) are never followed. Each deleted file is recorded in the diagnostic log.
+• Recovered failures: when an internal step fails and QuickSift safely continues, the diagnostic log records one warning naming the step ("… failed and continued: …"). Repeats of the same failure are counted ("N similar suppressed") instead of flooding the log.
+• The Performance HUD shows per-lane queue depths, in-flight jobs, pending metadata/rating/pick counts, the oldest waiting job, cache size and hit rate, last RAW/JPEG decode times, worker states and the current blocking reason.
 
 
 TECHNICAL DOCUMENTATION
@@ -1324,20 +1426,22 @@ DECODING AND SCHEDULING
 • Worker counts, codec threads, buffer budgets, read-ahead, and cache depth are derived from RAM, CPU topology, GPU budget, and storage class.
 • Obsolete work is cancelled through generation/navigation epochs. Requests for the same source are coalesced; a higher-quality decode may satisfy lower levels.
 • The face warning analyzes every face on a high-resolution decode: Laplacian detail normalized by face size and contrast (defocus), directional detail anisotropy (motion blur), and a conservative sclera-visibility check (closed eyes). All analysis runs on worker threads and is cached.
+• Every filter button (Stars, Pick state, Labels, Format, Date, ISO, Aperture, Focal, Shutter, Camera, Hour) shows a dropdown arrow with the same alignment.
+• With “Load only JPG previews for RAW” on, Single view shows the largest JPEG embedded in the RAW at full quality.
+• The RAW you are viewing (Single or Compare) gets a full decode budget; previously many were cancelled after 1.5 s and retried, which looked choppy or stuck.
 • JPEG uses TurboJPEG when its measured path is advantageous, with WIC as compatibility fallback. RAW prefers embedded previews before demosaic. AVIF uses libavif/dav1d with libyuv.
-• WIC native transforms, embedded thumbnails, progressive refinement, and on-demand Direct2D image sources are used when the codec and driver support them.
+• WIC native transforms, embedded thumbnails and progressive refinement are used when the codec and driver support them.
 
 MEMORY
 • Every decode retains its reservation until the final pixel owner releases it.
 • The RAM cache uses scan-resistant admission: new entries begin in probation; repeatedly used entries graduate to protected storage. Idle prefetch cannot evict interactively reused images.
-• Windows low-memory events, DXGI budgets, and GPU pressure can lower limits, cancel prefetch, trim image sources, and release buffer pools.
+• Windows low-memory events, DXGI budgets, and GPU pressure can lower limits, cancel prefetch, trim tiles, and release buffer pools.
 • Background threads use low memory priority and EcoQoS; interactive work remains normal priority.
 • Reusable buffers are bounded; large idle regions can be decommitted or offered to Windows rather than retained indefinitely.
-• After Compare ends, inactive high-resolution bitmaps, tiles, image sources, and decoder sessions are released after a short idle delay. Single view keeps the active photo; higher-RAM systems may retain nearby photos. Windows may temporarily keep released pages in the process working set until the system needs them.
+• After Compare ends, inactive high-resolution bitmaps, tiles and decoder sessions are released after a short idle delay. Single view keeps the active photo; higher-RAM systems may retain nearby photos. Windows may temporarily keep released pages in the process working set until the system needs them.
 
 GRAPHICS
-• On Windows 10+ with a suitable driver, large WIC images use on-demand ID2D1ImageSourceFromWic. Direct2D can retain JPEG luminance/chrominance planes and populate only required tiles.
-• If the modern path is unavailable, the application falls back to BGRA bitmaps and WIC tiles.
+• Images are drawn from BGRA bitmaps and WIC tiles prepared on worker threads.
 • Display quality only moves upward: late previews, thumbnails, or tiles cannot replace a sharper source already on screen. The base bitmap and tile layer use the same source coordinates and clamped pan centre.
 • When minimized or under pressure, off-viewport graphics are trimmed/offered; DXGI Trim runs only at genuine idle boundaries.
 
@@ -1346,6 +1450,7 @@ I/O AND DISK CACHE
 • Whole-file reads use sequential hints; retained pan/tile sessions use random-access hints.
 • Encoded sources may be memory-mapped with bounded prefetch; read-ahead depth follows storage and RAM characteristics.
 • Metadata uses SQLite WAL with bounded page-cache and mmap settings. Bitmap/tile payloads remain separate files to avoid database bloat.
+• For JPEG, rating/label/pick come straight from the XMP packet in the file header (one bounded read); unusual files still use Exiv2 as before. Capture time and camera settings come from the file header (64 KB, widened to 512 KB when needed) in a single file open.
 • Disk cache management enforces capacity, free-space reserve, age, approximate LRU, and orphan/temporary cleanup.
 • Multi-resolution pyramids are created only for very large or repeatedly inspected images and remain under the disk budget.
 

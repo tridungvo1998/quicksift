@@ -1,5 +1,6 @@
 // OWNER: Themed document and popup runtime implementation.
 #include "app/application_support.h"
+#include "ui/ui_layout_constants.h"
 
 namespace quicksift::app {
 // CODE GUIDE: See CODE_GUIDE.md -> "Where new code goes".
@@ -240,6 +241,8 @@ bool EnsureRichEditLoaded() {
 LRESULT CALLBACK DocumentWindowSubclassProc(HWND window, UINT message, WPARAM wParam,
     LPARAM lParam, UINT_PTR subclassId, DWORD_PTR reference);
 
+namespace doc = quicksift::ui::layout::document;
+
 namespace {
 // Background gradient, custom title bar (close light), the rounded content panel
 // that wraps the text control, and the accent strip. Called once per WM_PAINT.
@@ -252,11 +255,11 @@ void PaintDocumentChrome(HWND window, const DocumentWindowState* state, HDC dc, 
     wchar_t titleText[256]{};
     GetWindowTextW(window, titleText, static_cast<int>(std::size(titleText)));
     title.title = titleText;
-    title.titleTextRect = { px(16), 0, client.right - px(80), titleHeight };
+    title.titleTextRect = { px(doc::kTitleTextLeftDip), 0, client.right - px(doc::kTitleTextRightReserveDip), titleHeight };
     title.titleFont = state->semiboldFont ? state->semiboldFont : state->normalFont;
     title.active = GetActiveWindow() == window;
-    const int diameter = px(12);
-    const int rightMargin = px(15);
+    const int diameter = px(doc::kCloseLightDiameterDip);
+    const int rightMargin = px(doc::kCloseLightRightMarginDip);
     const int closeTop = (titleHeight - diameter) / 2;
     title.trafficLights[0].rect = { client.right - rightMargin - diameter, closeTop,
         client.right - rightMargin, closeTop + diameter };
@@ -271,19 +274,321 @@ void PaintDocumentChrome(HWND window, const DocumentWindowState* state, HDC dc, 
         RECT panel{};
         GetWindowRect(state->edit, &panel);
         MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&panel), 2);
-        InflateRect(&panel, px(2), px(2));
+        InflateRect(&panel, px(doc::kPanelInsetDip), px(doc::kPanelInsetDip));
         state->framework->PaintPanel(dc, panel,
             quicksift::ui::framework::PanelPresentation{ false, false,
                 quicksift::ui::layout::kDocumentPanelRadiusDip },
             state->theme, dpi);
     }
     RECT accent = client;
-    accent.left += px(22);
-    accent.right -= px(22);
-    accent.top = titleHeight + px(7);
-    accent.bottom = titleHeight + px(10);
+    accent.left += px(doc::kAccentInsetXDip);
+    accent.right -= px(doc::kAccentInsetXDip);
+    accent.top = titleHeight + px(doc::kAccentTopDip);
+    accent.bottom = titleHeight + px(doc::kAccentBottomDip);
     state->framework->PaintAccentStrip(dc, accent, state->theme);
 }
+} // namespace
+
+constexpr UINT_PTR kDocumentAutoRefreshTimer = 0x5105;
+constexpr UINT kDocumentAutoRefreshMs = 1000;
+
+// Refresh shows the newest entry (last line). Auto refresh skips the re-render
+// when the snapshot is unchanged, so an idle log costs one string compare.
+void RefreshDiagnosticDocument(DocumentWindowState* state, bool force) {
+    if (!state || !state->edit) return;
+    std::wstring text = quicksift::diagnostics::SnapshotText();
+    if (!force && text.size() == state->lastLogSize && text == state->lastLogText) return;
+    SetDocumentControlText(state->edit, text, false, state->richEdit, state->theme);
+    state->lastLogSize = text.size();
+    state->lastLogText = std::move(text);
+    ScrollDocumentToEnd(state->edit);
+}
+
+// ---- Document window procedure helpers (0.9.5.0 round 19: split out of
+// DocumentWindowSubclassProcImpl with no behaviour change).
+namespace {
+
+// Per-window DPI scaling, as the inline px() lambdas did (never below 1 px).
+struct DocumentMetrics {
+    UINT dpi = USER_DEFAULT_SCREEN_DPI;
+    int Px(int dip) const { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); }
+};
+
+DocumentMetrics DocumentMetricsFor(HWND window) {
+    return DocumentMetrics{ std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window)) };
+}
+
+// The title-bar close light's hit rectangle, in client coordinates.
+RECT DocumentTitleCloseRect(HWND window, const DocumentMetrics& metrics) {
+    RECT client{};
+    GetClientRect(window, &client);
+    const int titleHeight = metrics.Px(quicksift::ui::layout::kTitleBarHeightDip);
+    const int diameter = metrics.Px(doc::kCloseLightDiameterDip);
+    const int rightMargin = metrics.Px(doc::kCloseLightRightMarginDip);
+    RECT closeRect{ client.right - rightMargin - diameter, (titleHeight - diameter) / 2,
+        client.right - rightMargin, (titleHeight - diameter) / 2 + diameter };
+    InflateRect(&closeRect, metrics.Px(doc::kCloseHitInflateXDip), metrics.Px(doc::kCloseHitInflateYDip));
+    return closeRect;
+}
+
+// Position of a child's vertical centre within the window's background gradient.
+float DocumentGradientPosition(HWND window, HWND item) {
+    RECT client{};
+    RECT itemRect{};
+    GetClientRect(window, &client);
+    GetWindowRect(item, &itemRect);
+    MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&itemRect), 2);
+    const int clientHeight = std::max(1, static_cast<int>(client.bottom - client.top));
+    return std::clamp(static_cast<float>((itemRect.top + itemRect.bottom) / 2) /
+        static_cast<float>(clientHeight), 0.0f, 1.0f);
+}
+
+// WM_NCHITTEST: resize borders, the close light (client) and the caption strip.
+std::optional<LRESULT> DocumentHitTest(HWND window, LPARAM lParam) {
+    POINT screenPoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    RECT windowRect{};
+    GetWindowRect(window, &windowRect);
+    const DocumentMetrics metrics = DocumentMetricsFor(window);
+    const int border = metrics.Px(doc::kResizeBorderDip);
+    const bool left = screenPoint.x < windowRect.left + border;
+    const bool right = screenPoint.x >= windowRect.right - border;
+    const bool top = screenPoint.y < windowRect.top + border;
+    const bool bottom = screenPoint.y >= windowRect.bottom - border;
+    if (top && left) return HTTOPLEFT;
+    if (top && right) return HTTOPRIGHT;
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (bottom) return HTBOTTOM;
+    POINT clientPoint = screenPoint;
+    ScreenToClient(window, &clientPoint);
+    const int titleHeight = metrics.Px(quicksift::ui::layout::kTitleBarHeightDip);
+    const RECT closeRect = DocumentTitleCloseRect(window, metrics);
+    if (PtInRect(&closeRect, clientPoint)) return HTCLIENT;
+    if (clientPoint.y >= 0 && clientPoint.y < titleHeight) return HTCAPTION;
+    return std::nullopt;
+}
+
+// One double-buffered pass (background, title bar, content panel, accent strip).
+// WS_CLIPCHILDREN keeps it off the edit and buttons. It used to paint the chrome
+// in WM_ERASEBKGND and again (unbuffered) in WM_PAINT, over the children: visible
+// flicker on every resize.
+void PaintDocumentWindowBuffered(HWND window, DocumentWindowState* state) {
+    PAINTSTRUCT paint{};
+    HDC target = BeginPaint(window, &paint);
+    RECT client{};
+    GetClientRect(window, &client);
+    const int width = std::max(1, static_cast<int>(client.right - client.left));
+    const int height = std::max(1, static_cast<int>(client.bottom - client.top));
+    HDC buffer = target ? CreateCompatibleDC(target) : nullptr;
+    HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, width, height) : nullptr;
+    HGDIOBJ previous = bitmap ? SelectObject(buffer, bitmap) : nullptr;
+    const bool buffered = previous && previous != HGDI_ERROR;
+    HDC dc = buffered ? buffer : target;
+    if (dc) PaintDocumentChrome(window, state, dc, client);
+    if (buffered) {
+        BitBlt(target, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
+        SelectObject(buffer, previous);
+    }
+    if (bitmap) DeleteObject(bitmap);
+    if (buffer) DeleteDC(buffer);
+    EndPaint(window, &paint);
+}
+
+// WM_DRAWITEM for the owner-drawn checkboxes and buttons. Returns true when drawn.
+bool DrawDocumentControl(HWND window, DocumentWindowState* state, const DRAWITEMSTRUCT* draw) {
+    if (draw && (draw->hwndItem == state->verboseLogging || draw->hwndItem == state->autoRefresh)) {
+        wchar_t caption[128]{};
+        GetWindowTextW(draw->hwndItem, caption, static_cast<int>(std::size(caption)));
+        const float t = DocumentGradientPosition(window, draw->hwndItem);
+        state->framework->PaintCheckbox(draw->hDC, draw->rcItem, caption,
+            quicksift::ui::framework::MacOsUiFramework::IsCheckboxChecked(draw->hwndItem),
+            state->framework->IsButtonHot(draw->hwndItem), (draw->itemState & ODS_FOCUS) != 0,
+            (draw->itemState & ODS_DISABLED) != 0, state->theme, quicksift::ui::GetWindowDpi(window),
+            state->normalFont, quicksift::ui::BlendColor(state->theme.windowTop, state->theme.windowBottom, t));
+        return true;
+    }
+    if (draw && (draw->hwndItem == state->close || draw->hwndItem == state->refresh ||
+        draw->hwndItem == state->exportButton || draw->hwndItem == state->previousSessions)) {
+        wchar_t caption[128]{};
+        GetWindowTextW(draw->hwndItem, caption, static_cast<int>(std::size(caption)));
+        quicksift::ui::framework::ButtonPresentation presentation{};
+        presentation.text = caption;
+        presentation.role = quicksift::ui::framework::ButtonRole::Standard;
+        presentation.state.hot = state->framework->IsButtonHot(draw->hwndItem);
+        presentation.state.pressed = (draw->itemState & ODS_SELECTED) != 0;
+        presentation.state.disabled = (draw->itemState & ODS_DISABLED) != 0;
+        presentation.state.focused = (draw->itemState & ODS_FOCUS) != 0;
+        presentation.hoverBlend = state->framework->ButtonHoverBlend(draw->hwndItem);
+        presentation.pressBlend = presentation.state.pressed ? 1.0f : 0.0f;
+        {
+            // The buttons sit on the window's vertical background gradient:
+            // sample it at the button's centre for the AA corner colour.
+            const float t = DocumentGradientPosition(window, draw->hwndItem);
+            presentation.parentSurface = static_cast<std::uint32_t>(
+                quicksift::ui::BlendColor(state->theme.windowTop, state->theme.windowBottom, t));
+        }
+        state->framework->PaintButton(draw->hDC, draw->rcItem, presentation,
+            state->theme, quicksift::ui::GetWindowDpi(window),
+            state->normalFont, state->semiboldFont);
+        return true;
+    }
+    return false;
+}
+
+void TrackDocumentTitleHover(HWND window, DocumentWindowState* state, LPARAM lParam) {
+    const RECT closeRect = DocumentTitleCloseRect(window, DocumentMetricsFor(window));
+    POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    const bool hot = PtInRect(&closeRect, point) != FALSE;
+    if (hot != state->titleCloseHot) {
+        state->titleCloseHot = hot;
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    if (!GetPropW(window, L"QuickSift.DocumentTrackingMouse")) {
+        SetPropW(window, L"QuickSift.DocumentTrackingMouse", reinterpret_cast<HANDLE>(1));
+        TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0 };
+        TrackMouseEvent(&track);
+    }
+}
+
+// Returns true when the press landed on the close light (capture taken).
+bool BeginDocumentTitleClosePress(HWND window, DocumentWindowState* state, LPARAM lParam) {
+    const RECT closeRect = DocumentTitleCloseRect(window, DocumentMetricsFor(window));
+    POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    if (PtInRect(&closeRect, point)) {
+        state->titleClosePressed = true;
+        state->titleCloseHot = true;
+        SetCapture(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return true;
+    }
+    return false;
+}
+
+void EndDocumentTitleClosePress(HWND window, DocumentWindowState* state, LPARAM lParam) {
+    state->titleClosePressed = false;
+    ReleaseCapture();
+    const RECT closeRect = DocumentTitleCloseRect(window, DocumentMetricsFor(window));
+    POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    const bool activate = PtInRect(&closeRect, point) != FALSE;
+    state->titleCloseHot = activate;
+    InvalidateRect(window, nullptr, FALSE);
+    if (activate) DestroyWindow(window);
+}
+
+// WM_SIZE: the edit fills the content area; the action row (checkboxes, Refresh,
+// Export, Close) sits along the bottom edge.
+void LayoutDocumentWindow(HWND window, DocumentWindowState* state, int width, int height) {
+    const DocumentMetrics metrics = DocumentMetricsFor(window);
+    const auto px = [&metrics](int dip) { return metrics.Px(dip); };
+    // Keep the action row close to the window edges. Use a slightly smaller
+    // bottom inset than the horizontal inset so the Close button sits visually
+    // balanced against the right edge without leaving a large strip below it.
+    const int horizontalMargin = px(doc::kHorizontalMarginDip);
+    const int bottomMargin = px(doc::kBottomMarginDip);
+    const int topMargin = px(quicksift::ui::layout::kTitleBarHeightDip + doc::kContentGapBelowTitleDip);
+    const int buttonGap = px(doc::kButtonGapDip);
+    const int buttonWidth = px(doc::kButtonWidthDip);
+    const int buttonHeight = px(doc::kButtonHeightDip);
+    const int margin = horizontalMargin;
+    if (state->edit) MoveWindow(state->edit, margin, topMargin,
+        std::max(1, width - margin * 2),
+        std::max(1, height - topMargin - bottomMargin - buttonGap - buttonHeight), TRUE);
+    const int buttonY = std::max(topMargin, height - bottomMargin - buttonHeight);
+    auto positionButtonSized = [&](HWND button, int x, int widthPx) {
+        if (!button) return;
+        MoveWindow(button, x, buttonY, widthPx, buttonHeight, TRUE);
+        if (state->framework) {
+            state->framework->ApplyAntialiasedControlRegion(button, widthPx,
+                buttonHeight, px(quicksift::ui::layout::kButtonRadiusDip));
+        }
+    };
+    auto positionButton = [&](HWND button, int x) { positionButtonSized(button, x, buttonWidth); };
+    const int closeX = std::max(margin, width - margin - buttonWidth);
+    positionButton(state->close, closeX);
+    if (state->exportButton) positionButton(state->exportButton,
+        std::max(margin, closeX - buttonGap - buttonWidth));
+    if (state->refresh) positionButton(state->refresh,
+        std::max(margin, closeX - (buttonGap + buttonWidth) * 2));
+    // "Previous sessions…" (session log browser) sits left of Refresh.
+    const int wideButtonWidth = px(doc::kWideButtonWidthDip);
+    const int previousX = std::max(margin, closeX - (buttonGap + buttonWidth) * 2 - buttonGap - wideButtonWidth);
+    if (state->previousSessions) positionButtonSized(state->previousSessions, previousX, wideButtonWidth);
+    // Checkboxes share the row left of the buttons; widths follow the
+    // localized captions (measured) so EN and VI never clip.
+    int checkX = margin;
+    const int rightLimit = state->previousSessions ? previousX - buttonGap :
+        (state->refresh ? std::max(margin, closeX - (buttonGap + buttonWidth) * 2) - buttonGap : closeX);
+    for (HWND check : { state->verboseLogging, state->autoRefresh }) {
+        if (!check) continue;
+        wchar_t caption[128]{};
+        GetWindowTextW(check, caption, static_cast<int>(std::size(caption)));
+        int textWidth = px(doc::kCheckboxFallbackTextWidthDip);
+        if (HDC dc = GetDC(check)) {
+            HGDIOBJ old = state->normalFont ? SelectObject(dc, state->normalFont) : nullptr;
+            SIZE size{};
+            if (GetTextExtentPoint32W(dc, caption, lstrlenW(caption), &size)) textWidth = size.cx;
+            if (old) SelectObject(dc, old);
+            ReleaseDC(check, dc);
+        }
+        const int checkWidth = std::max(1, std::min(textWidth + px(doc::kCheckboxGlyphReserveDip), rightLimit - checkX));
+        MoveWindow(check, checkX, buttonY, checkWidth, buttonHeight, TRUE);
+        checkX += checkWidth + px(doc::kCheckboxGapDip);
+    }
+}
+
+// WM_COMMAND for the document buttons. Returns true when handled.
+bool HandleDocumentCommand(HWND window, DocumentWindowState* state, WPARAM wParam) {
+    if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
+        DestroyWindow(window);
+        return true;
+    }
+    if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_EXPORT) {
+        std::filesystem::path exported;
+        if (quicksift::diagnostics::ExportSnapshotInteractive(window, &exported)) {
+            QS_LOG_INFO(L"Diagnostics", L"Diagnostic snapshot exported to " + exported.wstring());
+            const std::wstring heading = state->Tr ? state->Tr(L"Diagnostic log exported to:")
+                                                   : std::wstring(L"Diagnostic log exported to:");
+            MessageBoxW(window, (heading + L"\r\n\r\n" + exported.wstring()).c_str(),
+                L"QuickSift", MB_OK | MB_ICONINFORMATION);
+        } else if (!exported.empty() || CommDlgExtendedError() != 0) {
+            QS_LOG_WARNING(L"Diagnostics", L"Diagnostic snapshot export failed");
+            const std::wstring failure = state->Tr
+                ? state->Tr(L"QuickSift could not export the diagnostic log to that location.")
+                : std::wstring(L"QuickSift could not export the diagnostic log to that location."); // loc-key
+            MessageBoxW(window, failure.c_str(), L"QuickSift", MB_OK | MB_ICONWARNING);
+        }
+        return true;
+    }
+    if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_VERBOSE) {
+        using quicksift::ui::framework::MacOsUiFramework;
+        const bool enabled = !MacOsUiFramework::IsCheckboxChecked(state->verboseLogging);
+        MacOsUiFramework::SetCheckboxChecked(state->verboseLogging, enabled);
+        quicksift::diagnostics::SetVerboseLogging(enabled);
+        return true;
+    }
+    if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_AUTO_REFRESH) {
+        using quicksift::ui::framework::MacOsUiFramework;
+        const bool enabled = !MacOsUiFramework::IsCheckboxChecked(state->autoRefresh);
+        MacOsUiFramework::SetCheckboxChecked(state->autoRefresh, enabled);
+        if (enabled) SetTimer(window, kDocumentAutoRefreshTimer, kDocumentAutoRefreshMs, nullptr);
+        else KillTimer(window, kDocumentAutoRefreshTimer);
+        return true;
+    }
+    if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_PREVIOUS_SESSIONS) {
+        // Read-only browser: the application lists the Logs folder off the UI
+        // thread, then shows the dropdown under this button.
+        if (state->browseSessionLogs) state->browseSessionLogs(window, state->previousSessions);
+        return true;
+    }
+    if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_REFRESH) {
+        RefreshDiagnosticDocument(state, true);
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARAM wParam,
@@ -308,62 +613,12 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
         return TRUE;
     case WM_NCHITTEST:
         if (state) {
-            POINT screenPoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            RECT windowRect{};
-            GetWindowRect(window, &windowRect);
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            const int border = px(7);
-            const bool left = screenPoint.x < windowRect.left + border;
-            const bool right = screenPoint.x >= windowRect.right - border;
-            const bool top = screenPoint.y < windowRect.top + border;
-            const bool bottom = screenPoint.y >= windowRect.bottom - border;
-            if (top && left) return HTTOPLEFT;
-            if (top && right) return HTTOPRIGHT;
-            if (bottom && left) return HTBOTTOMLEFT;
-            if (bottom && right) return HTBOTTOMRIGHT;
-            if (left) return HTLEFT;
-            if (right) return HTRIGHT;
-            if (bottom) return HTBOTTOM;
-            POINT clientPoint = screenPoint;
-            ScreenToClient(window, &clientPoint);
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            RECT client{};
-            GetClientRect(window, &client);
-            RECT closeRect{ client.right - rightMargin - diameter, (titleHeight - diameter) / 2,
-                client.right - rightMargin, (titleHeight - diameter) / 2 + diameter };
-            InflateRect(&closeRect, px(4), px(5));
-            if (PtInRect(&closeRect, clientPoint)) return HTCLIENT;
-            if (clientPoint.y >= 0 && clientPoint.y < titleHeight) return HTCAPTION;
+            if (const auto hit = DocumentHitTest(window, lParam)) return *hit;
         }
         break;
     case WM_PAINT:
         if (state && state->framework) {
-            // One double-buffered pass (background, title bar, content panel,
-            // accent strip). WS_CLIPCHILDREN keeps it off the edit and buttons.
-            // It used to paint the chrome in WM_ERASEBKGND and again (unbuffered)
-            // in WM_PAINT, over the children: visible flicker on every resize.
-            PAINTSTRUCT paint{};
-            HDC target = BeginPaint(window, &paint);
-            RECT client{};
-            GetClientRect(window, &client);
-            const int width = std::max(1, static_cast<int>(client.right - client.left));
-            const int height = std::max(1, static_cast<int>(client.bottom - client.top));
-            HDC buffer = target ? CreateCompatibleDC(target) : nullptr;
-            HBITMAP bitmap = buffer ? CreateCompatibleBitmap(target, width, height) : nullptr;
-            HGDIOBJ previous = bitmap ? SelectObject(buffer, bitmap) : nullptr;
-            const bool buffered = previous && previous != HGDI_ERROR;
-            HDC dc = buffered ? buffer : target;
-            if (dc) PaintDocumentChrome(window, state, dc, client);
-            if (buffered) {
-                BitBlt(target, 0, 0, width, height, buffer, 0, 0, SRCCOPY);
-                SelectObject(buffer, previous);
-            }
-            if (bitmap) DeleteObject(bitmap);
-            if (buffer) DeleteDC(buffer);
-            EndPaint(window, &paint);
+            PaintDocumentWindowBuffered(window, state);
             return 0;
         }
         break;
@@ -381,66 +636,11 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
         }
         break;
     case WM_DRAWITEM:
-        if (state && state->framework) {
-            auto* draw = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
-            if (draw && (draw->hwndItem == state->close || draw->hwndItem == state->refresh ||
-                draw->hwndItem == state->exportButton)) {
-                wchar_t caption[128]{};
-                GetWindowTextW(draw->hwndItem, caption, static_cast<int>(std::size(caption)));
-                quicksift::ui::framework::ButtonPresentation presentation{};
-                presentation.text = caption;
-                presentation.role = quicksift::ui::framework::ButtonRole::Standard;
-                presentation.state.hot = state->framework->IsButtonHot(draw->hwndItem);
-                presentation.state.pressed = (draw->itemState & ODS_SELECTED) != 0;
-                presentation.state.disabled = (draw->itemState & ODS_DISABLED) != 0;
-                presentation.state.focused = (draw->itemState & ODS_FOCUS) != 0;
-                presentation.hoverBlend = state->framework->ButtonHoverBlend(draw->hwndItem);
-                presentation.pressBlend = presentation.state.pressed ? 1.0f : 0.0f;
-                {
-                    // The buttons sit on the window's vertical background gradient:
-                    // sample it at the button's centre for the AA corner colour.
-                    RECT client{};
-                    RECT item{};
-                    GetClientRect(window, &client);
-                    GetWindowRect(draw->hwndItem, &item);
-                    MapWindowPoints(nullptr, window, reinterpret_cast<POINT*>(&item), 2);
-                    const int clientHeight = std::max(1, static_cast<int>(client.bottom - client.top));
-                    const float t = std::clamp(static_cast<float>((item.top + item.bottom) / 2) /
-                        static_cast<float>(clientHeight), 0.0f, 1.0f);
-                    presentation.parentSurface = static_cast<std::uint32_t>(
-                        quicksift::ui::BlendColor(state->theme.windowTop, state->theme.windowBottom, t));
-                }
-                state->framework->PaintButton(draw->hDC, draw->rcItem, presentation,
-                    state->theme, quicksift::ui::GetWindowDpi(window),
-                    state->normalFont, state->semiboldFont);
-                return TRUE;
-            }
-        }
+        if (state && state->framework &&
+            DrawDocumentControl(window, state, reinterpret_cast<DRAWITEMSTRUCT*>(lParam))) return TRUE;
         break;
     case WM_MOUSEMOVE:
-        if (state) {
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            RECT client{};
-            GetClientRect(window, &client);
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            RECT closeRect{ client.right - rightMargin - diameter, (titleHeight - diameter) / 2,
-                client.right - rightMargin, (titleHeight - diameter) / 2 + diameter };
-            InflateRect(&closeRect, px(4), px(5));
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            const bool hot = PtInRect(&closeRect, point) != FALSE;
-            if (hot != state->titleCloseHot) {
-                state->titleCloseHot = hot;
-                InvalidateRect(window, nullptr, FALSE);
-            }
-            if (!GetPropW(window, L"QuickSift.DocumentTrackingMouse")) {
-                SetPropW(window, L"QuickSift.DocumentTrackingMouse", reinterpret_cast<HANDLE>(1));
-                TRACKMOUSEEVENT track{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, window, 0 };
-                TrackMouseEvent(&track);
-            }
-        }
+        if (state) TrackDocumentTitleHover(window, state, lParam);
         return 0;
     case WM_MOUSELEAVE:
         if (state) {
@@ -450,46 +650,11 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
         RemovePropW(window, L"QuickSift.DocumentTrackingMouse");
         return 0;
     case WM_LBUTTONDOWN:
-        if (state) {
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            RECT client{};
-            GetClientRect(window, &client);
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            RECT closeRect{ client.right - rightMargin - diameter, (titleHeight - diameter) / 2,
-                client.right - rightMargin, (titleHeight - diameter) / 2 + diameter };
-            InflateRect(&closeRect, px(4), px(5));
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            if (PtInRect(&closeRect, point)) {
-                state->titleClosePressed = true;
-                state->titleCloseHot = true;
-                SetCapture(window);
-                InvalidateRect(window, nullptr, FALSE);
-                return 0;
-            }
-        }
+        if (state && BeginDocumentTitleClosePress(window, state, lParam)) return 0;
         break;
     case WM_LBUTTONUP:
         if (state && state->titleClosePressed) {
-            state->titleClosePressed = false;
-            ReleaseCapture();
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            RECT client{};
-            GetClientRect(window, &client);
-            const int titleHeight = px(quicksift::ui::layout::kTitleBarHeightDip);
-            const int diameter = px(12);
-            const int rightMargin = px(15);
-            RECT closeRect{ client.right - rightMargin - diameter, (titleHeight - diameter) / 2,
-                client.right - rightMargin, (titleHeight - diameter) / 2 + diameter };
-            InflateRect(&closeRect, px(4), px(5));
-            POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            const bool activate = PtInRect(&closeRect, point) != FALSE;
-            state->titleCloseHot = activate;
-            InvalidateRect(window, nullptr, FALSE);
-            if (activate) DestroyWindow(window);
+            EndDocumentTitleClosePress(window, state, lParam);
             return 0;
         }
         break;
@@ -515,78 +680,19 @@ LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARA
         return 0;
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) return 0;
-        if (state) {
-            const int width = LOWORD(lParam);
-            const int height = HIWORD(lParam);
-            const UINT dpi = std::max<UINT>(USER_DEFAULT_SCREEN_DPI, quicksift::ui::GetWindowDpi(window));
-            const auto px = [dpi](int dip) { return std::max(1, MulDiv(dip, static_cast<int>(dpi), USER_DEFAULT_SCREEN_DPI)); };
-            // Keep the action row close to the window edges. Use a slightly smaller
-            // bottom inset than the horizontal inset so the Close button sits visually
-            // balanced against the right edge without leaving a large strip below it.
-            const int horizontalMargin = px(8);
-            const int bottomMargin = px(6);
-            const int topMargin = px(quicksift::ui::layout::kTitleBarHeightDip + 18);
-            const int buttonGap = px(12);
-            const int buttonWidth = px(112);
-            const int buttonHeight = px(38);
-            const int margin = horizontalMargin;
-            if (state->edit) MoveWindow(state->edit, margin, topMargin,
-                std::max(1, width - margin * 2),
-                std::max(1, height - topMargin - bottomMargin - buttonGap - buttonHeight), TRUE);
-            const int buttonY = std::max(topMargin, height - bottomMargin - buttonHeight);
-            auto positionButton = [&](HWND button, int x) {
-                if (!button) return;
-                MoveWindow(button, x, buttonY, buttonWidth, buttonHeight, TRUE);
-                if (state->framework) {
-                    state->framework->ApplyAntialiasedControlRegion(button, buttonWidth,
-                        buttonHeight, px(quicksift::ui::layout::kButtonRadiusDip));
-                }
-            };
-            const int closeX = std::max(margin, width - margin - buttonWidth);
-            positionButton(state->close, closeX);
-            if (state->exportButton) positionButton(state->exportButton,
-                std::max(margin, closeX - buttonGap - buttonWidth));
-            if (state->refresh) positionButton(state->refresh,
-                std::max(margin, closeX - (buttonGap + buttonWidth) * 2));
-            if (state->verboseLogging) {
-                MoveWindow(state->verboseLogging, margin, buttonY, buttonWidth + px(20), buttonHeight, TRUE);
-            }
-        }
+        if (state) LayoutDocumentWindow(window, state, LOWORD(lParam), HIWORD(lParam));
         return 0;
     case WM_COMMAND:
-        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL) {
-            DestroyWindow(window);
-            return 0;
-        }
-        if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_EXPORT) {
-            std::filesystem::path exported;
-            if (quicksift::diagnostics::ExportSnapshotInteractive(window, &exported)) {
-                QS_LOG_INFO(L"Diagnostics", L"Diagnostic snapshot exported to " + exported.wstring());
-                const std::wstring heading = state->Tr ? state->Tr(L"Diagnostic log exported to:")
-                                                       : std::wstring(L"Diagnostic log exported to:");
-                MessageBoxW(window, (heading + L"\r\n\r\n" + exported.wstring()).c_str(),
-                    L"QuickSift", MB_OK | MB_ICONINFORMATION);
-            } else if (!exported.empty() || CommDlgExtendedError() != 0) {
-                QS_LOG_WARNING(L"Diagnostics", L"Diagnostic snapshot export failed");
-                const std::wstring failure = state->Tr
-                    ? state->Tr(L"QuickSift could not export the diagnostic log to that location.")
-                    : std::wstring(L"QuickSift could not export the diagnostic log to that location."); // loc-key
-                MessageBoxW(window, failure.c_str(), L"QuickSift", MB_OK | MB_ICONWARNING);
-            }
-            return 0;
-        }
-        if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_VERBOSE) {
-            const bool enabled = SendMessageW(state->verboseLogging, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            quicksift::diagnostics::SetVerboseLogging(enabled);
-            return 0;
-        }
-        if (state && state->diagnosticLog && LOWORD(wParam) == ID_DOCUMENT_REFRESH) {
-            SetDocumentControlText(state->edit, quicksift::diagnostics::SnapshotText(), false,
-                state->richEdit, state->theme);
+        if (HandleDocumentCommand(window, state, wParam)) return 0;
+        break;
+    case WM_TIMER:
+        if (state && state->diagnosticLog && wParam == kDocumentAutoRefreshTimer) {
+            RefreshDiagnosticDocument(state, false);
             return 0;
         }
         break;
     case WM_NCDESTROY:
+        KillTimer(window, kDocumentAutoRefreshTimer);
         RemovePropW(window, L"QuickSift.DocumentTrackingMouse");
         RemovePropW(window, kDocumentKindProperty);
         RemovePropW(window, kDocumentStateProperty);
@@ -626,4 +732,13 @@ LRESULT CALLBACK DocumentWindowSubclassProc(HWND window, UINT message, WPARAM wP
 }
 
 
+void ScrollDocumentToEnd(HWND edit) noexcept {
+    if (!edit) return;
+    const LRESULT length = SendMessageW(edit, WM_GETTEXTLENGTH, 0, 0);
+    SendMessageW(edit, EM_SETSEL, static_cast<WPARAM>(length), static_cast<LPARAM>(length));
+    SendMessageW(edit, EM_SCROLLCARET, 0, 0);
+    SendMessageW(edit, WM_VSCROLL, SB_BOTTOM, 0);
+}
+
 } // namespace quicksift::app
+

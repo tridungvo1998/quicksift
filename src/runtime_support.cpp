@@ -2,6 +2,7 @@
 // OWNER: Process security, storage identity, and native helper implementation; check every OS result.
 
 #include "runtime_support.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <algorithm>
 #include <array>
@@ -161,6 +162,7 @@ CpuTopology DetectCpuTopology() noexcept {
         }
     }
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"DetectCpuTopology");
         // Topology is an optimization input. Under extreme allocation pressure,
         // retain the active-processor fallback rather than failing application startup.
         topology.performanceCpuSets.clear();
@@ -442,6 +444,7 @@ void BoundedVirtualBufferPool::Return(VirtualBuffer buffer) noexcept {
         buffers_.push_back(std::move(buffer));
         retainedBytes_ += bytes;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"BoundedVirtualBufferPool::Return");
         // Read-ahead is opportunistic. Allocation failure should discard the
         // scratch buffer, never escape a Windows thread-pool callback.
     }
@@ -516,6 +519,7 @@ void ThreadPoolReadAhead::Queue(const fs::path& path) {
         key = ReadAheadPathKey(path);
         request->key = key;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ThreadPoolReadAhead::Queue");
         return;
     }
 
@@ -525,6 +529,7 @@ void ThreadPoolReadAhead::Queue(const fs::path& path) {
             pending_.size() >= maximumOutstanding_ || !pending_.insert(key).second) return;
         ++activeCount_;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ThreadPoolReadAhead::Queue [2]");
         return;
     }
 
@@ -568,6 +573,7 @@ void ThreadPoolReadAhead::UnblockPaths(const std::vector<fs::path>& paths) noexc
             else --found->second;
         }
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ThreadPoolReadAhead::UnblockPaths");
     }
 }
 
@@ -576,6 +582,7 @@ bool ThreadPoolReadAhead::IsBlocked(const std::wstring& key) const noexcept {
         std::lock_guard lock(mutex_);
         return blocked_.contains(key);
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ThreadPoolReadAhead::IsBlocked");
         return true;
     }
 }
@@ -643,6 +650,7 @@ void CALLBACK ThreadPoolReadAhead::WorkCallback(PTP_CALLBACK_INSTANCE instance, 
             }
         }
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ThreadPoolReadAhead::WorkCallback");
         // Read-ahead is a hint. Always release the pending slot and callback
         // object even under allocation pressure or an unexpected STL failure.
     }
@@ -673,6 +681,7 @@ bool ResourcePressureMonitor::StartWaitThread() noexcept {
         thread_ = std::thread([this] { Run(); });
         return true;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ResourcePressureMonitor::StartWaitThread");
         return false;
     }
 }
@@ -811,6 +820,7 @@ void ResourcePressureMonitor::Run() {
             }
         }
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Runtime", L"ResourcePressureMonitor::Run");
         // Monitoring is an optimization. A topology-allocation failure or other
         // unexpected exception must disable the monitor, not terminate the app.
     }

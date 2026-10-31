@@ -9,6 +9,7 @@
 #include "diagnostics/log_categories.h"
 #include "core/log_rate_limiter.h"
 #include "core/lock_order.h"
+#include "diagnostics/log_and_continue.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -256,7 +257,7 @@ fs::path SidecarPath(const fs::path& image) {
 std::wstring LowerPath(const fs::path& path) {
     std::wstring value;
     try { value = fs::weakly_canonical(path).wstring(); }
-    catch (...) { value = path.lexically_normal().wstring(); }
+    catch (...) { QS_LOG_AND_CONTINUE(L"Cache", L"LowerPath"); value = path.lexically_normal().wstring(); }
 #if defined(_WIN32)
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t c) {
         return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
@@ -331,6 +332,9 @@ int OpenSqlitePath(const fs::path& path, sqlite3** database) {
 }
 #endif
 
+#define QS_KEEP_CAMERA \
+    "(excluded.camera_settings_known=0 AND image_records.camera_settings_known=1 AND " \
+    "image_records.file_size=excluded.file_size AND image_records.modified_stamp=excluded.modified_stamp)"
 constexpr char kUpsertRecordSql[] =
     "INSERT INTO image_records(path,file_size,modified_stamp,sidecar_stamp,rating,color_label,pick_state,"
     "source_width,source_height,exif_text,faces,faces_scanned,face_blur_scanned,face_blurry,face_sharpness,last_access,"
@@ -372,10 +376,18 @@ constexpr char kUpsertRecordSql[] =
     "face_selection=CASE WHEN image_records.file_size=excluded.file_size AND "
     "image_records.modified_stamp=excluded.modified_stamp AND image_records.sidecar_stamp=excluded.sidecar_stamp "
     "AND ?26=0 THEN image_records.face_selection ELSE excluded.face_selection END,"
-    "iso=excluded.iso, aperture=excluded.aperture, focal_length=excluded.focal_length, "
-    "shutter_speed=excluded.shutter_speed, camera=excluded.camera, lens=excluded.lens, "
-    "camera_settings_known=excluded.camera_settings_known,"
+    // Camera index: a record that does not carry camera settings keeps the indexed
+    // ones while the image is unchanged (same size and modification stamp); a
+    // changed image drops them so they are re-read (no stale ISO/lens).
+    "iso=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.iso ELSE excluded.iso END,"
+    "aperture=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.aperture ELSE excluded.aperture END,"
+    "focal_length=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.focal_length ELSE excluded.focal_length END,"
+    "shutter_speed=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.shutter_speed ELSE excluded.shutter_speed END,"
+    "camera=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.camera ELSE excluded.camera END,"
+    "lens=CASE WHEN " QS_KEEP_CAMERA " THEN image_records.lens ELSE excluded.lens END,"
+    "camera_settings_known=CASE WHEN " QS_KEEP_CAMERA " THEN 1 ELSE excluded.camera_settings_known END,"
     "last_access=excluded.last_access;";
+#undef QS_KEEP_CAMERA
 
 void BindRecord(sqlite3_stmt* statement, const std::wstring& key, const CachedImageRecord& record) {
     BindText16(statement, 1, key);
@@ -644,7 +656,7 @@ void PersistentCache::CloseDatabase() {
 }
 
 void PersistentCache::CloseForShutdown() noexcept {
-    try { CloseDatabase(); } catch (...) {}
+    try { CloseDatabase(); } catch (...) { QS_LOG_AND_CONTINUE(L"Cache", L"PersistentCache::CloseForShutdown"); }
 }
 
 bool PersistentCache::MigrateSchema(int fromVersion) {
@@ -778,11 +790,12 @@ void PersistentCache::DrainDeferredWritesLocked() noexcept {
         writes.swap(deferredWrites_);
         deferredPending_.store(false, std::memory_order_release);
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Cache", L"PersistentCache::DrainDeferredWritesLocked");
         return;
     }
     if (!database_) return; // cache unavailable: the writes are best-effort, like the cache
     for (auto& write : writes) {
-        try { write(); } catch (...) {}
+        try { write(); } catch (...) { QS_LOG_AND_CONTINUE(L"Cache", L"PersistentCache::DrainDeferredWritesLocked [2]"); }
     }
 }
 
@@ -1029,39 +1042,91 @@ std::optional<CachedImageRecord> PersistentCache::LookupRecord(
     return record;
 }
 
-std::optional<CachedImageRecord> PersistentCache::LookupCameraSettings(const fs::path& path) {
+namespace {
+// Camera-only stub rows carry the image stamps (so the index can be validated)
+// and this sidecar sentinel, which no real MetadataStampFor() value equals, so
+// LookupRecord can never mistake a stub for a complete metadata record.
+constexpr sqlite3_int64 kCameraStubSidecarStamp = -9223372036854775807LL;
+constexpr char kCameraLookupSql[] =
+    "SELECT iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known,"
+    "file_size,modified_stamp FROM image_records WHERE path=?1;";
+
+// Row -> settings when known and not stale. Stamps of 0/0 (caller or legacy stub
+// row) are "unknown" and accepted, matching the former stamp-independent lookup.
+std::optional<CachedImageRecord> CameraRowToRecord(sqlite3_stmt* row,
+    std::uint64_t fileSize, std::int64_t modifiedStamp) {
+    if (sqlite3_column_int(row, 6) == 0) return std::nullopt;
+    const sqlite3_int64 storedSize = sqlite3_column_int64(row, 7);
+    const sqlite3_int64 storedModified = sqlite3_column_int64(row, 8);
+    const bool callerStamped = fileSize != 0 || modifiedStamp != 0;
+    const bool rowStamped = storedSize != 0 || storedModified != 0;
+    if (callerStamped && rowStamped && (static_cast<std::uint64_t>(storedSize) != fileSize ||
+        storedModified != modifiedStamp)) return std::nullopt; // image changed: re-read
+    CachedImageRecord record;
+    record.iso = sqlite3_column_int(row, 0);
+    record.aperture = sqlite3_column_double(row, 1);
+    record.focalLength = sqlite3_column_double(row, 2);
+    record.shutterSpeed = sqlite3_column_double(row, 3);
+    record.camera = ColumnText16(row, 4);
+    record.lens = ColumnText16(row, 5);
+    record.cameraSettingsKnown = true;
+    return record;
+}
+} // namespace
+
+std::optional<CachedImageRecord> PersistentCache::LookupCameraSettings(const fs::path& path,
+    std::uint64_t fileSize, std::int64_t modifiedStamp) {
     const std::wstring key = NormalizeKey(path);
     std::lock_guard lock(databaseMutex_);
     if (!database_) return std::nullopt;
     SqlStatement query;
-    if (!Prepare(database_,
-        "SELECT iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known "
-        "FROM image_records WHERE path=?1;", query)) return std::nullopt;
+    if (!Prepare(database_, kCameraLookupSql, query)) return std::nullopt;
     BindText16(query.value, 1, key);
     if (sqlite3_step(query.value) != SQLITE_ROW) return std::nullopt;
-    if (sqlite3_column_int(query.value, 6) == 0) return std::nullopt;
-    CachedImageRecord record;
-    record.iso = sqlite3_column_int(query.value, 0);
-    record.aperture = sqlite3_column_double(query.value, 1);
-    record.focalLength = sqlite3_column_double(query.value, 2);
-    record.shutterSpeed = sqlite3_column_double(query.value, 3);
-    record.camera = ColumnText16(query.value, 4);
-    record.lens = ColumnText16(query.value, 5);
-    record.cameraSettingsKnown = true;
-    return record;
+    return CameraRowToRecord(query.value, fileSize, modifiedStamp);
 }
 
-void PersistentCache::UpdateCameraSettings(const fs::path& path, const CachedImageRecord& settings) {
+std::vector<std::optional<CachedImageRecord>> PersistentCache::LookupCameraSettingsBatch(
+    const std::vector<CameraLookupKey>& keys) {
+    // One prepared statement reused for every path; the lock is taken per chunk
+    // so UI-thread cache users are never blocked for long (like GetPhotoComments).
+    std::vector<std::optional<CachedImageRecord>> results(keys.size());
+    constexpr std::size_t kChunk = 256;
+    for (std::size_t start = 0; start < keys.size(); start += kChunk) {
+        std::lock_guard lock(databaseMutex_);
+        if (!database_) break;
+        SqlStatement query;
+        if (!Prepare(database_, kCameraLookupSql, query)) break;
+        const std::size_t end = std::min(keys.size(), start + kChunk);
+        for (std::size_t index = start; index < end; ++index) {
+            sqlite3_reset(query.value);
+            sqlite3_clear_bindings(query.value);
+            BindText16(query.value, 1, NormalizeKey(keys[index].path));
+            if (sqlite3_step(query.value) == SQLITE_ROW)
+                results[index] = CameraRowToRecord(query.value, keys[index].fileSize, keys[index].modifiedStamp);
+        }
+    }
+    return results;
+}
+
+void PersistentCache::UpdateCameraSettings(const fs::path& path, const CachedImageRecord& settings,
+    std::uint64_t fileSize, std::int64_t modifiedStamp) {
     const std::wstring key = NormalizeKey(path);
     std::lock_guard lock(databaseMutex_);
     DrainDeferredWritesLocked();
     if (!database_) return;
-    // Only touch camera columns. Existing rating/faces/dimensions are preserved.
-    // If the row does not exist yet, insert a minimal stub so the next full upsert merges.
+    // Only camera columns of a row for the SAME image version are updated (a row
+    // for an older version keeps its own, which the next full upsert replaces).
+    // Stub rows (sidecar sentinel, or legacy 0/0 stamps) also refresh their stamps.
     SqlStatement update;
     if (!Prepare(database_,
         "UPDATE image_records SET iso=?1, aperture=?2, focal_length=?3, shutter_speed=?4, "
-        "camera=?5, lens=?6, camera_settings_known=?7 WHERE path=?8;", update)) return;
+        "camera=?5, lens=?6, camera_settings_known=?7, "
+        "file_size=CASE WHEN sidecar_stamp=?11 OR (file_size=0 AND modified_stamp=0) THEN ?9 ELSE file_size END, "
+        "modified_stamp=CASE WHEN sidecar_stamp=?11 OR (file_size=0 AND modified_stamp=0) THEN ?10 ELSE modified_stamp END, "
+        "sidecar_stamp=CASE WHEN file_size=0 AND modified_stamp=0 AND (?9<>0 OR ?10<>0) THEN ?11 ELSE sidecar_stamp END "
+        "WHERE path=?8 AND ((?9=0 AND ?10=0) OR (file_size=?9 AND modified_stamp=?10) OR "
+        "sidecar_stamp=?11 OR (file_size=0 AND modified_stamp=0));", update)) return;
     sqlite3_bind_int(update.value, 1, settings.iso);
     sqlite3_bind_double(update.value, 2, settings.aperture);
     sqlite3_bind_double(update.value, 3, settings.focalLength);
@@ -1070,14 +1135,19 @@ void PersistentCache::UpdateCameraSettings(const fs::path& path, const CachedIma
     BindText16(update.value, 6, settings.lens);
     sqlite3_bind_int(update.value, 7, settings.cameraSettingsKnown ? 1 : 0);
     BindText16(update.value, 8, key);
+    sqlite3_bind_int64(update.value, 9, static_cast<sqlite3_int64>(fileSize));
+    sqlite3_bind_int64(update.value, 10, modifiedStamp);
+    sqlite3_bind_int64(update.value, 11, kCameraStubSidecarStamp);
     if (sqlite3_step(update.value) == SQLITE_DONE && sqlite3_changes(database_) == 0) {
-        // No existing row: insert a stub that only carries camera settings.
+        // No row (or a row for another image version, which OR IGNORE leaves alone):
+        // insert a stub that only carries camera settings and the image stamps.
+        const bool stamped = fileSize != 0 || modifiedStamp != 0;
         SqlStatement insert;
         if (Prepare(database_,
-            "INSERT INTO image_records(path,file_size,modified_stamp,sidecar_stamp,rating,"
+            "INSERT OR IGNORE INTO image_records(path,file_size,modified_stamp,sidecar_stamp,rating,"
             "color_label,pick_state,source_width,source_height,faces_scanned,last_access,"
             "iso,aperture,focal_length,shutter_speed,camera,lens,camera_settings_known) "
-            "VALUES(?1,0,0,0,0,0,0,0,0,0,?2,?3,?4,?5,?6,?7,?8,?9);", insert)) {
+            "VALUES(?1,?10,?11,?12,0,0,0,0,0,0,?2,?3,?4,?5,?6,?7,?8,?9);", insert)) {
             BindText16(insert.value, 1, key);
             sqlite3_bind_int64(insert.value, 2, CurrentAccessStamp());
             sqlite3_bind_int(insert.value, 3, settings.iso);
@@ -1087,6 +1157,9 @@ void PersistentCache::UpdateCameraSettings(const fs::path& path, const CachedIma
             BindText16(insert.value, 7, settings.camera);
             BindText16(insert.value, 8, settings.lens);
             sqlite3_bind_int(insert.value, 9, settings.cameraSettingsKnown ? 1 : 0);
+            sqlite3_bind_int64(insert.value, 10, static_cast<sqlite3_int64>(fileSize));
+            sqlite3_bind_int64(insert.value, 11, modifiedStamp);
+            sqlite3_bind_int64(insert.value, 12, stamped ? kCameraStubSidecarStamp : 0);
             sqlite3_step(insert.value);
         }
     }
@@ -1311,7 +1384,7 @@ bool PersistentCache::LoadBitmapFile(const fs::path& cachedPath, std::uint64_t f
         return false;
     }
     try { output.pixels.resize(static_cast<std::size_t>(expected)); }
-    catch (...) { return false; }
+    catch (...) { QS_LOG_AND_CONTINUE(L"Cache", L"PersistentCache::LoadBitmapFile"); return false; }
     if (!ReadExact(stream, output.pixels.data(), output.pixels.size())) {
         output.pixels.clear();
         stream.close();

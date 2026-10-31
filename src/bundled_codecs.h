@@ -23,6 +23,9 @@ struct DecodeOptions {
     int targetSize = 0;
     bool preferEmbeddedPreview = false;
     bool rawJpegPreviewOnly = false;
+    // Single View only: scan for and decode the largest embedded JPEG at full
+    // quality. Thumbnail / cache paths keep the small LibRaw thumb.
+    bool singleViewFullPreview = false;
     bool allowTurboJpeg = true;
     bool prefetchEncodedInput = false;
     std::uint64_t mappedInputLimit = 256ull * 1024ull * 1024ull;

@@ -117,6 +117,10 @@ struct WorkJob {
     bool timeoutSingleView = false;
     bool forceWic = false;
     bool ignoreThumbnailViewport = false;
+    // Round 23: a Single View filmstrip cell decode (Thumbnail class). Dropped when
+    // its photo leaves the strip's decode window (core/filmstrip_policy.h). Never
+    // part of the job identity; OR-merged when requests coalesce.
+    bool filmstripOwned = false;
     // 0.9.4.0: Single/Compare decodes run on the dedicated view lane (never on the
     // thumbnail pool). viewPrefetch marks low-priority neighbour prefetch on that
     // lane; it is cancelled by any foreground view request or a new prefetch set.

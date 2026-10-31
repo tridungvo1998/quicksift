@@ -66,12 +66,38 @@ int QuickSiftApplicationImpl::TrackDropdownMenu(HWND anchor, std::vector<MenuIte
     return result;
 }
 
+// A dropdown owned by another top-level window of ours (the diagnostic log
+// window). Item text is data (file labels), so it is shown as given.
+int QuickSiftApplicationImpl::TrackDropdownMenuVerbatim(HWND owner, HWND anchor, std::vector<MenuItem> items) {
+    if (!owner || !anchor || items.empty()) return 0;
+    quicksift::ui::framework::DropdownRequest request{};
+    request.owner = owner;
+    request.anchor = anchor;
+    request.instance = instance_;
+    request.palette = Palette();
+    request.font = uiFont_;
+    request.dpi = quicksift::ui::GetWindowDpi(owner);
+    request.items = std::move(items);
+    request.maintenancePump = DropdownMaintenancePump();
+    request.errorSink = [](std::wstring_view operation) {
+        quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Error,
+            L"UI", operation);
+    };
+    const quicksift::core::ScopedBooleanFlag menuGuard(menuOpen_);
+    const int result = uiFramework_.TrackDropdown(std::move(request));
+    if (IsWindow(owner)) SetFocus(owner);
+    return result;
+}
+
 
 void QuickSiftApplicationImpl::UpdateLanguageSelectorButton() {
     if (!languageSelector_) return;
-    SetWindowTextW(languageSelector_,
-        localizer_.CurrentLanguage() == quicksift::Language::Vietnamese
-            ? L"Tiếng Việt" : L"English");
+    const wchar_t* caption = localizer_.CurrentLanguage() == quicksift::Language::Vietnamese
+        ? L"Tiếng Việt" : L"English";
+    // Only on change: WM_SETTEXT repaints a visible button synchronously.
+    wchar_t current[64]{};
+    GetWindowTextW(languageSelector_, current, static_cast<int>(std::size(current)));
+    if (std::wcscmp(current, caption) != 0) SetWindowTextW(languageSelector_, caption);
 }
 
 void QuickSiftApplicationImpl::ShowLanguageMenu() {
@@ -96,86 +122,112 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
 }
 
 
+    // OnCommand dispatch (0.9.5.0 round 19: split into cohesive helpers with no
+    // behaviour change). The commands handled before the alert guard run first and
+    // skip MarkInteraction exactly as before; every other command is routed through
+    // the grouped dispatchers below in the original switch order.
     void QuickSiftApplicationImpl::OnCommand(int id, int notifyCode, HWND source) {
         (void)source;
-        if (id == ID_THUMBNAIL_SEARCH) {
-            if (notifyCode == EN_CHANGE) OnSearchTextChanged();
-            return;
-        }
-        if (id == ID_SETTING_LANGUAGE_SELECTOR) { ShowLanguageMenu(); return; }
-        if (id == ID_SAVE_USER_COMMENT) { SaveUserComment(); return; }
-        if (id == ID_LIBRARY_LIST && notifyCode == LBN_SELCHANGE) {
-            const int sel=static_cast<int>(SendMessageW(libraryList_,LB_GETCURSEL,0,0));
-            if (controls_.contains(ID_REMOVE_LIBRARY)) EnableWindow(controls_[ID_REMOVE_LIBRARY], sel != LB_ERR);
-            if(sel!=LB_ERR && sel>=0 && sel<static_cast<int>(libraryPaths_.size())) { fs::path folder(libraryPaths_[sel]); if(folder!=currentFolder_) LoadFolder(folder); }
-            return;
-        }
-        if (id == ID_REMOVE_LIBRARY) {
-            const int sel=static_cast<int>(SendMessageW(libraryList_,LB_GETCURSEL,0,0));
-            if(sel!=LB_ERR && sel>=0 && sel<static_cast<int>(libraryPaths_.size())) { const fs::path folder(libraryPaths_[sel]); persistentCache_.WipeFolderCache(folder); persistentCache_.RemoveLibraryFolder(folder);
-                for(auto it=bitmapCache_.begin(); it!=bitmapCache_.end();) { if(it->first.path.rfind(folder.wstring(),0)==0) { RemoveCacheBytes(it->second.cacheClass,it->second.bytes); UnindexBitmapSize(it->first); it=bitmapCache_.erase(it); } else ++it; }
-                RefreshLibraryList(); if(folder==currentFolder_) { currentFolder_.clear(); reviewState_.ResetForFolder(); UpdateStatus(); InvalidateCanvas(); } }
-            return;
-        }
+        if (HandleCommandBeforeAlertGuard(id, notifyCode)) return;
         if (uiFramework_.Alerts().Visible()) return;
         MarkInteraction();
+        if (DispatchNavigationCommand(id)) return;
+        if (DispatchCullingCommand(id)) return;
+        if (DispatchFilterMenuCommand(id)) return;
+        if (DispatchViewerCommand(id)) return;
+        DispatchApplicationCommand(id);
+    }
+
+    bool QuickSiftApplicationImpl::HandleCommandBeforeAlertGuard(int id, int notifyCode) {
+        if (id == ID_THUMBNAIL_SEARCH) {
+            if (notifyCode == EN_CHANGE) OnSearchTextChanged();
+            return true;
+        }
+        if (id == ID_SETTING_LANGUAGE_SELECTOR) { ShowLanguageMenu(); return true; }
+        if (id == ID_SAVE_USER_COMMENT) { SaveUserComment(); return true; }
+        if (id == ID_LIBRARY_LIST && notifyCode == LBN_SELCHANGE) {
+            OnLibraryListSelectionChanged();
+            return true;
+        }
+        if (id == ID_REMOVE_LIBRARY) {
+            RemoveSelectedLibraryFolder();
+            return true;
+        }
+        return false;
+    }
+
+    void QuickSiftApplicationImpl::OnLibraryListSelectionChanged() {
+        const int sel=static_cast<int>(SendMessageW(libraryList_,LB_GETCURSEL,0,0));
+        if (controls_.contains(ID_REMOVE_LIBRARY)) EnableWindow(controls_[ID_REMOVE_LIBRARY], sel != LB_ERR);
+        if(sel!=LB_ERR && sel>=0 && sel<static_cast<int>(libraryPaths_.size())) { fs::path folder(libraryPaths_[sel]); if(folder!=currentFolder_) LoadFolder(folder); }
+    }
+
+    void QuickSiftApplicationImpl::RemoveSelectedLibraryFolder() {
+        const int sel=static_cast<int>(SendMessageW(libraryList_,LB_GETCURSEL,0,0));
+        if(sel!=LB_ERR && sel>=0 && sel<static_cast<int>(libraryPaths_.size())) { const fs::path folder(libraryPaths_[sel]); persistentCache_.WipeFolderCache(folder); persistentCache_.RemoveLibraryFolder(folder);
+            for(auto it=bitmapCache_.begin(); it!=bitmapCache_.end();) { if(it->first.path.rfind(folder.wstring(),0)==0) { RemoveCacheBytes(it->second.cacheClass,it->second.bytes); UnindexBitmapSize(it->first); it=bitmapCache_.erase(it); } else ++it; }
+            RefreshLibraryList(); if(folder==currentFolder_) { currentFolder_.clear(); reviewState_.ResetForFolder(); UpdateStatus(); InvalidateCanvas(); } }
+    }
+
+    // Folder picking, view modes, flyout tabs, navigation and file operations.
+    bool QuickSiftApplicationImpl::DispatchNavigationCommand(int id) {
         switch (id) {
         case ID_PICK_FOLDER:
             ChooseFolder();
-            break;
+            return true;
         case ID_MODE_THUMBS:
             SetMode(ViewMode::Thumbnails);
-            break;
+            return true;
         case ID_MODE_SINGLE:
             EnterSingleFromSelection();
-            break;
+            return true;
         case ID_MODE_COMPARE:
-            if (reviewState_.Mode() == ViewMode::Compare) {
-                SetMode(ViewMode::Thumbnails);
-            } else if (reviewState_.Mode() == ViewMode::Single) {
-                // Leaving Single via Compare returns to Thumbnails with the selection
-                // guidance toast (Compare needs 2–6 selected photos).
-                SetMode(ViewMode::Thumbnails);
-                ShowToast(L"Select 2 to 6 photos to enter Compare.");
-            } else {
-                EnterCompareFromSelection();
-            }
-            break;
-        case ID_FLYOUT_TAB_FILE: SetActiveFlyout(FlyoutPanel::File); break;
-        case ID_FLYOUT_TAB_CULL: SetActiveFlyout(FlyoutPanel::Cull); break;
-        case ID_FLYOUT_TAB_FILTER: SetActiveFlyout(FlyoutPanel::Filter); break;
-        case ID_FLYOUT_TAB_FOLDERS: SetActiveFlyout(FlyoutPanel::Folders); break;
-        case ID_FLYOUT_TAB_INFO: SetActiveFlyout(FlyoutPanel::Info); break;
-        case ID_FLYOUT_TAB_SETTINGS: SetActiveFlyout(FlyoutPanel::Settings); break;
+            OnCompareModeCommand();
+            return true;
+        case ID_FLYOUT_TAB_FILE: SetActiveFlyout(FlyoutPanel::File); return true;
+        case ID_FLYOUT_TAB_CULL: SetActiveFlyout(FlyoutPanel::Cull); return true;
+        case ID_FLYOUT_TAB_FILTER: SetActiveFlyout(FlyoutPanel::Filter); return true;
+        case ID_FLYOUT_TAB_FOLDERS: SetActiveFlyout(FlyoutPanel::Folders); return true;
+        case ID_FLYOUT_TAB_INFO: SetActiveFlyout(FlyoutPanel::Info); return true;
+        case ID_FLYOUT_TAB_SETTINGS: SetActiveFlyout(FlyoutPanel::Settings); return true;
         case ID_PREVIOUS:
             Navigate(-1, false);
             SetFocus(canvas_);
-            break;
+            return true;
         case ID_NEXT:
             Navigate(1, false);
             SetFocus(canvas_);
-            break;
+            return true;
         case ID_COPY:
             FileOperation(false, false);
-            break;
+            return true;
         case ID_MOVE:
             FileOperation(true, false);
-            break;
+            return true;
         case ID_DELETE:
             RequestDeleteOperation();
-            break;
-        case ID_FORMATS:
-            ShowFormatsMenu();
-            break;
-        case ID_DATE_FILTER:
-            ShowDateFilterMenu();
-            break;
-        case ID_SORT:
-            ShowSortMenu();
-            break;
-        case ID_THUMB_SIZE:
-            ShowThumbnailSizeMenu();
-            break;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void QuickSiftApplicationImpl::OnCompareModeCommand() {
+        if (reviewState_.Mode() == ViewMode::Compare) {
+            SetMode(ViewMode::Thumbnails);
+        } else if (reviewState_.Mode() == ViewMode::Single) {
+            // Leaving Single via Compare returns to Thumbnails with the selection
+            // guidance toast (Compare needs 2–6 selected photos).
+            SetMode(ViewMode::Thumbnails);
+            ShowToast(L"Select 2 to 6 photos to enter Compare.");
+        } else {
+            EnterCompareFromSelection();
+        }
+    }
+
+    // Ratings, pick state and colour labels.
+    bool QuickSiftApplicationImpl::DispatchCullingCommand(int id) {
+        switch (id) {
         case ID_RATE_CLEAR:
         case ID_RATE_1:
         case ID_RATE_2:
@@ -183,91 +235,108 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
         case ID_RATE_4:
         case ID_RATE_5:
             ApplyRating(id == ID_RATE_CLEAR ? 0 : id - ID_RATE_1 + 1);
-            break;
+            return true;
         case ID_PICK_STATE_MENU:
             ShowPickStateMenu();
-            break;
+            return true;
         case ID_PICK_STATE_PICK:
             ApplyPickState(1);
-            break;
+            return true;
         case ID_PICK_STATE_REJECT:
             ApplyPickState(-1);
-            break;
+            return true;
         case ID_PICK_STATE_UNMARK:
             ApplyPickState(0);
-            break;
+            return true;
         case ID_COLOR_LABEL:
             ShowColorLabelMenu();
-            break;
+            return true;
         case ID_RATING_MENU:
             ShowRatingMenu();
-            break;
-        case ID_STAR_FILTER:
-            ShowRatingFilterMenu();
-            break;
-        case ID_PICK_FILTER:
-            ShowPickFilterMenu();
-            break;
-        case ID_LABEL_FILTER:
-            ShowColorLabelFilterMenu();
-            break;
-        case ID_ISO_FILTER:
-            ShowIsoFilterMenu();
-            break;
-        case ID_APERTURE_FILTER:
-            ShowApertureFilterMenu();
-            break;
-        case ID_FOCAL_FILTER:
-            ShowFocalFilterMenu();
-            break;
-        case ID_SHUTTER_FILTER:
-            ShowShutterFilterMenu();
-            break;
-        case ID_CAMERA_FILTER:
-            ShowCameraFilterMenu();
-            break;
-        case ID_HOUR_FILTER:
-            ShowHourFilterMenu();
-            break;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // Formats, date, sort, thumbnail size and the metadata filter menus.
+    bool QuickSiftApplicationImpl::DispatchFilterMenuCommand(int id) {
+        switch (id) {
+        case ID_FORMATS: ShowFormatsMenu(); return true;
+        case ID_DATE_FILTER: ShowDateFilterMenu(); return true;
+        case ID_SORT: ShowSortMenu(); return true;
+        case ID_THUMB_SIZE: ShowThumbnailSizeMenu(); return true;
+        case ID_STAR_FILTER: ShowRatingFilterMenu(); return true;
+        case ID_PICK_FILTER: ShowPickFilterMenu(); return true;
+        case ID_LABEL_FILTER: ShowColorLabelFilterMenu(); return true;
+        case ID_ISO_FILTER: ShowIsoFilterMenu(); return true;
+        case ID_APERTURE_FILTER: ShowApertureFilterMenu(); return true;
+        case ID_FOCAL_FILTER: ShowFocalFilterMenu(); return true;
+        case ID_SHUTTER_FILTER: ShowShutterFilterMenu(); return true;
+        case ID_CAMERA_FILTER: ShowCameraFilterMenu(); return true;
+        case ID_HOUR_FILTER: ShowHourFilterMenu(); return true;
+        default: return false;
+        }
+    }
+
+    // Zoom, rotation, compare sync and face lock.
+    bool QuickSiftApplicationImpl::DispatchViewerCommand(int id) {
+        switch (id) {
         case ID_ZOOM_MODE:
             ShowZoomModeMenu();
-            break;
+            return true;
         case ID_ROTATE_LEFT:
             RotateView(-90);
-            break;
+            return true;
         case ID_ROTATE_RIGHT:
             RotateView(90);
-            break;
+            return true;
         case ID_SYNC_VIEW:
-            ClearFaceZoomToggle(); // toggle keys change (per pane <-> shared)
-            reviewState_.SetSyncCompareView(!reviewState_.SyncCompareView());
-            UpdateToggleButtons();
-            UpdateZoomModeButton();
-            SaveSession();
-            InvalidateCanvas();
-            break;
+            ToggleSyncCompareViewCommand();
+            return true;
         case ID_FACE_LOCK:
-            ClearFaceZoomToggle();
-            RefreshFaceDetectorCapability(false);
-            if (faceAnalysisRetryPolicy_.Capability() !=
-                quicksift::core::FaceDetectorCapability::Available) {
-                RefreshFaceLockAvailabilityUi();
-                UpdateStatus();
-                break;
-            }
-            if (reviewState_.FaceLockEnabled()) {
-                DisableFaceLockPreservingViews();
-            } else {
-                reviewState_.EnableFaceLock();
-                faceAnalysisRetryPolicy_.AllowExplicitRetry(EditableViewPath(),
-                    quicksift::core::FaceAnalysisRetryPolicy::Clock::now());
-                RecenterFaceLockForPath(EditableViewPath());
-                SchedulePredictivePrefetch(0);
-            }
-            UpdateToggleButtons();
-            SaveSession();
-            InvalidateCanvas();
-            break;
+            ToggleFaceLockCommand();
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    void QuickSiftApplicationImpl::ToggleSyncCompareViewCommand() {
+        ClearFaceZoomToggle(); // toggle keys change (per pane <-> shared)
+        reviewState_.SetSyncCompareView(!reviewState_.SyncCompareView());
+        UpdateToggleButtons();
+        UpdateZoomModeButton();
+        SaveSession();
+        InvalidateCanvas();
+    }
+
+    void QuickSiftApplicationImpl::ToggleFaceLockCommand() {
+        ClearFaceZoomToggle();
+        RefreshFaceDetectorCapability(false);
+        if (faceAnalysisRetryPolicy_.Capability() !=
+            quicksift::core::FaceDetectorCapability::Available) {
+            RefreshFaceLockAvailabilityUi();
+            UpdateStatus();
+            return;
+        }
+        if (reviewState_.FaceLockEnabled()) {
+            DisableFaceLockPreservingViews();
+        } else {
+            reviewState_.EnableFaceLock();
+            faceAnalysisRetryPolicy_.AllowExplicitRetry(EditableViewPath(),
+                quicksift::core::FaceAnalysisRetryPolicy::Clock::now());
+            RecenterFaceLockForPath(EditableViewPath());
+            SchedulePredictivePrefetch(0);
+        }
+        UpdateToggleButtons();
+        SaveSession();
+        InvalidateCanvas();
+    }
+
+    // Undo/redo, theme, fullscreen, help, tools and the settings commands.
+    void QuickSiftApplicationImpl::DispatchApplicationCommand(int id) {
+        switch (id) {
         case ID_UNDO:
             Undo();
             break;
@@ -275,12 +344,7 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             Redo();
             break;
         case ID_THEME_TOGGLE:
-            theme_ = theme_ == AppTheme::Dark ? AppTheme::Light : AppTheme::Dark;
-            SetWindowTextW(controls_[ID_THEME_TOGGLE], ThemeToggleText().c_str());
-            // Do not leave keyboard focus painted inside the appearance pill.
-            if (canvas_) SetFocus(canvas_);
-            ApplyTheme();
-            SaveSession();
+            ToggleThemeCommand();
             break;
         case ID_FULLSCREEN:
             ToggleFullscreen();
@@ -322,6 +386,15 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
         default:
             break;
         }
+    }
+
+    void QuickSiftApplicationImpl::ToggleThemeCommand() {
+        theme_ = theme_ == AppTheme::Dark ? AppTheme::Light : AppTheme::Dark;
+        SetWindowTextW(controls_[ID_THEME_TOGGLE], ThemeToggleText().c_str());
+        // Do not leave keyboard focus painted inside the appearance pill.
+        if (canvas_) SetFocus(canvas_);
+        ApplyTheme();
+        SaveSession();
     }
 
 
@@ -391,6 +464,19 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             item.camera.find(cameraFilter_) == std::wstring::npos)) return false;
         if (hourFilter_ >= 0 && (item.captureTimeSource == quicksift::core::predicate::CaptureTimeSource::Unknown ||
             item.captureTime.hour != hourFilter_)) return false;
+        if (!formatExtFilter_.empty()) {
+            std::wstring ext = item.extension;
+            for (wchar_t& ch : ext) ch = static_cast<wchar_t>(std::towlower(ch));
+            if (!ext.empty() && ext.front() == L'.') ext.erase(ext.begin());
+            if (ext != formatExtFilter_) return false;
+        }
+        if (!dateExactFilter_.empty()) {
+            if (item.captureTimeSource == quicksift::core::predicate::CaptureTimeSource::Unknown) return false;
+            std::wstring stamp = std::to_wstring(item.captureTime.year) + L"-" +
+                (item.captureTime.month < 10 ? L"0" : L"") + std::to_wstring(item.captureTime.month) + L"-" +
+                (item.captureTime.day < 10 ? L"0" : L"") + std::to_wstring(item.captureTime.day);
+            if (dateExactFilter_ != stamp) return false;
+        }
         return true;
     }
 

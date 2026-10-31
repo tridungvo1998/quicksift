@@ -109,10 +109,9 @@ MetadataWriteOutcome MetadataTransactionService::WriteWithRetry(
             std::chrono::steady_clock::now() - start) * divisor;
         // Hard timeout: abort this write and release the exclusive path gate.
         // Returning here lets the caller drop the path gate; the file lock is
-        // not held past this point. Also signal cancellation so any nested
-        // wait exits immediately.
+        // not held past this point. Only THIS file gives up: the batch must not
+        // be cancelled (that used to abort every remaining, unlocked file).
         if (elapsed >= wl::kHardTimeout) {
-            cancellationRequested_.store(true, std::memory_order_release);
             clearWaiting();
             outcome.ok = false;
             outcome.failureKind = wl::WriteFailureKind::InUse;

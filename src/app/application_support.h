@@ -44,6 +44,7 @@
 #include "localization.h"
 #include "runtime_support.h"
 #include "core/app_types.h"
+#include "core/exif_capture_time.h"
 #include "core/catalog_policy.h"
 #include "core/catalog_store.h"
 #include "core/system_profile.h"
@@ -185,6 +186,8 @@ inline constexpr UINT WM_APP_RATINGS_WORKER_DONE = WM_APP + 15;
 inline constexpr UINT WM_APP_BATCH_WORKER_DONE = WM_APP + 16;
 // Thumbnail search worker has facts (capture time / comments) or an evaluation result.
 inline constexpr UINT WM_APP_SEARCH_WORKER = WM_APP + 17;
+// Previous-session log browser worker finished (listing or one bounded read).
+inline constexpr UINT WM_APP_SESSION_LOG_WORKER_DONE = WM_APP + 18;
 
 
 inline constexpr UINT_PTR ID_TIMER_IDLE_QUALITY = 1;
@@ -236,6 +239,7 @@ inline constexpr UINT_PTR ID_TIMER_METADATA_WRITE_LANE = 23;
 // waits at most PersistentCache::kUiDatabaseWait, then retries from these timers).
 inline constexpr UINT_PTR ID_TIMER_USER_COMMENT_RETRY = 24;
 inline constexpr UINT_PTR ID_TIMER_LIBRARY_LIST_RETRY = 25;
+inline constexpr UINT_PTR ID_TIMER_BLOCKING_WAIT = 26;
 
 inline constexpr UINT_PTR kFaceWarningTooltipId = 1;
 
@@ -255,6 +259,10 @@ struct DocumentWindowState {
     HWND refresh = nullptr;
     HWND exportButton = nullptr;
     HWND verboseLogging = nullptr;
+    HWND autoRefresh = nullptr; // diagnostic log: continuous refresh (default off)
+    HWND previousSessions = nullptr; // diagnostic log: "Previous sessions…" (session log browser)
+    std::wstring lastLogText;   // auto refresh: skip re-render when unchanged
+    std::size_t lastLogSize = 0;
     HWND close = nullptr;
     bool richEdit = false;
     bool diagnosticLog = false;
@@ -268,6 +276,11 @@ struct DocumentWindowState {
     std::wstring titleKey;
     // Translator for messages the window raises itself (diagnostic export result).
     std::function<std::wstring(std::wstring_view)> Tr;
+    // SessionLog windows: untranslated suffix after the translated title (time · size).
+    std::wstring titleSuffix;
+    // Diagnostic log: opens the previous-session list (the application owns the
+    // worker and the dropdown; session_log_browser_controller.cpp).
+    std::function<void(HWND window, HWND anchor)> browseSessionLogs;
 };
 
 class QuickSiftApplicationImpl;
@@ -287,6 +300,8 @@ void SetDocumentControlText(HWND edit, std::wstring_view text, bool helpDocument
 void SetDocumentPlainText(HWND edit, std::wstring_view text, bool richEdit,
     const ThemePalette& theme);
 bool EnsureRichEditLoaded();
+// Moves the caret and view to the last line (newest diagnostic-log entry).
+void ScrollDocumentToEnd(HWND edit) noexcept;
 LRESULT CALLBACK DocumentWindowSubclassProcImpl(HWND window, UINT message, WPARAM wParam,
     LPARAM lParam, UINT_PTR, DWORD_PTR reference);
 LRESULT CALLBACK DocumentWindowSubclassProc(HWND window, UINT message, WPARAM wParam,
@@ -399,7 +414,6 @@ bool ExistingTextFileCouldNotBeDecoded(const fs::path& path, bool decodedSuccess
 std::vector<char> EncodeTextFile(const std::wstring& text, TextFileEncoding encoding);
 bool CaptureAtomicFileSnapshotFromHandle(HANDLE handle, AtomicFileSnapshot& snapshot);
 bool CaptureAtomicFileSnapshot(const fs::path& path, AtomicFileSnapshot& snapshot);
-std::uint64_t WicFileIdentity(const fs::path& path);
 bool SameAtomicFileSnapshot(const AtomicFileSnapshot& left, const AtomicFileSnapshot& right);
 bool WriteAllBytes(HANDLE handle, const std::vector<char>& bytes);
 // Why WriteTextFile refused (all fields zero/false on success or other failures).
@@ -421,6 +435,14 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
 PhotoMetadataValues ReadPhotoMetadataFromStorage(const fs::path& image,
     MetadataStorageKind storage);
 PhotoMetadataValues ReadPhotoMetadata(const fs::path& image);
+// Capture time and camera settings from ONE shared-read open of the file header:
+// 64 KB first, widened to 512 KB only when a requested fact is still missing.
+struct ExifHeaderFacts {
+    bool opened = false;
+    std::optional<quicksift::core::exif::CaptureTimeResult> capture;
+    quicksift::core::exif::CameraSettingsResult camera;
+};
+ExifHeaderFacts ReadExifHeaderFacts(const fs::path& image, bool wantCapture, bool wantCamera);
 std::wstring ReadPropertyDisplay(IPropertyStore* store, const wchar_t* canonicalName);
 std::wstring BuildExifText(const fs::path& path);
 std::optional<fs::path> PickFolder(HWND owner, const wchar_t* title);
@@ -482,23 +504,6 @@ struct TileKeyHash {
     }
 };
 
-struct WicImageSourceEntry {
-    ComPtr<IWICBitmapDecoder> decoder;
-    ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<ID2D1ImageSourceFromWic> imageSource;
-    std::uint64_t identity = 0;
-    // 0.9.4.0: last time the on-disk identity was re-verified. Paint reuses a
-    // recently verified source instead of opening the file on every frame.
-    std::chrono::steady_clock::time_point identityVerifiedAt{};
-    std::uint64_t lastUse = 0;
-    std::chrono::steady_clock::time_point lastUseTime = std::chrono::steady_clock::now();
-    UINT width = 0;
-    UINT height = 0;
-    D2D1_RECT_U lastTrim{};
-    bool hasTrim = false;
-    bool offered = false;
-};
-
 struct TileEntry {
     ComPtr<ID2D1Bitmap> bitmap;
     int sourceWidth = 0;
@@ -540,7 +545,6 @@ using GlassAlertMode = quicksift::ui::framework::AlertMode;
 enum class PendingGlassAction {
     None,
     DeleteSelection,
-    CloseWithPendingOperations,
     // Drop a guarded Undo/Redo entry after on-disk identity diverged from history.
     RelinquishUndoHistory,
     RelinquishRedoHistory,
@@ -561,11 +565,13 @@ enum class PendingGlassAction {
     BatchNoMatches,
     // Write lane: a file stayed locked by another app for ~30 s. Retry resubmits the
     // affected edits; Skip keeps the rolled-back values.
-    MetadataRetryInUse
+    MetadataRetryInUse,
+    // Blocking-wait dialog (core/blocking_wait.h): Force quit / Cancel operation.
+    BlockingWaitPrimary
 };
 
 inline constexpr size_t kInvalidVisiblePosition = quicksift::core::CatalogStore::InvalidVisiblePosition;
-enum class DocumentKind : ULONG_PTR { Help = 1, About = 2, DiagnosticLog = 3, MissingFiles = 4 };
+enum class DocumentKind : ULONG_PTR { Help = 1, About = 2, DiagnosticLog = 3, MissingFiles = 4, SessionLog = 5 };
 struct AdaptivePrefetchPolicy {
     int extraThumbnailRows = 1;
     int depth = 2;

@@ -17,6 +17,7 @@
 //       src\core\exif_capture_time.cpp src\core\batch_match_policy.cpp src\core\image_formats.cpp
 
 #include "core/exif_capture_time.h"
+#include "core/metadata_state.h"
 #include "core/metadata_vocabulary.h"
 #include "core/photo_predicate.h"
 #include "core/search_query.h"
@@ -417,6 +418,111 @@ void CheckExif() {
 
 } // namespace
 
+void CheckRatingRanges() {
+    using C = Comparison;
+    struct Case { const wchar_t* query; C op; int value; };
+    const Case cases[] = {
+        { L"0 stars and up", C::AtLeast, 0 }, { L"3 stars or more", C::AtLeast, 3 },
+        { L"at least 3 stars", C::AtLeast, 3 }, { L"3 stars and above", C::AtLeast, 3 },
+        { L"3 stars or higher", C::AtLeast, 3 }, { L"no less than 3 stars", C::AtLeast, 3 },
+        { L"5 stars and lower", C::AtMost, 5 }, { L"5 stars or less", C::AtMost, 5 },
+        { L"5 stars and below", C::AtMost, 5 }, { L"at most 4 stars", C::AtMost, 4 },
+        { L"no more than 4 stars", C::AtMost, 4 }, { L"up to 4 stars", C::AtMost, 4 },
+        { L"less than 5 stars", C::Less, 5 }, { L"under 3 stars", C::Less, 3 },
+        { L"below 3 stars", C::Less, 3 }, { L"fewer than 3 stars", C::Less, 3 },
+        { L"more than 2 stars", C::Greater, 2 }, { L"over 2 stars", C::Greater, 2 },
+        { L"above 2 stars", C::Greater, 2 }, { L"greater than 2 stars", C::Greater, 2 },
+        { L"at least 1 star", C::AtLeast, 1 }, { L"1 star or more", C::AtLeast, 1 },
+        { L"3stars or more", C::AtLeast, 3 }, { L"3* and up", C::AtLeast, 3 },
+        { L">=3*", C::AtLeast, 3 }, { L"<5 stars", C::Less, 5 }, { L">2 stars", C::Greater, 2 },
+        { L"\u22653 stars", C::AtLeast, 3 }, { L"\u2264 4 stars", C::AtMost, 4 },
+        { L">= 3 stars", C::AtLeast, 3 }, { L"\u2265 3 sao", C::AtLeast, 3 },
+        { L"3 sao tr\u1edf l\u00ean", C::AtLeast, 3 }, { L"3 sao tro len", C::AtLeast, 3 },
+        { L"t\u1eeb 3 sao", C::AtLeast, 3 }, { L"tu 3 sao", C::AtLeast, 3 },
+        { L"t\u1eeb 3 sao tr\u1edf l\u00ean", C::AtLeast, 3 },
+        { L"\u00edt nh\u1ea5t 3 sao", C::AtLeast, 3 }, { L"it nhat 3 sao", C::AtLeast, 3 },
+        { L"t\u1ed1i thi\u1ec3u 3 sao", C::AtLeast, 3 },
+        { L"5 sao tr\u1edf xu\u1ed1ng", C::AtMost, 5 }, { L"5 sao tro xuong", C::AtMost, 5 },
+        { L"t\u1ed1i \u0111a 4 sao", C::AtMost, 4 }, { L"toi da 4 sao", C::AtMost, 4 },
+        { L"kh\u00f4ng qu\u00e1 4 sao", C::AtMost, 4 }, { L"khong qua 4 sao", C::AtMost, 4 },
+        { L"d\u01b0\u1edbi 5 sao", C::Less, 5 }, { L"duoi 5 sao", C::Less, 5 },
+        { L"\u00edt h\u01a1n 5 sao", C::Less, 5 }, { L"it hon 5 sao", C::Less, 5 },
+        { L"tr\u00ean 2 sao", C::Greater, 2 }, { L"tren 2 sao", C::Greater, 2 },
+        { L"nhi\u1ec1u h\u01a1n 2 sao", C::Greater, 2 }, { L"h\u01a1n 2 sao", C::Greater, 2 },
+        { L"AT LEAST 3 STARS", C::AtLeast, 3 },
+    };
+    for (const Case& c : cases) {
+        const bool ok = Rating(c.query, c.op, c.value);
+        if (!ok) std::printf("  range case: %ls\n", c.query);
+        Check(ok, "rating range phrase");
+    }
+    // Negation still applies to a whole range; "không" alone is still negation.
+    {
+        const auto parsed = ParseSearchQuery(L"not at least 3 stars");
+        Check(parsed.clauses.size() == 1 && parsed.clauses[0].op == C::AtLeast && parsed.clauses[0].negated,
+            "not + range negates the range");
+        const auto vi = ParseSearchQuery(L"kh\u00f4ng 5 sao");
+        Check(vi.clauses.size() == 1 && vi.clauses[0].op == C::Equal && vi.clauses[0].negated,
+            "khong + N sao is still a negation");
+    }
+    // The unit is required: words and bare numbers stay text, existing forms unchanged.
+    Check(!ParseSearchQuery(L"under 3").clauses.empty() &&
+        ParseSearchQuery(L"under 3").clauses[0].kind == ClauseKind::Text, "under 3 (no unit) is text");
+    Check(IsText(L"over", L"over"), "over alone is text");
+    Check(IsText(L"9/10", L"9/10"), "9/10 unchanged");
+    Check(Rating(L"0 stars", C::Equal, 0) && Rating(L"0 star", C::Equal, 0) && Rating(L"0 sao", C::Equal, 0),
+        "0 stars / 0 star / 0 sao");
+    Check(Rating(L"3 stars or less", C::AtMost, 3), "suffix after plain N stars");
+
+    MetadataFactsView photo = Photo(); // 5 stars
+    Check(Matches(L"at least 3 stars", photo) && Matches(L"3 sao tr\u1edf l\u00ean", photo), "5 >= 3");
+    Check(!Matches(L"less than 5 stars", photo) && Matches(L"5 stars or less", photo), "< vs <= at 5");
+    Check(!Matches(L"more than 5 stars", photo) && Matches(L"more than 4 stars", photo), "> boundary");
+}
+
+// Regression (user report, 55 photos all shown as 0 stars: "0 stars" found 39,
+// "0" found 55). 16 photos had no rating in any source Exiv2/sidecar/shell could
+// read, so their rating stayed Unknown and never matched. After every source is
+// consulted for a readable file, an unset rating is 0 (ResolveUnsetMetadataAsNone).
+void CheckUnsetRatingRegression() {
+    std::size_t before = 0;
+    std::size_t after = 0;
+    std::size_t rangeAfter = 0;
+    for (int i = 0; i < 55; ++i) {
+        PhotoMetadataValues values;
+        if (i < 39) values.rating = KnownMetadataValue(0);
+        // else: no source had a value -> Unknown (the old final state)
+        MetadataFactsView facts;
+        facts.name = L"IMG_" + std::to_wstring(1000 + i) + L".JPG";
+        facts.rating = values.rating.value;
+        facts.ratingKnowledge = values.rating.knowledge;
+        if (Matches(L"0 stars", facts)) ++before;
+        ResolveUnsetMetadataAsNone(values);
+        facts.rating = values.rating.value;
+        facts.ratingKnowledge = values.rating.knowledge;
+        if (Matches(L"0 stars", facts)) ++after;
+        if (Matches(L"0 stars and up", facts) && Matches(L"unrated", facts)) ++rangeAfter;
+    }
+    Check(before == 39, "regression baseline: unresolved Unknown ratings miss \"0 stars\" (39 of 55)");
+    Check(after == 55, "regression: \"0 stars\" matches all 55 unrated photos");
+    Check(rangeAfter == 55, "regression: \"0 stars and up\" and \"unrated\" match all 55");
+    {
+        PhotoMetadataValues values;
+        values.rating = UnreadableMetadataValue();
+        values.colorLabel = UnsupportedMetadataValue(L"custom");
+        ResolveUnsetMetadataAsNone(values);
+        Check(values.rating.knowledge == MetadataKnowledge::Unreadable, "unreadable file never becomes 0 stars");
+        Check(values.colorLabel.knowledge == MetadataKnowledge::Unsupported, "custom value kept");
+        Check(values.pickState.knowledge == MetadataKnowledge::Known && values.pickState.value == 0,
+            "unset pick resolves to unmarked");
+    }
+    {
+        MetadataFactsView pending;
+        pending.ratingKnowledge = MetadataKnowledge::Unknown; // not read yet
+        Check(!Matches(L"0 stars", pending), "a photo not read yet does not match until read");
+    }
+}
+
 int main() {
     CheckTime();
     CheckDate();
@@ -427,6 +533,8 @@ int main() {
     CheckFilterCriteria();
     CheckVocabulary();
     CheckExif();
+    CheckRatingRanges();
+    CheckUnsetRatingRegression();
     std::printf("search_query_checks: %d checks, %d failures\n", gChecks, gFailures);
     return gFailures == 0 ? 0 : 1;
 }

@@ -1,5 +1,7 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "core/blur_outline_policy.h"
+#include "diagnostics/log_and_continue.h"
 #include <shobjidl.h>
 #include <shellapi.h>
 
@@ -107,7 +109,7 @@ namespace quicksift::app {
         deviceContext2_.Reset();
         d2dDevice_.Reset();
         d2dFactory1_.Reset();
-        ClearWicImageSources();
+        uiWicFactory_.Reset();
     }
 
 
@@ -141,6 +143,7 @@ namespace quicksift::app {
             }
         }
         bool sharedResourcesReady = renderTarget_ != nullptr && dwriteFactory_ != nullptr;
+        if (renderTarget_) deviceMaxBitmapEdge_ = renderTarget_->GetMaximumBitmapSize();
         if (renderTarget_) {
             const ThemePalette palette = Palette();
             auto ensureBrush = [&](ComPtr<ID2D1SolidColorBrush>& brush,
@@ -169,6 +172,20 @@ namespace quicksift::app {
             // Face outlines are optional decoration; failure never blocks rendering.
             static_cast<void>(ensureBrush(faceOutlineBrush_, ToD2D(RGB(255, 255, 255)), L"face outline"));
             static_cast<void>(ensureBrush(faceOutlineShadowBrush_, ToD2D(RGB(0, 0, 0)), L"face outline shadow"));
+            // Round 23: blurry-photo outline. Optional decoration (falls back to the
+            // solid danger stroke); created once per device / theme.
+            {
+                const auto red = quicksift::core::blur_outline::Color(palette.dark);
+                static_cast<void>(ensureBrush(blurOutlineBrush_, ToD2D(palette.highContrast ? palette.dangerBorder :
+                    RGB(red.r, red.g, red.b)), L"blur outline"));
+            }
+            if (!blurOutlineStrokeStyle_ && d2dFactory_) {
+                const float dashes[] = { quicksift::core::blur_outline::kDashOn, quicksift::core::blur_outline::kDashOff };
+                const HRESULT styleHr = d2dFactory_->CreateStrokeStyle(D2D1::StrokeStyleProperties(
+                    D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_ROUND,
+                    10.0f, D2D1_DASH_STYLE_CUSTOM, 0.0f), dashes, 2, &blurOutlineStrokeStyle_);
+                if (FAILED(styleHr)) blurOutlineStrokeStyle_.Reset();
+            }
         }
         if (dwriteFactory_) {
             auto ensureTextFormat = [&](ComPtr<IDWriteTextFormat>& format, const wchar_t* family,
@@ -202,15 +219,9 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::ClearWicImageSources() {
-        wicImageSources_.clear();
-        uiWicFactory_.Reset();
-    }
-
-
     void QuickSiftApplicationImpl::DiscardDeviceResources() {
         ClearBitmapCache();
-        ClearWicImageSources();
+        uiWicFactory_.Reset();
         textBrush_.Reset();
         panelBrush_.Reset();
         accentBrush_.Reset();
@@ -222,6 +233,16 @@ namespace quicksift::app {
         glassHighlightBrush_.Reset();
         faceOutlineBrush_.Reset();
         faceOutlineShadowBrush_.Reset();
+        blurOutlineBrush_.Reset();
+        blurOutlineStrokeStyle_.Reset();
+        filmstripBackgroundBrush_.Reset();
+        filmstripActiveBrush_.Reset();
+        filmstripInactiveBrush_.Reset();
+        // Round 22: Shell-fallback bitmaps belong to the discarded target too; the
+        // filmstrip drew them on the new target after a device loss (D2D error).
+        shellFallbackCache_.clear();
+        shellFallbackLastUse_ = {};
+        for (auto& brush : badgeColorBrushes_) brush.Reset();
         hwndRenderTarget_.Reset();
         ResetModernDeviceResources();
     }
@@ -309,25 +330,9 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::OfferGraphicsResources(bool release) {
-        if (release) {
-            for (auto& [path, entry] : wicImageSources_) {
-                if (entry.imageSource && !entry.offered && SUCCEEDED(entry.imageSource->OfferResources())) {
-                    entry.offered = true;
-                }
-            }
-            if (IsIconic(hwnd_)) {
-                DiscardDeviceResources();
-                return;
-            }
-        } else {
-            for (auto& [path, entry] : wicImageSources_) {
-                if (!entry.imageSource || !entry.offered) continue;
-                BOOL discarded = FALSE;
-                if (SUCCEEDED(entry.imageSource->TryReclaimResources(&discarded))) {
-                    entry.offered = false;
-                    if (discarded) entry.hasTrim = false;
-                }
-            }
+        if (release && IsIconic(hwnd_)) {
+            DiscardDeviceResources();
+            return;
         }
         // Trim is a release boundary, not a reclaim operation. Calling it after
         // TryReclaimResources would immediately throw away driver allocations
@@ -541,20 +546,6 @@ namespace quicksift::app {
     }
 
 
-    size_t QuickSiftApplicationImpl::RetainedWicImageSourceLimit() const {
-        const auto retention = ViewResourceRetention();
-        if (retention <= std::chrono::milliseconds(0)) return 1;
-        if (systemProfile_.lowMemory && retention <= std::chrono::seconds(10)) return 1;
-        if (systemProfile_.totalPhysicalBytes <= 18ull * kGibibyte &&
-            retention <= std::chrono::minutes(1)) return 2;
-        if (systemProfile_.totalPhysicalBytes > 18ull * kGibibyte &&
-            retention <= std::chrono::minutes(2)) return 4;
-        if (systemProfile_.lowMemory) return 2;
-        if (systemProfile_.totalPhysicalBytes <= 18ull * kGibibyte) return 8;
-        return systemProfile_.logicalProcessors >= 16 ? 16u : 12u;
-    }
-
-
     bool QuickSiftApplicationImpl::PathHasDetectedFace(const std::wstring& path) const {
         const auto index = CatalogIndexForPath(path);
         return index && catalog_.PhotoAt(*index).facesScanned && !catalog_.PhotoAt(*index).faces.empty();
@@ -639,14 +630,6 @@ namespace quicksift::app {
                 ++iterator;
             }
         }
-        for (auto iterator = wicImageSources_.begin(); iterator != wicImageSources_.end();) {
-            if (!keep.contains(iterator->first) && expired(iterator->first, iterator->second.lastUseTime)) {
-                removedAny = true;
-                iterator = wicImageSources_.erase(iterator);
-            } else {
-                ++iterator;
-            }
-        }
         for (auto iterator = displayedViewKeys_.begin(); iterator != displayedViewKeys_.end();) {
             if (!bitmapCache_.contains(iterator->second)) iterator = displayedViewKeys_.erase(iterator);
             else ++iterator;
@@ -706,43 +689,56 @@ namespace quicksift::app {
     }
 
 
+    // Bitmap/tile cache eviction (0.9.5.0 round 19: split into helpers with no
+    // behaviour change). The candidate pass is the normal path; if it throws (it
+    // allocates candidate arrays) the allocation-free LRU scan runs instead.
+    size_t QuickSiftApplicationImpl::CacheLimitForClass(CacheClass cacheClass) const {
+        switch (cacheClass) {
+        case CacheClass::Thumbnail: return thumbnailCacheLimit_;
+        case CacheClass::Preview: return previewCacheLimit_;
+        case CacheClass::Full: return fullCacheLimit_;
+        case CacheClass::Tile: return tileCacheLimit_;
+        }
+        return previewCacheLimit_;
+    }
+
+    size_t QuickSiftApplicationImpl::CacheBytesForClass(CacheClass cacheClass) const {
+        switch (cacheClass) {
+        case CacheClass::Thumbnail: return thumbnailCacheBytes_;
+        case CacheClass::Preview: return previewCacheBytes_;
+        case CacheClass::Full: return fullCacheBytes_;
+        case CacheClass::Tile: return tileCacheBytes_;
+        }
+        return 0;
+    }
+
+    bool QuickSiftApplicationImpl::CacheEvictionBudget::IsRecent(
+        const std::chrono::steady_clock::time_point& lastUseTime) const {
+        return recentGrace > std::chrono::milliseconds(0) && now - lastUseTime < recentGrace;
+    }
+
+    size_t QuickSiftApplicationImpl::EvictionLimitFor(const CacheEvictionBudget& budget,
+        CacheClass cacheClass) const {
+        const size_t limit = CacheLimitForClass(cacheClass);
+        if (!budget.incomingClass || *budget.incomingClass != cacheClass) return limit;
+        return budget.incomingBytes >= limit ? 0 : limit - budget.incomingBytes;
+    }
+
     void QuickSiftApplicationImpl::EvictBitmapCache(bool forceProtected ,
         std::optional<CacheClass> incomingClass , size_t incomingBytes ) {
-        auto baseLimitFor = [&](CacheClass cacheClass) -> size_t {
-            switch (cacheClass) {
-            case CacheClass::Thumbnail: return thumbnailCacheLimit_;
-            case CacheClass::Preview: return previewCacheLimit_;
-            case CacheClass::Full: return fullCacheLimit_;
-            case CacheClass::Tile: return tileCacheLimit_;
-            }
-            return previewCacheLimit_;
-        };
-        auto limitFor = [&](CacheClass cacheClass) -> size_t {
-            const size_t limit = baseLimitFor(cacheClass);
-            if (!incomingClass || *incomingClass != cacheClass) return limit;
-            return incomingBytes >= limit ? 0 : limit - incomingBytes;
-        };
-        auto bytesFor = [&](CacheClass cacheClass) -> size_t {
-            switch (cacheClass) {
-            case CacheClass::Thumbnail: return thumbnailCacheBytes_;
-            case CacheClass::Preview: return previewCacheBytes_;
-            case CacheClass::Full: return fullCacheBytes_;
-            case CacheClass::Tile: return tileCacheBytes_;
-            }
-            return 0;
-        };
-        const size_t adjustedHardLimit = incomingBytes >= hardCacheLimit_ ?
+        CacheEvictionBudget budget;
+        budget.forceProtected = forceProtected;
+        budget.incomingClass = incomingClass;
+        budget.incomingBytes = incomingBytes;
+        budget.adjustedHardLimit = incomingBytes >= hardCacheLimit_ ?
             0 : hardCacheLimit_ - incomingBytes;
-        const auto now = std::chrono::steady_clock::now();
-        const auto recentGrace = forceProtected ? std::chrono::milliseconds(0) : RecentViewGracePeriod();
-        auto isRecent = [&](const std::chrono::steady_clock::time_point& lastUseTime) {
-            return recentGrace > std::chrono::milliseconds(0) && now - lastUseTime < recentGrace;
-        };
-        const bool classOver = thumbnailCacheBytes_ > limitFor(CacheClass::Thumbnail) ||
-            previewCacheBytes_ > limitFor(CacheClass::Preview) ||
-            fullCacheBytes_ > limitFor(CacheClass::Full) ||
-            tileCacheBytes_ > limitFor(CacheClass::Tile);
-        if (!classOver && TotalCacheBytes() <= adjustedHardLimit) return;
+        budget.now = std::chrono::steady_clock::now();
+        budget.recentGrace = forceProtected ? std::chrono::milliseconds(0) : RecentViewGracePeriod();
+        const bool classOver = thumbnailCacheBytes_ > EvictionLimitFor(budget, CacheClass::Thumbnail) ||
+            previewCacheBytes_ > EvictionLimitFor(budget, CacheClass::Preview) ||
+            fullCacheBytes_ > EvictionLimitFor(budget, CacheClass::Full) ||
+            tileCacheBytes_ > EvictionLimitFor(budget, CacheClass::Tile);
+        if (!classOver && TotalCacheBytes() <= budget.adjustedHardLimit) return;
 
         // 0.9.4.0: eviction never removes a pinned (visible/margin) thumbnail, but if
         // any thumbnail bytes were reclaimed, ask the visible-cell sweep to verify that
@@ -756,11 +752,33 @@ namespace quicksift::app {
                         self->reviewState_.Mode() == ViewMode::Thumbnails)
                         self->ArmThumbnailReconcile(400);
                 } catch (...) {
+                    QS_LOG_AND_CONTINUE(L"Cache", L"EvictBitmapCache");
                 }
             }
         } evictionReconcile{ this, thumbnailCacheBytes_ };
 
         try {
+            EvictBitmapCacheByCandidates(budget);
+            return;
+        } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Cache", L"EvictBitmapCache [2]");
+            // Candidate arrays are an optimization. Under extreme allocation
+            // pressure, fall back to the allocation-free LRU scan rather than
+            // failing the UI thread while trying to free memory.
+        }
+        EvictBitmapCacheByLruScan(budget);
+    }
+
+    // Normal eviction path: sort candidates once, trim each class to its limit, then
+    // trim the combined total to the hard limit. May throw std::bad_alloc.
+    void QuickSiftApplicationImpl::EvictBitmapCacheByCandidates(const CacheEvictionBudget& budget) {
+        const bool forceProtected = budget.forceProtected;
+        const size_t adjustedHardLimit = budget.adjustedHardLimit;
+        auto isRecent = [&](const std::chrono::steady_clock::time_point& lastUseTime) {
+            return budget.IsRecent(lastUseTime);
+        };
+        auto limitFor = [&](CacheClass cacheClass) { return EvictionLimitFor(budget, cacheClass); };
+        auto bytesFor = [&](CacheClass cacheClass) { return CacheBytesForClass(cacheClass); };
         using BitmapIterator = decltype(bitmapCache_)::iterator;
         struct BitmapCandidate {
             BitmapIterator iterator;
@@ -855,39 +873,49 @@ namespace quicksift::app {
             }
             skipErased();
         }
-        return;
-        } catch (...) {
-            // Candidate arrays are an optimization. Under extreme allocation
-            // pressure, fall back to the allocation-free LRU scan rather than
-            // failing the UI thread while trying to free memory.
-        }
+    }
 
-        auto evictOneBitmap = [&](std::optional<CacheClass> onlyClass) -> bool {
-            auto oldest = bitmapCache_.end();
-            for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
-                if (onlyClass && it->second.cacheClass != *onlyClass) continue;
-                if (!forceProtected && IsProtectedBitmap(it->first)) continue;
-                const bool candidateRecent = it->first.cacheClass != CacheClass::Thumbnail &&
-                    isRecent(it->second.lastUseTime);
-                const bool oldestRecent = oldest != bitmapCache_.end() &&
-                    oldest->first.cacheClass != CacheClass::Thumbnail && isRecent(oldest->second.lastUseTime);
-                const bool candidateFace = reviewState_.FaceLockEnabled() && PathHasDetectedFace(it->first.path);
-                const bool oldestFace = oldest != bitmapCache_.end() && reviewState_.FaceLockEnabled() && PathHasDetectedFace(oldest->first.path);
-                if (oldest == bitmapCache_.end() ||
-                    (oldestRecent && !candidateRecent) ||
-                    (oldestRecent == candidateRecent && oldestFace && !candidateFace) ||
-                    (oldestRecent == candidateRecent && oldestFace == candidateFace && oldest->second.frequent && !it->second.frequent) ||
-                    (oldestRecent == candidateRecent && oldestFace == candidateFace && oldest->second.frequent == it->second.frequent &&
-                        it->second.lastUse < oldest->second.lastUse)) oldest = it;
-            }
-            if (oldest == bitmapCache_.end()) return false;
-            RemoveCacheBytes(oldest->second.cacheClass, oldest->second.bytes);
-            UnindexBitmapSize(oldest->first);
-            bitmapCache_.erase(oldest);
-            return true;
+    // Allocation-free fallback: repeated linear scans for the oldest entry.
+    bool QuickSiftApplicationImpl::EvictOldestBitmap(const CacheEvictionBudget& budget,
+        std::optional<CacheClass> onlyClass) {
+        const bool forceProtected = budget.forceProtected;
+        auto isRecent = [&](const std::chrono::steady_clock::time_point& lastUseTime) {
+            return budget.IsRecent(lastUseTime);
         };
+        auto oldest = bitmapCache_.end();
+        for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
+            if (onlyClass && it->second.cacheClass != *onlyClass) continue;
+            if (!forceProtected && IsProtectedBitmap(it->first)) continue;
+            const bool candidateRecent = it->first.cacheClass != CacheClass::Thumbnail &&
+                isRecent(it->second.lastUseTime);
+            const bool oldestRecent = oldest != bitmapCache_.end() &&
+                oldest->first.cacheClass != CacheClass::Thumbnail && isRecent(oldest->second.lastUseTime);
+            const bool candidateFace = reviewState_.FaceLockEnabled() && PathHasDetectedFace(it->first.path);
+            const bool oldestFace = oldest != bitmapCache_.end() && reviewState_.FaceLockEnabled() && PathHasDetectedFace(oldest->first.path);
+            if (oldest == bitmapCache_.end() ||
+                (oldestRecent && !candidateRecent) ||
+                (oldestRecent == candidateRecent && oldestFace && !candidateFace) ||
+                (oldestRecent == candidateRecent && oldestFace == candidateFace && oldest->second.frequent && !it->second.frequent) ||
+                (oldestRecent == candidateRecent && oldestFace == candidateFace && oldest->second.frequent == it->second.frequent &&
+                    it->second.lastUse < oldest->second.lastUse)) oldest = it;
+        }
+        if (oldest == bitmapCache_.end()) return false;
+        RemoveCacheBytes(oldest->second.cacheClass, oldest->second.bytes);
+        UnindexBitmapSize(oldest->first);
+        bitmapCache_.erase(oldest);
+        return true;
+    }
+
+    void QuickSiftApplicationImpl::EvictBitmapCacheByLruScan(const CacheEvictionBudget& budget) {
+        const bool forceProtected = budget.forceProtected;
+        const size_t adjustedHardLimit = budget.adjustedHardLimit;
+        auto isRecent = [&](const std::chrono::steady_clock::time_point& lastUseTime) {
+            return budget.IsRecent(lastUseTime);
+        };
+        auto limitFor = [&](CacheClass cacheClass) { return EvictionLimitFor(budget, cacheClass); };
+        auto bytesFor = [&](CacheClass cacheClass) { return CacheBytesForClass(cacheClass); };
         for (CacheClass cacheClass : { CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full }) {
-            while (bytesFor(cacheClass) > limitFor(cacheClass) && evictOneBitmap(cacheClass)) {}
+            while (bytesFor(cacheClass) > limitFor(cacheClass) && EvictOldestBitmap(budget, cacheClass)) {}
         }
         while (tileCacheBytes_ > limitFor(CacheClass::Tile) && !tileCache_.empty()) {
             auto oldest = tileCache_.begin();
@@ -969,12 +997,7 @@ namespace quicksift::app {
             backgroundCacheWidth_ = backgroundCacheHeight_ = 0;
             backgroundSurfaceWidth_ = backgroundSurfaceHeight_ = 0;
             if (selection_.Empty()) selection_.Clear(true);
-            ClearWicImageSources();
-        } else {
-            for (auto& [path, entry] : wicImageSources_) {
-                if (entry.imageSource) entry.imageSource->TrimCache(nullptr);
-                entry.hasTrim = false;
-            }
+            uiWicFactory_.Reset();
         }
 
         // Normal pressure evicts only off-screen entries. Under genuinely critical
@@ -1009,11 +1032,19 @@ namespace quicksift::app {
 
     int QuickSiftApplicationImpl::BucketFor(int desired) const {
         static constexpr int buckets[] = { 128, 256, 512, 1024, 2048, 4096, 8192, 12288 };
+        const int cap = MaximumViewDecodeEdge();
         for (int bucket : buckets) {
-            if (bucket > systemProfile_.maximumDecodeBucket) break;
+            if (bucket > cap) break;
             if (desired <= bucket) return bucket;
         }
-        return systemProfile_.maximumDecodeBucket;
+        return cap;
+    }
+
+    int QuickSiftApplicationImpl::MaximumViewDecodeEdge() const {
+        // Round 21 (t29u): also bounded by the device's maximum bitmap edge. A 12288
+        // bucket on an 8192-texture GPU made CreateBitmap fail on every result.
+        return quicksift::core::view_load::EffectiveMaximumDecodeEdge(
+            systemProfile_.maximumDecodeBucket, deviceMaxBitmapEdge_);
     }
 
 
@@ -1185,6 +1216,11 @@ namespace quicksift::app {
             return nullptr;
         }
         --shellFallbackFrameBudget_;
+        // The WIC factory used to be created only by the (never used) Direct2D
+        // image-source cache, so this fallback always discarded the Shell bitmap
+        // after paying for GetImage. Create it here, before any Shell I/O.
+        if (!uiWicFactory_ && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&uiWicFactory_)))) return nullptr;
         ComPtr<IShellItem> item;
         if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item)))) return nullptr;
         ComPtr<IShellItemImageFactory> factory;
@@ -1241,165 +1277,11 @@ namespace quicksift::app {
         return best;
     }
 
-    bool QuickSiftApplicationImpl::SupportsModernWicImageSource(const fs::path& path) const {
-        if (!deviceContext2_ || !systemProfile_.enableModernImageSources) return false;
-        const std::wstring extension = ExtensionLower(path);
-        if (IsRawExtension(extension) || extension == L".webp" || extension == L".avif") return false;
-        return extension == L".jpg" || extension == L".jpeg" || extension == L".jpe" ||
-            extension == L".png" || extension == L".tif" || extension == L".tiff" ||
-            extension == L".bmp" || extension == L".gif" || extension == L".jxr" ||
-            extension == L".wdp" || extension == L".heic" || extension == L".heif";
-    }
-
-
-    WicImageSourceEntry* QuickSiftApplicationImpl::GetOrCreateWicImageSource(const fs::path& path) {
-        if (!SupportsModernWicImageSource(path)) return nullptr;
-        const std::wstring key = path.wstring();
-        const auto verifyNow = std::chrono::steady_clock::now();
-        // 0.9.4.0: WicFileIdentity opens the file (CreateFile + handle query). Single
-        // and Compare view call this on every paint, including zoom/pan animation
-        // frames, so re-verify the identity at most every 500 ms per source.
-        constexpr auto kIdentityReverifyInterval = std::chrono::milliseconds(500);
-        bool recentlyVerified = false;
-        if (const auto cached = wicImageSources_.find(key); cached != wicImageSources_.end()) {
-            recentlyVerified = cached->second.imageSource &&
-                cached->second.identityVerifiedAt != std::chrono::steady_clock::time_point{} &&
-                verifyNow - cached->second.identityVerifiedAt < kIdentityReverifyInterval;
-        }
-        const std::uint64_t identity = recentlyVerified ? 0 : WicFileIdentity(path);
-        if (!recentlyVerified && identity == 0) return nullptr;
-        if (auto existing = wicImageSources_.find(key); existing != wicImageSources_.end()) {
-            if ((recentlyVerified || existing->second.identity == identity) && existing->second.imageSource) {
-                if (!recentlyVerified) existing->second.identityVerifiedAt = verifyNow;
-                existing->second.lastUse = ++useCounter_;
-                existing->second.lastUseTime = std::chrono::steady_clock::now();
-                if (existing->second.offered) {
-                    BOOL discarded = FALSE;
-                    if (SUCCEEDED(existing->second.imageSource->TryReclaimResources(&discarded))) {
-                        existing->second.offered = false;
-                        if (discarded) existing->second.hasTrim = false;
-                    }
-                }
-                return &existing->second;
-            }
-            wicImageSources_.erase(existing);
-        }
-
-        try {
-            if (!uiWicFactory_) {
-                if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                    IID_PPV_ARGS(&uiWicFactory_)))) return nullptr;
-            }
-            WicImageSourceEntry entry;
-            if (FAILED(uiWicFactory_->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                WICDecodeMetadataCacheOnDemand, &entry.decoder)) ||
-                FAILED(entry.decoder->GetFrame(0, &entry.frame))) return nullptr;
-            // The Direct2D image source preserves native JPEG Y/Cb/Cr planes and tiles
-            // only when it receives the original frame. Oriented source files stay on
-            // the existing transform path until orientation-aware source composition is
-            // available, avoiding silent rotation errors.
-            if (ReadOrientationTransform(entry.frame.Get(), path) != WICBitmapTransformRotate0) return nullptr;
-            if (FAILED(entry.frame->GetSize(&entry.width, &entry.height)) ||
-                entry.width == 0 || entry.height == 0) return nullptr;
-            if (FAILED(deviceContext2_->CreateImageSourceFromWic(entry.frame.Get(),
-                D2D1_IMAGE_SOURCE_LOADING_OPTIONS_CACHE_ON_DEMAND, &entry.imageSource))) return nullptr;
-            entry.identity = identity;
-            entry.identityVerifiedAt = verifyNow;
-            entry.lastUse = ++useCounter_;
-            entry.lastUseTime = std::chrono::steady_clock::now();
-
-            const size_t maximumEntries = RetainedWicImageSourceLimit();
-            while (wicImageSources_.size() >= maximumEntries && !wicImageSources_.empty()) {
-                auto victim = wicImageSources_.end();
-                for (auto iterator = wicImageSources_.begin(); iterator != wicImageSources_.end(); ++iterator) {
-                    if (protectedViewPaths_.contains(iterator->first)) continue;
-                    if (victim == wicImageSources_.end() || iterator->second.lastUse < victim->second.lastUse)
-                        victim = iterator;
-                }
-                if (victim == wicImageSources_.end()) break;
-                wicImageSources_.erase(victim);
-            }
-            auto [iterator, inserted] = wicImageSources_.insert_or_assign(key, std::move(entry));
-            (void)inserted;
-            return &iterator->second;
-        } catch (...) {
-            return nullptr;
-        }
-    }
-
-
-    bool QuickSiftApplicationImpl::DrawWicImageSourceFit(WicImageSourceEntry* entry,
-        D2D1_RECT_F area, const quicksift::review::transform::ResolvedView& view, bool clip ) {
-        if (!entry || !entry->imageSource || !deviceContext2_ || entry->width == 0 ||
-            entry->height == 0 || !view.valid) return false;
-        const float scale = view.scaleDip;
-        const float drawWidth = static_cast<float>(entry->width) * scale;
-        const float drawHeight = static_cast<float>(entry->height) * scale;
-        const float areaCenterX = (area.left + area.right) * 0.5f;
-        const float areaCenterY = (area.top + area.bottom) * 0.5f;
-        const float left = areaCenterX - view.state.centerX * drawWidth;
-        const float top = areaCenterY - view.state.centerY * drawHeight;
-
-        if (clip) deviceContext2_->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        D2D1_MATRIX_3X2_F previous{};
-        deviceContext2_->GetTransform(&previous);
-        D2D1_MATRIX_3X2_F transform = D2D1::Matrix3x2F::Scale(scale, scale) *
-            D2D1::Matrix3x2F::Translation(left, top);
-        if (view.state.rotation != 0) {
-            transform = transform * D2D1::Matrix3x2F::Rotation(
-                static_cast<float>(view.state.rotation),
-                D2D1::Point2F(areaCenterX, areaCenterY));
-        }
-        deviceContext2_->SetTransform(transform * previous);
-        const D2D1_INTERPOLATION_MODE interpolation = IsActivelyInteracting() ?
-            D2D1_INTERPOLATION_MODE_LINEAR : D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC;
-        const D2D1_POINT_2F targetOffset = D2D1::Point2F(0.0f, 0.0f);
-        deviceContext2_->DrawImage(entry->imageSource.Get(), &targetOffset, nullptr,
-            interpolation, D2D1_COMPOSITE_MODE_SOURCE_OVER);
-        deviceContext2_->SetTransform(previous);
-        if (clip) deviceContext2_->PopAxisAlignedClip();
-
-        if (view.state.rotation == 0) {
-            auto clampCoordinate = [](float value, UINT maximum, bool upper) -> UINT {
-                if (!std::isfinite(value) || value <= 0.0f) return 0;
-                if (value >= static_cast<float>(maximum)) return maximum;
-                return static_cast<UINT>(upper ? std::ceil(value) : std::floor(value));
-            };
-            D2D1_RECT_U visible{
-                clampCoordinate((area.left - left) / scale, entry->width, false),
-                clampCoordinate((area.top - top) / scale, entry->height, false),
-                clampCoordinate((area.right - left) / scale, entry->width, true),
-                clampCoordinate((area.bottom - top) / scale, entry->height, true)
-            };
-            visible.right = std::max(visible.left +
-                (visible.left < entry->width ? 1u : 0u), visible.right);
-            visible.bottom = std::max(visible.top +
-                (visible.top < entry->height ? 1u : 0u), visible.bottom);
-            visible.right = std::min(visible.right, entry->width);
-            visible.bottom = std::min(visible.bottom, entry->height);
-            const auto materiallyDifferent = [&](const D2D1_RECT_U& previousRect) {
-                constexpr UINT threshold = 64;
-                return !entry->hasTrim ||
-                    (visible.left > previousRect.left ? visible.left - previousRect.left : previousRect.left - visible.left) > threshold ||
-                    (visible.top > previousRect.top ? visible.top - previousRect.top : previousRect.top - visible.top) > threshold ||
-                    (visible.right > previousRect.right ? visible.right - previousRect.right : previousRect.right - visible.right) > threshold ||
-                    (visible.bottom > previousRect.bottom ? visible.bottom - previousRect.bottom : previousRect.bottom - visible.bottom) > threshold;
-            };
-            if (visible.right > visible.left && visible.bottom > visible.top &&
-                materiallyDifferent(entry->lastTrim)) {
-                entry->imageSource->TrimCache(&visible);
-                entry->lastTrim = visible;
-                entry->hasTrim = true;
-            }
-        }
-        entry->lastUse = ++useCounter_;
-        entry->lastUseTime = std::chrono::steady_clock::now();
-        return true;
-    }
-
-
     BitmapEntry* QuickSiftApplicationImpl::GetOrRequestBitmap(const fs::path& path, int desired, JobPriority priority, bool requestFull,
         CacheClass cacheClass, uint64_t viewportEpoch, bool ignoreThumbnailViewport) {
+        // One path materialization per call (fs::path::wstring() allocates a copy;
+        // this runs for every visible card / view pane on every frame).
+        const std::wstring pathText = path.wstring();
         const bool raw = IsRawExtension(ExtensionLower(path));
         const bool rawJpegOnly = raw && loadOnlyRawJpegPreviews_;
         if (rawJpegOnly) requestFull = false;
@@ -1407,7 +1289,7 @@ namespace quicksift::app {
         // source dimension (for example 160 px), which must not clamp the requested
         // thumbnail bucket and cause an immediate cancellation/retry loop.
         if (cacheClass != CacheClass::Thumbnail && !requestFull) {
-            if (const auto photo = IndexForPath(path.wstring()); photo) {
+            if (const auto photo = IndexForPath(pathText); photo) {
                 const PhotoItem& item = VisiblePhoto(*photo);
                 if (item.sourceWidth > 0 && item.sourceHeight > 0) {
                     desired = std::min(desired, std::max(item.sourceWidth, item.sourceHeight));
@@ -1417,13 +1299,17 @@ namespace quicksift::app {
         const int desiredEdge = std::max(1, desired);
         const int bucket = BucketFor(desiredEdge);
         const CacheClass requestedClass = requestFull ? (bucket >= 6144 ? CacheClass::Full : cacheClass) : cacheClass;
-        const CacheKey exact{ path.wstring(), bucket, requestedClass };
+        const CacheKey exact{ pathText, bucket, requestedClass };
         const auto exactIt = bitmapCache_.find(exact);
         const bool gridThumbnailRequest = !requestFull && cacheClass == CacheClass::Thumbnail;
         BitmapEntry* existing = nullptr;
         if (gridThumbnailRequest && exactIt != bitmapCache_.end()) {
             TouchBitmapEntry(exactIt->first, exactIt->second);
             existing = &exactIt->second;
+            // Hot path (every on-screen card, every frame): an exact, adequately
+            // sized thumbnail needs no retry-key normalization, catalog lookup or
+            // enqueue decision; the slow path below would enqueue nothing either.
+            if (BitmapSatisfiesDisplay(existing, desiredEdge, false)) return existing;
         } else if (gridThumbnailRequest) {
             existing = FindBitmap(path, bucket, requestedClass);
         } else {
@@ -1446,7 +1332,7 @@ namespace quicksift::app {
             int retryAttempt = 0;
             bool forceWic = false;
             if (!thumbnailRetryState_.empty() || !failedThumbnailPaths_.empty()) {
-                const auto photoIndex = IndexForPath(path.wstring());
+                const auto photoIndex = IndexForPath(pathText);
                 if (photoIndex) {
                     if (!ThumbnailDecodeAdmissible(VisiblePhoto(*photoIndex), thumbnailRetryKey,
                         std::chrono::steady_clock::now(), retryAttempt, forceWic)) return existing;
@@ -1456,7 +1342,7 @@ namespace quicksift::app {
             }
             const bool resolutionSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, false);
             if (exactIt == bitmapCache_.end()) {
-                const std::wstring previewFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
+                const std::wstring previewFailed = DecodeFailureKey(pathText, bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
                 if (!HasRecentDecodeFailure(previewFailed))
                     worker_.EnqueuePreview(path, bucket, generation_, priority, CacheClass::Thumbnail, epoch,
                         thumbnailViewportEpoch, retryAttempt, forceWic, 0, ignoreThumbnailViewport);
@@ -1464,28 +1350,36 @@ namespace quicksift::app {
                 // Keep an undersized embedded preview as an immediate stand-in, but
                 // never let its bucket identity suppress the real target-sized decode
                 // unless the user explicitly forbids RAW decoding.
-                const std::wstring fullFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
+                const std::wstring fullFailed = DecodeFailureKey(pathText, bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
                 if (!HasRecentDecodeFailure(fullFailed))
                     worker_.EnqueueFull(path, bucket, generation_, priority, CacheClass::Thumbnail, epoch,
                         thumbnailViewportEpoch);
             }
         } else if (raw) {
-            const CacheKey previewKey{ path.wstring(), bucket, cacheClass };
+            const CacheKey previewKey{ pathText, bucket, cacheClass };
             const auto previewIt = bitmapCache_.find(previewKey);
             const bool previewSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, false);
-            const std::wstring previewFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
+            const std::wstring previewFailed = DecodeFailureKey(pathText, bucket, JobKind::DecodePreview, gridThumbnailRequest ? CacheClass::Thumbnail : cacheClass);
             if (previewIt == bitmapCache_.end() && !previewSatisfied && !HasRecentDecodeFailure(previewFailed)) {
                 RequestViewDecode(path, JobKind::DecodePreview, bucket, cacheClass, priority);
             }
             const bool fullSatisfied = BitmapSatisfiesDisplay(existing, desiredEdge, true);
-            if (requestFull && !fullSatisfied) {
-                const std::wstring fullFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
+            // Round 21 (t29u): like the non-RAW branch, never re-request once the
+            // exact bucket holds a full-quality result. LibRaw half-size / the decoded
+            // pixel cap / the bucket cap can keep it below the native edge when
+            // zoomed, and this re-ran a full demosaic on every paint.
+            const auto exactFull = bitmapCache_.find(CacheKey{ pathText, bucket, requestedClass });
+            const bool exactFullPresent = exactFull != bitmapCache_.end() &&
+                exactFull->second.bitmap && !exactFull->second.previewOnly;
+            if (requestFull &&
+                quicksift::core::view_load::ShouldRequestFullViewDecode(fullSatisfied, exactFullPresent)) {
+                const std::wstring fullFailed = DecodeFailureKey(pathText, bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
                 if (!HasRecentDecodeFailure(fullFailed))
                     RequestViewDecode(path, JobKind::DecodeFull, bucket, requestedClass, priority);
             }
         } else if (exactIt == bitmapCache_.end() &&
             !BitmapSatisfiesDisplay(existing, desiredEdge, requestFull)) {
-            const std::wstring fullFailed = DecodeFailureKey(path.wstring(), bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
+            const std::wstring fullFailed = DecodeFailureKey(pathText, bucket, JobKind::DecodeFull, gridThumbnailRequest ? CacheClass::Thumbnail : requestedClass);
             if (!HasRecentDecodeFailure(fullFailed))
                 RequestViewDecode(path, JobKind::DecodeFull, bucket, requestedClass, priority);
         }

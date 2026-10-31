@@ -32,6 +32,7 @@ void QuickSiftApplicationImpl::CreateFaceLockAvailabilityTooltip() {
     spec.toolId = static_cast<UINT_PTR>(ID_FACE_LOCK);
     spec.text = &faceLockAvailabilityTooltipText_;
     faceLockAvailabilityTooltip_ = uiFramework_.CreateTooltip(spec);
+    RestyleTooltips();
     if (!faceLockAvailabilityTooltip_) {
         quicksift::diagnostics::WriteLastError(quicksift::diagnostics::Level::Warning,
             L"UI", L"Creating the Face Lock availability tooltip");

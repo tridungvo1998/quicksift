@@ -7,12 +7,15 @@
 #include "platform/application_data_paths.h"
 #include "core/priority_policy.h"
 #include "core/lock_order.h"
+#include "core/log_retention.h"
 
 #include <commdlg.h>
 #include <dbghelp.h>
 #include <psapi.h>
 
 #include <algorithm>
+#include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
@@ -130,7 +133,6 @@ std::wstring TimestampForFile() {
     return buffer;
 }
 
-constexpr std::size_t kRetainedSessionLogs = 20;
 constexpr std::size_t kRetainedCrashIncidents = 20;
 constexpr std::uint64_t kMaximumSessionLogBytes = 16ull * 1024ull * 1024ull;
 
@@ -159,33 +161,6 @@ constexpr std::uint64_t kMaximumSessionLogBytes = 16ull * 1024ull * 1024ull;
     } catch (...) {
     }
     return false;
-}
-
-void PruneSessionLogs(const fs::path& directory, std::size_t maximumLogs) noexcept {
-    try {
-        struct Candidate { fs::path path; fs::file_time_type modified{}; };
-        std::vector<Candidate> logs;
-        std::error_code ec;
-        for (const auto& entry : fs::directory_iterator(directory,
-            fs::directory_options::skip_permission_denied, ec)) {
-            if (ec) break;
-            if (!entry.is_regular_file(ec) || ec) { ec.clear(); continue; }
-            const std::wstring name = entry.path().filename().wstring();
-            if (!name.starts_with(L"QuickSift-") || entry.path().extension() != L".log") continue;
-            const auto modified = entry.last_write_time(ec);
-            logs.push_back({ entry.path(), ec ? fs::file_time_type{} : modified });
-            ec.clear();
-        }
-        std::sort(logs.begin(), logs.end(), [](const Candidate& left, const Candidate& right) {
-            if (left.modified != right.modified) return left.modified > right.modified;
-            return left.path.filename().wstring() > right.path.filename().wstring();
-        });
-        for (std::size_t index = maximumLogs; index < logs.size(); ++index) {
-            ec.clear();
-            fs::remove(logs[index].path, ec);
-        }
-    } catch (...) {
-    }
 }
 
 void PruneCrashReports(const fs::path& directory) noexcept {
@@ -860,4 +835,265 @@ bool ExportSnapshotInteractive(HWND owner, fs::path* destination) noexcept {
     }
 }
 
+namespace {
+// FILETIME (100 ns since 1601-01-01 UTC) to system_clock (Unix epoch on MSVC).
+std::chrono::system_clock::time_point FromFileTime(const FILETIME& time) noexcept {
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart = time.dwLowDateTime;
+    ticks.HighPart = time.dwHighDateTime;
+    constexpr std::uint64_t kUnixEpochTicks = 116444736000000000ull;
+    if (ticks.QuadPart < kUnixEpochTicks) return {};
+    return std::chrono::system_clock::time_point(std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        std::chrono::microseconds((ticks.QuadPart - kUnixEpochTicks) / 10)));
+}
+
+// Non-recursive listing of QuickSift-* entries in one of our own folders. The
+// folder itself is skipped when it is a reparse point (never followed).
+bool ListRetentionCandidates(const fs::path& folder, std::vector<quicksift::core::log_retention::Entry>& entries,
+    std::wstring& skipReason) {
+    const DWORD folderAttributes = GetFileAttributesW(folder.c_str());
+    if (folderAttributes == INVALID_FILE_ATTRIBUTES) { skipReason = L"missing"; return false; }
+    if ((folderAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) { skipReason = L"not_a_folder"; return false; }
+    if ((folderAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { skipReason = L"reparse_point"; return false; }
+    WIN32_FIND_DATAW data{};
+    const std::wstring pattern = (folder / L"QuickSift-*").wstring();
+    HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
+        FIND_FIRST_EX_LARGE_FETCH);
+    if (find == INVALID_HANDLE_VALUE) return true; // nothing matches
+    do {
+        quicksift::core::log_retention::Entry entry;
+        entry.name = data.cFileName;
+        entry.lastWrite = FromFileTime(data.ftLastWriteTime);
+        entry.reparsePoint = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        entry.regularFile = (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) == 0;
+        entries.push_back(std::move(entry));
+    } while (FindNextFileW(find, &data) != FALSE);
+    FindClose(find);
+    return true;
+}
+
+enum class DeleteOutcome { Deleted, Skipped, Failed };
+
+// Deletes one entry the policy selected, through a handle opened on the entry
+// itself (FILE_FLAG_OPEN_REPARSE_POINT: a link is never followed). The handle is
+// re-checked before deleting: still a plain file, still not a reparse point,
+// still older than the retention age. A file another process has open without
+// delete sharing (a live session log) fails to open and is left alone.
+DeleteOutcome DeleteOwnDiagnosticFile(const fs::path& target, std::chrono::system_clock::time_point now,
+    DWORD& error) noexcept {
+    HANDLE file = CreateFileW(target.c_str(), DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND ? DeleteOutcome::Skipped : DeleteOutcome::Failed;
+    }
+    DeleteOutcome outcome = DeleteOutcome::Skipped;
+    FILE_ATTRIBUTE_TAG_INFO tag{};
+    FILE_BASIC_INFO basic{};
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) != FALSE &&
+        GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) != FALSE &&
+        GetFileInformationByHandle(file, &identity) != FALSE &&
+        (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) == 0 &&
+        identity.nNumberOfLinks == 1) {
+        FILETIME written{};
+        written.dwLowDateTime = static_cast<DWORD>(basic.LastWriteTime.QuadPart & 0xFFFFFFFFull);
+        written.dwHighDateTime = static_cast<DWORD>(static_cast<std::uint64_t>(basic.LastWriteTime.QuadPart) >> 32);
+        const auto lastWrite = FromFileTime(written);
+        if (lastWrite <= now && now - lastWrite > quicksift::core::log_retention::kMaxAge) {
+            FILE_DISPOSITION_INFO disposition{};
+            disposition.DeleteFile = TRUE;
+            if (SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE) {
+                outcome = DeleteOutcome::Deleted;
+            } else {
+                error = GetLastError();
+                outcome = DeleteOutcome::Failed;
+            }
+        }
+    }
+    CloseHandle(file);
+    return outcome;
+}
+} // namespace
+
+CleanupSummary CleanupOldDiagnosticFiles(const std::function<bool()>& cancelled) noexcept {
+    namespace lr = quicksift::core::log_retention;
+    CleanupSummary summary;
+    try {
+        const auto started = std::chrono::steady_clock::now();
+        const fs::path root = DataRootPath();
+        if (root.empty()) return summary;
+        fs::path crashFolder = CrashReportDirectory();
+        if (crashFolder.empty()) crashFolder = root / L"CrashReports";
+        const std::wstring currentSession = SessionLogPath().filename().wstring();
+        const auto now = std::chrono::system_clock::now();
+        const std::pair<lr::Folder, fs::path> folders[] = {
+            { lr::Folder::Logs, root / L"Logs" }, { lr::Folder::CrashReports, crashFolder } };
+        for (const auto& [folder, path] : folders) {
+            std::vector<lr::Entry> entries;
+            std::wstring skipReason;
+            if (!ListRetentionCandidates(path, entries, skipReason)) {
+                WriteEvent(Level::Info, L"Diagnostics", L"cleanup_folder_skipped",
+                    { { L"folder", folder == lr::Folder::Logs ? L"Logs" : L"CrashReports" }, { L"reason", skipReason } });
+                continue;
+            }
+            summary.scanned += entries.size();
+            for (const std::wstring& name : lr::Plan(folder, entries, now, currentSession)) {
+                if (cancelled && cancelled()) { summary.cancelled = true; break; }
+                const fs::path target = path / name;
+                const lr::Kind kind = lr::Classify(name);
+                DWORD error = ERROR_SUCCESS;
+                const DeleteOutcome outcome = DeleteOwnDiagnosticFile(target, now, error);
+                if (outcome == DeleteOutcome::Deleted) {
+                    ++summary.deleted;
+                    WriteEvent(Level::Info, L"Diagnostics", L"old_file_deleted",
+                        { { L"kind", std::wstring(lr::KindName(kind)) }, { L"file", name } });
+                } else if (outcome == DeleteOutcome::Failed) {
+                    ++summary.failed;
+                    WriteEvent(Level::Warning, L"Diagnostics", L"old_file_delete_failed",
+                        { { L"kind", std::wstring(lr::KindName(kind)) }, { L"file", name },
+                          { L"win32", std::to_wstring(error) } });
+                } else {
+                    WriteEvent(Level::Info, L"Diagnostics", L"old_file_skipped",
+                        { { L"kind", std::wstring(lr::KindName(kind)) }, { L"file", name },
+                          { L"reason", L"changed_or_link" } });
+                }
+            }
+            if (summary.cancelled) break;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        WriteEvent(Level::Info, L"Diagnostics", L"cleanup_complete",
+            { { L"deleted", std::to_wstring(summary.deleted) }, { L"failed", std::to_wstring(summary.failed) },
+              { L"scanned", std::to_wstring(summary.scanned) }, { L"cancelled", summary.cancelled ? L"1" : L"0" },
+              { L"max_age_days", std::to_wstring(lr::kMaxAge.count() / 24) }, { L"ms", std::to_wstring(ms) } });
+    } catch (...) {
+        // Best effort: cleanup never affects the session.
+    }
+    return summary;
+}
+
+fs::path SessionLogDirectory() {
+    const fs::path root = DataRootPath();
+    return root.empty() ? fs::path{} : root / L"Logs";
+}
+
+namespace {
+// The Logs folder, or empty when it is missing, not a folder, or a reparse point
+// (never followed, same rule as the cleanup).
+fs::path BrowsableLogsFolder() {
+    const fs::path folder = SessionLogDirectory();
+    if (folder.empty()) return {};
+    const DWORD attributes = GetFileAttributesW(folder.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) return {};
+    return folder;
+}
+
+struct ScopedFileHandle {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    ScopedFileHandle() = default;
+    explicit ScopedFileHandle(HANDLE value) noexcept : handle(value) {}
+    ScopedFileHandle(const ScopedFileHandle&) = delete;
+    ScopedFileHandle& operator=(const ScopedFileHandle&) = delete;
+    ~ScopedFileHandle() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+};
+} // namespace
+
+std::vector<quicksift::core::session_logs::Listed> ListPreviousSessionLogs() noexcept {
+    namespace sl = quicksift::core::session_logs;
+    try {
+        const fs::path folder = BrowsableLogsFolder();
+        if (folder.empty()) return {};
+        std::vector<sl::Candidate> candidates;
+        WIN32_FIND_DATAW data{};
+        const std::wstring pattern = (folder / L"QuickSift-*").wstring();
+        HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data, FindExSearchNameMatch, nullptr,
+            FIND_FIRST_EX_LARGE_FETCH);
+        if (find == INVALID_HANDLE_VALUE) return {};
+        struct FindCloser {
+            HANDLE handle;
+            ~FindCloser() { FindClose(handle); }
+        } closer{ find };
+        do {
+            sl::Candidate candidate;
+            candidate.name = data.cFileName;
+            candidate.bytes = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+            candidate.reparsePoint = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            candidate.regularFile = (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_DEVICE)) == 0;
+            candidates.push_back(std::move(candidate));
+        } while (FindNextFileW(find, &data) != FALSE);
+        return sl::Select(candidates, SessionLogPath().filename().wstring());
+    } catch (...) {
+        // Best effort: an empty list shows "No previous session logs".
+        return {};
+    }
+}
+
+SessionLogText ReadSessionLogTail(std::wstring_view name) noexcept {
+    namespace sl = quicksift::core::session_logs;
+    SessionLogText result;
+    try {
+        if (!sl::IsBrowsableName(name)) { result.error = ERROR_INVALID_NAME; return result; }
+        const fs::path folder = BrowsableLogsFolder();
+        if (folder.empty()) { result.error = ERROR_PATH_NOT_FOUND; return result; }
+        // Read-only access with full sharing: the owning session may still be
+        // writing (a second QuickSift window), and nothing here may block it.
+        ScopedFileHandle file(CreateFileW((folder / std::wstring(name)).c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (file.handle == INVALID_HANDLE_VALUE) { result.error = GetLastError(); return result; }
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        LARGE_INTEGER size{};
+        if (GetFileInformationByHandleEx(file.handle, FileAttributeTagInfo, &tag, sizeof(tag)) == FALSE ||
+            (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) != 0 ||
+            GetFileSizeEx(file.handle, &size) == FALSE || size.QuadPart < 0) {
+            result.error = ERROR_CANT_ACCESS_FILE;
+            return result;
+        }
+        const sl::TailPlan plan = sl::PlanTail(static_cast<std::uint64_t>(size.QuadPart));
+        LARGE_INTEGER offset{};
+        offset.QuadPart = static_cast<LONGLONG>(plan.offset);
+        if (SetFilePointerEx(file.handle, offset, nullptr, FILE_BEGIN) == FALSE) {
+            result.error = GetLastError();
+            return result;
+        }
+        std::string bytes(static_cast<std::size_t>(plan.length), '\0');
+        std::size_t filled = 0;
+        while (filled < bytes.size()) {
+            DWORD read = 0;
+            const DWORD request = static_cast<DWORD>(std::min<std::size_t>(bytes.size() - filled, 1u << 20));
+            if (ReadFile(file.handle, bytes.data() + filled, request, &read, nullptr) == FALSE) {
+                result.error = GetLastError();
+                return result;
+            }
+            if (read == 0) break; // the file shrank meanwhile: show what was read
+            filled += read;
+        }
+        bytes.resize(filled);
+        const std::size_t first = std::min(bytes.size(), sl::FirstShownByte(bytes, plan.truncated));
+        const std::string_view shown(bytes.data() + first, bytes.size() - first);
+        if (!shown.empty()) {
+            // Invalid UTF-8 (a log cut off by a crash) becomes U+FFFD instead of failing.
+            const int length = MultiByteToWideChar(CP_UTF8, 0, shown.data(), static_cast<int>(shown.size()), nullptr, 0);
+            if (length > 0) {
+                result.text.resize(static_cast<std::size_t>(length));
+                MultiByteToWideChar(CP_UTF8, 0, shown.data(), static_cast<int>(shown.size()),
+                    result.text.data(), length);
+            }
+        }
+        result.ok = true;
+        result.totalBytes = static_cast<std::uint64_t>(size.QuadPart);
+        result.shownBytes = shown.size();
+        result.truncated = plan.truncated;
+    } catch (...) {
+        // Out of memory or similar: report "could not read" rather than throw.
+        result.ok = false;
+        result.text.clear();
+        if (result.error == ERROR_SUCCESS) result.error = ERROR_NOT_ENOUGH_MEMORY;
+    }
+    return result;
+}
+
 } // namespace quicksift::diagnostics
+

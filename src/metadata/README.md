@@ -24,7 +24,7 @@ Owns the deliberately narrow XMP subset QuickSift needs for rating, label, and p
 - insert a new attribute into an existing `rdf:Description`;
 - preserve unknown XML and refuse ambiguous or malformed structures.
 
-It is **not** a general XML or RDF engine. Unsupported documents must fail without modification. Do not broaden it by adding loose regular expressions in `main.cpp`; add a focused test first and keep rejected input byte-for-byte unchanged.
+It is **not** a general XML or RDF engine. Unsupported documents must fail without modification. Do not broaden it by adding loose regular expressions at a call site; add a focused check first and keep rejected input byte-for-byte unchanged.
 
 ### `jpeg_orientation.*`
 
@@ -33,8 +33,13 @@ Owns bounded parsing of JPEG APP1/Exif orientation. Every marker length, TIFF of
 ## Where neighboring work belongs
 
 - Embedded JPEG/TIFF/PNG metadata transactions: `../embedded_metadata.*`
-- Sidecar file reading, encoding preservation, atomic publication, and metadata precedence: `../main.cpp` composition adapters, with transaction behavior in `../ui/metadata_history_and_file_safety.cpp`
-- Background metadata scheduling: `../work/background_work_engine.cpp`
+- Sidecar file reading/writing and metadata precedence: `../app/application_support.cpp` (`SidecarPathFor`, `ReadSidecarMetadata`, `WritePhotoMetadataPatch`, `ReadPhotoMetadata`); the sidecar write plan is `../core/sidecar_write_policy.h`
+- Encoding preservation and atomic text publication: `../app/application_text_io.cpp`
+- JPEG XMP packet location: `jpeg_xmp_locator.*` (this folder)
+- Exiv2 gate admission: `../core/metadata_gate_policy.h` (gate in `../embedded_metadata.cpp`)
+- Canonical rating/pick/label tokens: `../core/metadata_vocabulary.h`
+- Background metadata scheduling: `../work/background_work_engine.cpp` (`ExecuteMetadataReadJob`); lane admission, retries and queue order: `../core/metadata_lane_policy.h`, `metadata_progress.h`, `metadata_queue_order.h`
+- Write-lane retry and coalescing: `../core/write_retry_policy.h`, `../core/metadata_edit_queue.h`, `../ui/metadata_write_lane_controller.cpp`
 - Persistent metadata records: `../persistent_cache.*`
 - Metadata UI and history: `../ui/metadata_history_and_file_safety.cpp`
 
@@ -42,7 +47,7 @@ Owns bounded parsing of JPEG APP1/Exif orientation. Every marker length, TIFF of
 
 1. Identify whether the change is parsing, XMP structure, JPEG binary structure, transaction safety, or UI behavior.
 2. Edit the single owner listed above.
-3. Add the smallest corrupt, boundary, duplicate, or unsupported input to `tests/core_tests.cpp` when portable.
+3. Add the smallest corrupt, boundary, duplicate, or unsupported input to the matching `../../scripts/checks/*.cpp` program (`jpeg_xmp_checks.cpp`, `sidecar_write_checks.cpp`, …) when portable.
 4. Keep reads and writes symmetrical: a value written by QuickSift must be readable by the same owner.
 5. Reject malformed values instead of clamping them into legitimate-looking metadata.
 6. Run the validation sequence in `../../TESTING.md`.

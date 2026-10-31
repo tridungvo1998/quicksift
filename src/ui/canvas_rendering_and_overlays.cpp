@@ -1,5 +1,10 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "core/blur_outline_policy.h"
+#include "core/hud_snapshot.h"
+#include "core/log_rate_limiter.h"
+#include "diagnostics/log_categories.h"
+#include "diagnostics/log_and_continue.h"
 
 namespace quicksift::app {
 
@@ -253,6 +258,13 @@ namespace quicksift::app {
             }
             // Skip: the locked files keep their rolled-back values.
             if (shownAction == PendingGlassAction::MetadataRetryInUse) SkipInUseMetadataChanges();
+            // "Wait" / "Stop waiting": the operation keeps running; nothing else waits.
+            if (shownAction == PendingGlassAction::BlockingWaitPrimary) {
+                KillTimer(hwnd_, ID_TIMER_BLOCKING_WAIT);
+                if (blockingWaitCommand_ == quicksift::core::blocking_wait::Command::Close)
+                    ShowToast(L"QuickSift is still waiting. Close again to see progress.");
+                blockingWaitCommand_.reset();
+            }
             return;
         }
         DispatchGlassAction(static_cast<PendingGlassAction>(*actionToken));
@@ -287,25 +299,14 @@ namespace quicksift::app {
         case PendingGlassAction::MetadataRetryInUse:
             RetryInUseMetadataChanges();
             return;
+        case PendingGlassAction::BlockingWaitPrimary:
+            OnBlockingWaitPrimary();
+            return;
         default:
             break;
         }
         if (action == PendingGlassAction::DeleteSelection) {
             FileOperation(false, true);
-            return;
-        }
-        if (action == PendingGlassAction::CloseWithPendingOperations) {
-            closingAfterTransactionCancellation_ = true;
-            // "Close anyway" cancels pending work, including coalesced edits that
-            // were never submitted (their optimistic values die with the window).
-            pendingMetadataEdits_.Clear();
-            transactions_.RequestCloseAtSafeBoundary();
-            if (transactions_.ConsumeCloseRequestIfIdle()) {
-                SaveSession();
-                DestroyWindow(hwnd_);
-            } else {
-                ShowToast(L"Cancelling file operations at a safe boundary before closing…");
-            }
             return;
         }
         if (action == PendingGlassAction::RelinquishUndoHistory) {
@@ -447,40 +448,138 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::DrawPerformanceHudOverlay() {
         if (!performanceHudVisible_ || !renderTarget_ || !smallText_ || !overlayBrush_ || !textBrush_) return;
-        const auto telemetry = worker_.Telemetry();
-        MEMORYSTATUSEX memory{ sizeof(memory) };
-        GlobalMemoryStatusEx(&memory);
-        const auto toMiB = [](std::uint64_t bytes) -> std::uint64_t { return bytes / kMebibyte; };
+        namespace hud = quicksift::core::hud;
+        const auto telemetry = worker_.Telemetry(); // one short lock; heads-only lane scan
+        const auto now = std::chrono::steady_clock::now();
+        // O(n) catalog counts and the blocker probe are refreshed at most once a second.
+        if (now - hudCountsAt_ >= std::chrono::seconds(1)) {
+            hudCountsAt_ = now;
+            hudPendingRating_ = 0;
+            hudPendingPick_ = 0;
+            for (std::size_t index = 0; index < catalog_.PhotoCount(); ++index) {
+                const PhotoItem& photo = catalog_.PhotoAt(index);
+                if (photo.ratingKnowledge == MetadataKnowledge::Unknown) ++hudPendingRating_;
+                if (photo.pickStateKnowledge == MetadataKnowledge::Unknown) ++hudPendingPick_;
+            }
+            MEMORYSTATUSEX memory{ sizeof(memory) };
+            hudRamFreeMiB_ = GlobalMemoryStatusEx(&memory) ? memory.ullAvailPhys / kMebibyte : 0;
+            const auto blockers = CurrentBlockers(!blockingWaitCommand_ ||
+                *blockingWaitCommand_ == quicksift::core::blocking_wait::Command::Close);
+            hudBlockingReason_ = blockers.empty() ? std::wstring{} :
+                Tr(quicksift::core::blocking_wait::ReasonKey(blockers.front().reason));
+        }
+        hud::HudSnapshot snapshot;
+        snapshot.interactive = telemetry.interactiveQueued;
+        snapshot.visible = telemetry.visibleQueued;
+        snapshot.predictive = telemetry.predictiveQueued;
+        snapshot.idle = telemetry.idleQueued;
+        snapshot.analysis = telemetry.analysisQueued;
+        snapshot.view = telemetry.viewQueued;
+        snapshot.viewPrefetch = telemetry.viewPrefetchQueued;
+        snapshot.faces = telemetry.faceQueued;
+        snapshot.metadata = telemetry.metadataQueued + pendingMetadataIndices_.size();
+        snapshot.writes = telemetry.cacheWritesQueued + pendingMetadataEdits_.Size();
+        snapshot.activeVisual = telemetry.activeVisualJobs;
+        snapshot.activeForeground = telemetry.activeForegroundVisualJobs;
+        snapshot.metadataInFlight = metadataJobsInFlight_;
+        snapshot.pendingMetadata = pendingRatings_;
+        snapshot.pendingRating = hudPendingRating_;
+        snapshot.pendingPick = hudPendingPick_;
+        snapshot.oldestQueuedMs = telemetry.oldestQueuedMs;
+        snapshot.cacheMiB = static_cast<std::uint64_t>(TotalCacheBytes()) / kMebibyte;
+        snapshot.ramFreeMiB = hudRamFreeMiB_;
+        snapshot.diskHits = telemetry.persistentCacheHits;
+        snapshot.diskMisses = telemetry.persistentCacheMisses;
+        snapshot.lastJpegMs = telemetry.lastDecodeMillisecondsByFormat[0];
+        snapshot.lastRawMs = telemetry.lastDecodeMillisecondsByFormat[1];
+        snapshot.avgDecodeMs = telemetry.decodeMilliseconds;
+        snapshot.queueWaitMs = telemetry.queueWaitMilliseconds;
+        snapshot.metadataLaneState = telemetry.metadataLaneState;
+        snapshot.metadataWriteBusy = transactions_.MetadataBusy();
+        snapshot.fileOperationBusy = transactions_.FileBusy();
+        snapshot.ratingsWorkerBusy = RatingsWorkerBusy();
+        snapshot.batchWorkerBusy = BatchWorkerBusy();
+        snapshot.workerStopping = telemetry.stopping;
+        snapshot.blockingReason = hudBlockingReason_;
+        snapshot.focus = reviewState_.Mode() == ViewMode::Thumbnails ? L"THUMBNAILS" :
+            reviewState_.Mode() == ViewMode::Single ? L"SINGLE VIEW" : L"COMPARE";
+        const std::wstring text = hud::FormatHud(snapshot);
+
+        // Size from the measured text (DirectWrite works in DIPs, so this is DPI-aware).
+        // The layout is rebuilt only when the text changes; the width only grows while
+        // the HUD is shown so changing digits do not make the panel jitter.
+        if (!hudLayout_ || text != hudLayoutText_) {
+            hudLayout_.Reset();
+            if (!dwriteFactory_ || FAILED(dwriteFactory_->CreateTextLayout(text.c_str(),
+                    static_cast<UINT32>(text.size()), smallText_.Get(), 4096.0f, 4096.0f, &hudLayout_))) {
+                return;
+            }
+            hudLayout_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            hudLayout_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            hudLayout_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            hudLayoutText_ = text;
+        }
+        DWRITE_TEXT_METRICS metrics{};
+        if (FAILED(hudLayout_->GetMetrics(&metrics))) return;
+        hudTextWidthDip_ = std::max(hudTextWidthDip_, std::ceil(metrics.widthIncludingTrailingWhitespace));
+        const float textHeight = std::ceil(metrics.height);
+
         const D2D1_SIZE_F size = renderTarget_->GetSize();
-        const float width = 285.0f;
-        const float height = 176.0f;
-        const float right = size.width - 12.0f;
-        const float top = 12.0f;
-        const D2D1_RECT_F panel = D2D1::RectF(right - width, top, right, top + height);
+        // Content area = canvas minus the left hover-rail inset; obstacles = every
+        // overlay painted on the canvas (search field) and every sibling control
+        // over it (search input, filmstrip toggle, pane, tabs...). The drag handle
+        // and first line are never left under one of them.
+        const hud::PanelRect content{ std::min(kThumbnailRailSafeInsetDip * 0.5f, size.width * 0.25f), 0.0f,
+            size.width, size.height };
+        std::vector<hud::PanelRect> obstacles;
+        if (SearchFieldAvailable()) {
+            const D2D1_RECT_F frame = SearchFieldFrameDip();
+            obstacles.push_back({ frame.left - 4.0f, frame.top - 4.0f, frame.right + 4.0f,
+                frame.bottom + 8.0f });
+        }
+        if (canvas_ && hwnd_) {
+            RECT canvasScreen{};
+            GetWindowRect(canvas_, &canvasScreen);
+            for (HWND child = GetWindow(hwnd_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+                if (child == canvas_ || !IsWindowVisible(child)) continue;
+                RECT rc{};
+                GetWindowRect(child, &rc);
+                RECT overlap{};
+                if (!IntersectRect(&overlap, &rc, &canvasScreen)) continue;
+                const auto topLeft = CanvasPixelsToDips(static_cast<int>(overlap.left - canvasScreen.left),
+                    static_cast<int>(overlap.top - canvasScreen.top));
+                const auto bottomRight = CanvasPixelsToDips(static_cast<int>(overlap.right - canvasScreen.left),
+                    static_cast<int>(overlap.bottom - canvasScreen.top));
+                obstacles.push_back({ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y });
+            }
+        }
+        const hud::PanelRect placed = hud::PlacePanelAvoiding(hudX_, hudY_, hudTextWidthDip_, textHeight,
+            content, obstacles.data(), obstacles.size());
+        hudPanelRect_ = placed;
+        const D2D1_RECT_F panel = D2D1::RectF(placed.left, placed.top, placed.right, placed.bottom);
         const FLOAT previousOpacity = overlayBrush_->GetOpacity();
-        overlayBrush_->SetOpacity(0.78f);
+        overlayBrush_->SetOpacity(0.80f);
         uiFramework_.PaintOverlayLabel(renderTarget_.Get(), panel,
             static_cast<float>(kOverlayPanelRadiusDip), L"", smallText_.Get(),
             overlayBrush_.Get(), textBrush_.Get());
         overlayBrush_->SetOpacity(previousOpacity);
-        std::wstring hud;
-        hud += L"PERFORMANCE\n";
-        hud += L"Visual    " + std::to_wstring(telemetry.activeVisualJobs) + L" active / " +
-            std::to_wstring(systemProfile_.logicalProcessors) + L" CPU\n";
-        hud += L"Queues    I:" + std::to_wstring(telemetry.interactiveQueued) +
-            L" V:" + std::to_wstring(telemetry.visibleQueued) +
-            L" P:" + std::to_wstring(telemetry.predictiveQueued) + L"\n";
-        hud += L"Decode    " + std::to_wstring(static_cast<long long>(telemetry.decodeMilliseconds)) + L" ms\n";
-        hud += L"Queue     " + std::to_wstring(static_cast<long long>(telemetry.queueWaitMilliseconds)) + L" ms\n";
-        hud += L"Cache     " + std::to_wstring(toMiB(static_cast<std::uint64_t>(TotalCacheBytes()))) + L" MiB\n";
-        hud += L"Disk      hit " + std::to_wstring(telemetry.persistentCacheHits) +
-            L" / miss " + std::to_wstring(telemetry.persistentCacheMisses) + L"\n";
-        hud += L"RAM free  " + std::to_wstring(toMiB(memory.ullAvailPhys)) + L" MiB\n";
-        hud += L"Focus     " + std::wstring(reviewState_.Mode() == ViewMode::Thumbnails ? L"THUMBNAILS" :
-            reviewState_.Mode() == ViewMode::Single ? L"SINGLE VIEW" : L"COMPARE");
-        uiFramework_.PaintText(renderTarget_.Get(), hud, smallText_.Get(),
-            D2D1::RectF(panel.left + 12.0f, panel.top + 9.0f, panel.right - 12.0f, panel.bottom - 8.0f),
-            textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        // Visible drag handle: a grip pill centred in the top strip.
+        const hud::PanelRect handle = hud::HandleRect(placed);
+        const float centerX = (handle.left + handle.right) * 0.5f;
+        const float centerY = handle.top + (handle.bottom - handle.top) * 0.55f;
+        const FLOAT textOpacity = textBrush_->GetOpacity();
+        textBrush_->SetOpacity(hudDragging_ || hudHandleHot_ ? 0.85f : 0.45f);
+        uiFramework_.PaintDragGrip(renderTarget_.Get(), D2D1::Point2F(centerX, centerY), textBrush_.Get());
+        textBrush_->SetOpacity(textOpacity);
+        renderTarget_->DrawTextLayout(D2D1::Point2F(placed.left + hud::kPaddingDip,
+            placed.top + hud::kPaddingDip * 0.5f + hud::kHandleDip), hudLayout_.Get(), textBrush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+
+    bool QuickSiftApplicationImpl::HudHandleHit(float x, float y) const noexcept {
+        return performanceHudVisible_ &&
+            quicksift::core::hud::Contains(quicksift::core::hud::HandleRect(hudPanelRect_), x, y);
     }
 
     D2D1_RECT_F QuickSiftApplicationImpl::ThumbnailScrollbarThumbRect() const {
@@ -546,20 +645,34 @@ namespace quicksift::app {
         const float cellW = layout.cellWidth;
         const float cellH = layout.cellHeight;
         const int columns = layout.columns;
-        const int rows = layout.rows;
         const float unclampedScroll = reviewState_.Thumbnails().scrollDip;
         reviewState_.SetThumbnailMaximumScroll(layout.maximumScroll);
         const float thumbnailScroll = reviewState_.Thumbnails().scrollDip;
         if (thumbnailScroll != unclampedScroll) thumbnailPrefetchPlanner_.Reset(thumbnailScroll);
+        {
+            // Remember which grid positions are on screen so rating indexing can
+            // go visible-first (PumpMetadataQueue reorders on its next call).
+            const auto shownRows = quicksift::review::thumbnail::VisibleThumbnailRows(
+                layout, thumbnailScroll, bounds.bottom);
+            quicksift::core::metadata_order::VisibleWindow shown;
+            if (!shownRows.Empty() && catalog_.VisibleCount() > 0) {
+                shown.first = static_cast<size_t>(shownRows.first) * static_cast<size_t>(columns);
+                shown.last = std::min(catalog_.VisibleCount(),
+                    static_cast<size_t>(shownRows.last + 1) * static_cast<size_t>(columns)) - 1;
+                if (shown.first > shown.last) shown = {};
+            }
+            thumbnailShownPositions_ = shown;
+        }
 
         // Fast scroll (scrollbar fling or wheel fling) gets a deliberately cheap
         // render path. The normal card renderer performs per-card string/hash work,
         // cache LRU touches, text/badge drawing, and fallback bitmap creation. None
         // of that belongs on the hot path of a high-frequency scroll gesture.
         if (ThumbnailScrollPrefersPlaceholders()) {
-            const int firstRow = std::max(0, static_cast<int>((thumbnailScroll - padding) / cellH));
-            const int lastRow = std::min(rows - 1,
-                static_cast<int>((thumbnailScroll + bounds.bottom) / cellH));
+            const auto visibleRows = quicksift::review::thumbnail::VisibleThumbnailRows(
+                layout, thumbnailScroll, bounds.bottom);
+            const int firstRow = visibleRows.first;
+            const int lastRow = visibleRows.last;
             for (int row = firstRow; row <= lastRow; ++row) {
                 for (int column = 0; column < columns; ++column) {
                     const size_t index = static_cast<size_t>(row * columns + column);
@@ -597,8 +710,13 @@ namespace quicksift::app {
             return;
         }
 
-        const int firstRow = std::max(0, static_cast<int>((thumbnailScroll - padding) / cellH) - 1);
-        const int lastRow = std::min(rows - 1, static_cast<int>((thumbnailScroll + bounds.bottom) / cellH) + 1);
+        // Virtualized: only rows that intersect the viewport are painted. The former
+        // +/-1 row margin painted (and requested at Interactive priority) whole rows
+        // of off-screen cards every frame; neighbours belong to the prefetch planner.
+        const auto visibleRows = quicksift::review::thumbnail::VisibleThumbnailRows(
+            layout, thumbnailScroll, bounds.bottom);
+        const int firstRow = visibleRows.first;
+        const int lastRow = visibleRows.last;
         for (int row = firstRow; row <= lastRow; ++row) {
             for (int column = 0; column < columns; ++column) {
                 const size_t index = static_cast<size_t>(row * columns + column);
@@ -621,8 +739,11 @@ namespace quicksift::app {
                 cardPresentation.selected = selected;
                 cardPresentation.focused = focused;
                 cardPresentation.warning = HasFaceFocusWarning(photo);
+                // Round 23: blurry photo = theme red DASHED outline (was solid danger).
                 uiFramework_.PaintMediaCard(renderTarget_.Get(), cardPresentation,
-                    { panelBrush_.Get(), glassBorderBrush_.Get(), accentBrush_.Get(), dangerBrush_.Get() });
+                    { panelBrush_.Get(), glassBorderBrush_.Get(), accentBrush_.Get(),
+                      blurOutlineBrush_ ? blurOutlineBrush_.Get() : dangerBrush_.Get(),
+                      blurOutlineStrokeStyle_.Get() });
 
                 protectedThumbnailPaths_.insert(photoPath);
                 BitmapEntry* bitmap = GetOrRequestBitmap(photo.path, thumbnailTarget,
@@ -714,9 +835,18 @@ namespace quicksift::app {
         if (!bitmap || !bitmap->bitmap) return false;
         int nativeEdge = std::max(photo.sourceWidth, photo.sourceHeight);
         nativeEdge = std::max(nativeEdge, std::max(bitmap->sourceWidth, bitmap->sourceHeight));
-        const int readyEdge = nativeEdge > 0 ? std::min(displayDesired, nativeEdge) : displayDesired;
+        // Round 21 (t29u): bounded by the decode cap too, and an exact full-quality
+        // result for the requested bucket is final even when LibRaw half-size kept it
+        // below that edge. Otherwise a zoomed large RAW/JPEG never "settled" and the
+        // 400 ms backstop repainted (and, for RAW, re-decoded) forever.
+        const int readyEdge = quicksift::core::view_load::SatisfiableViewEdge(displayDesired,
+            nativeEdge, MaximumViewDecodeEdge());
         const bool previewIsFinal = loadOnlyRawJpegPreviews_ && IsRawExtension(photo.extension);
-        return BitmapSatisfiesDisplay(bitmap, std::max(1, readyEdge), !previewIsFinal);
+        if (BitmapSatisfiesDisplay(bitmap, readyEdge, !previewIsFinal)) return true;
+        if (previewIsFinal) return false;
+        const auto exact = bitmapCache_.find(CacheKey{ photo.path.wstring(),
+            BucketFor(std::max(1, displayDesired)), CacheClass::Full });
+        return exact != bitmapCache_.end() && exact->second.bitmap && !exact->second.previewOnly;
     }
 
     void QuickSiftApplicationImpl::RenderSingle(const D2D1_RECT_F& bounds) {
@@ -727,8 +857,11 @@ namespace quicksift::app {
         }
         const PhotoItem& photo = VisiblePhoto(*index);
         protectedViewPaths_.insert(reviewState_.SinglePath());
-        const D2D1_RECT_F imageArea = D2D1::RectF(8, 8, bounds.right - 8, bounds.bottom - 8);
-        const int baseDesired = static_cast<int>(std::max(imageArea.right - imageArea.left,
+        const D2D1_RECT_F imageArea = SingleImageArea(bounds);
+        // Decode size from the unreserved area: toggling the filmstrip must not
+        // change the bucket and re-decode the image on screen (round 22).
+        const float reservedDip = FilmstripReservedDip(bounds);
+        const int baseDesired = static_cast<int>(std::max(imageArea.right - imageArea.left + reservedDip,
             imageArea.bottom - imageArea.top) * CanvasPixelScale() * 1.25f);
 
         BitmapEntry* bitmap = nullptr;
@@ -821,9 +954,56 @@ namespace quicksift::app {
         // View backstop: while the on-screen image is still a stand-in, a low-rate
         // timer repaints so a cancelled/dropped view decode is re-requested.
         if (!fullBitmapReady && !viewFailed) ArmThumbnailReconcile(400);
+        // Round 21 (t29u) stall watchdog: when the image on screen has not settled
+        // within 5 s (then every 15 s), log the UI and view-lane state once so a stalled
+        // load can be diagnosed from the log. Rate-limited globally as well.
+        if (singleViewStallWatch_.Observe(photo.path.wstring(), fullBitmapReady || viewFailed,
+                std::chrono::steady_clock::now())) {
+            LogSingleViewStall(photo, bitmap, displayDesired);
+        }
 
     }
 
+
+    void QuickSiftApplicationImpl::LogSingleViewStall(const PhotoItem& photo, const BitmapEntry* bitmap,
+        int displayDesired) {
+        static quicksift::core::LogRateLimiter limiter(4, std::chrono::seconds(60));
+        std::uint64_t suppressed = 0;
+        if (!limiter.Allow(&suppressed)) return;
+        try {
+            const auto now = std::chrono::steady_clock::now();
+            std::wstring retry = L"none";
+            if (const auto it = viewRetryState_.find(NormalizedPathKey(photo.path)); it != viewRetryState_.end()) {
+                const auto waitMs = it->second.nextRetryAt == std::chrono::steady_clock::time_point::max() ? -1LL :
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        it->second.nextRetryAt - now).count());
+                retry = L"attempts=" + std::to_wstring(it->second.failedAttempts) +
+                    L",terminal=" + (it->second.terminal ? std::wstring(L"1") : std::wstring(L"0")) +
+                    L",kind=" + std::to_wstring(static_cast<int>(it->second.lastFailure)) +
+                    L",next_ms=" + std::to_wstring(waitMs);
+            }
+            const int nativeEdge = std::max(photo.sourceWidth, photo.sourceHeight);
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, quicksift::diagnostics::category::kViewLane,
+                L"single_view_load_stalled",
+                { L"file", quicksift::diagnostics::LogFileName(photo.path) },
+                { L"path_id", quicksift::diagnostics::LogPathId(photo.path) },
+                { L"stalled_ms", std::to_wstring(singleViewStallWatch_.StalledFor(now).count()) },
+                { L"report", std::to_wstring(singleViewStallWatch_.Reports()) },
+                { L"has_bitmap", bitmap && bitmap->bitmap ? L"1" : L"0" },
+                { L"bitmap_edge", std::to_wstring(BitmapMaximumEdge(bitmap)) },
+                { L"bitmap_preview", bitmap && bitmap->previewOnly ? L"1" : L"0" },
+                { L"bitmap_class", std::to_wstring(bitmap ? static_cast<int>(bitmap->cacheClass) : -1) },
+                { L"desired_edge", std::to_wstring(displayDesired) },
+                { L"native_edge", std::to_wstring(nativeEdge) },
+                { L"decode_cap", std::to_wstring(MaximumViewDecodeEdge()) },
+                { L"retry", retry },
+                { L"nav_epoch", std::to_wstring(reviewState_.Epochs().navigation) },
+                { L"worker", worker_.DescribeViewLoadState(photo.path) },
+                { L"suppressed", std::to_wstring(suppressed) });
+        } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Rendering", L"QuickSiftApplicationImpl::LogSingleViewStall");
+        }
+    }
 
     float QuickSiftApplicationImpl::AspectForPath(const std::wstring& path) const {
         const auto index = IndexForPath(path);
@@ -870,7 +1050,7 @@ namespace quicksift::app {
             if (rowH < 80.0f) continue;
 
             std::vector<D2D1_RECT_F> cells;
-            cells.reserve(count);
+            cells.reserve(static_cast<std::size_t>(count));
             float score = 0.0f;
             size_t imageIndex = 0;
             for (size_t row = 0; row < rows.size(); ++row) {
@@ -1057,32 +1237,73 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::DrawThumbnailBadges(const PhotoItem& photo, D2D1_RECT_F area) {
+    void QuickSiftApplicationImpl::RefreshBadgeCaptions() {
+        const int language = static_cast<int>(localizer_.CurrentLanguage());
+        if (language == badgeCaptionLanguage_) return;
+        badgeCaptionLanguage_ = language;
+        badgePickCaption_ = Tr(L"PICK");
+        badgeRejectCaption_ = Tr(L"REJECT");
+        badgeFormatCaptionCache_.clear();
+    }
+
+    void QuickSiftApplicationImpl::DrawThumbnailBadges(const PhotoItem& photo, D2D1_RECT_F area,
+        const ThumbnailBadgeStyle& style) {
+        // Round 23: allocation-free per frame (fixed badge array, string views into
+        // static or cached captions, heterogeneous width-cache lookup); shared by
+        // the grid and the filmstrip. Pending metadata (not Known) shows no badge,
+        // and painting never requests metadata.
         struct ThumbnailBadge {
-            std::wstring text;
+            std::wstring_view text;
             int color = 0;
             bool matchCardSurface = false;
         };
-        std::vector<ThumbnailBadge> badges;
-        if (badgeStars_ && photo.ratingKnowledge == MetadataKnowledge::Known && photo.rating > 0)
-            badges.push_back({ L"★" + std::to_wstring(photo.rating), 0, false });
-        if (badgeColor_ && photo.colorLabelKnowledge == MetadataKnowledge::Known && photo.colorLabel > 0)
-            badges.push_back({ L"●", photo.colorLabel, false });
+        static constexpr std::array<std::wstring_view, 6> kRatingCaptions{{
+            L"", L"★1", L"★2", L"★3", L"★4", L"★5" }};
+        static constexpr std::wstring_view kColorCaption = L"●";
+        RefreshBadgeCaptions();
+        std::array<ThumbnailBadge, 4> badges{};
+        std::size_t count = 0;
+        if (badgeStars_ && photo.ratingKnowledge == MetadataKnowledge::Known &&
+            photo.rating > 0 && photo.rating <= 5)
+            badges[count++] = { kRatingCaptions[static_cast<std::size_t>(photo.rating)], 0, false };
+        if (style.includeColorLabel && badgeColor_ &&
+            photo.colorLabelKnowledge == MetadataKnowledge::Known && photo.colorLabel > 0)
+            badges[count++] = { kColorCaption, photo.colorLabel, false };
         if (badgePick_ && photo.pickStateKnowledge == MetadataKnowledge::Known &&
             photo.pickState != 0) {
-            badges.push_back({ Tr(photo.pickState > 0 ? L"PICK" : L"REJECT"),
-                photo.pickState > 0 ? 3 : 1, false });
+            badges[count++] = { photo.pickState > 0 ? std::wstring_view(badgePickCaption_)
+                : std::wstring_view(badgeRejectCaption_), photo.pickState > 0 ? 3 : 1, false };
         }
         // The format badge sits on the card itself. Leaving its interior unpainted
         // avoids compositing a second translucent surface over the card and creating
         // the subtle off-color patch visible in both light and dark themes.
-        if (badgePair_) badges.push_back({ FormatBadgeText(photo), 0, true });
+        if (style.includeFormat && badgePair_) {
+            auto format = badgeFormatCaptionCache_.find(std::wstring_view(photo.extension));
+            if (format == badgeFormatCaptionCache_.end()) {
+                if (badgeFormatCaptionCache_.size() > 64) badgeFormatCaptionCache_.clear();
+                format = badgeFormatCaptionCache_.emplace(photo.extension, FormatBadgeText(photo)).first;
+            }
+            badges[count++] = { format->second, 0, true };
+        }
+        if (count == 0) return;
+        const float opacity = std::clamp(style.opacity, 0.0f, 1.0f);
+        if (opacity <= 0.004f) return;
+        // Fade: scale the shared brushes' opacity for these draws and restore it
+        // (the framework's PaintFaceOutline does the same); no per-frame brushes.
+        const auto withOpacity = [opacity](ID2D1Brush* brush, auto&& draw) {
+            if (!brush || opacity >= 0.999f) { draw(); return; }
+            const float previous = brush->GetOpacity();
+            brush->SetOpacity(previous * opacity);
+            draw();
+            brush->SetOpacity(previous);
+        };
         float x = area.left;
         const float badgeHeight = area.bottom - area.top;
-        for (const ThumbnailBadge& item : badges) {
+        for (std::size_t index = 0; index < count; ++index) {
+            const ThumbnailBadge& item = badges[index];
             // Measured once per text and format (was chars x 7 DIP, which made
-            // "REJECT"/VI captions overflow and "●" far too wide), padded 6 DIP per
-            // side, never narrower than a circle.
+            // "REJECT"/VI captions overflow and "●" far too wide), padded 6 DIP
+            // per side, never narrower than a circle.
             float textWidth = 0.0f;
             if (auto cached = badgeTextWidthCache_.find(item.text); cached != badgeTextWidthCache_.end()) {
                 textWidth = cached->second;
@@ -1091,27 +1312,31 @@ namespace quicksift::app {
                     dwriteFactory_.Get(), smallText_.Get(), item.text);
                 if (textWidth <= 0.0f) textWidth = static_cast<float>(item.text.size()) * 7.0f;
                 if (badgeTextWidthCache_.size() > 256) badgeTextWidthCache_.clear();
-                badgeTextWidthCache_.emplace(item.text, textWidth);
+                badgeTextWidthCache_.emplace(std::wstring(item.text), textWidth);
             }
             const float width = std::max(badgeHeight, std::ceil(textWidth) + 12.0f);
             if (x + width > area.right) break;
             const D2D1_RECT_F badge = D2D1::RectF(x, area.top, x + width, area.bottom);
             ID2D1Brush* brush = item.color == 0 ? textBrush_.Get() : accentBrush_.Get();
-            ComPtr<ID2D1SolidColorBrush> labelBrush;
             if (item.color > 0 && item.color <= 5) {
                 static const D2D1_COLOR_F colors[] = {
                     D2D1::ColorF(1,1,1), D2D1::ColorF(0.96f,0.28f,0.34f), D2D1::ColorF(1.0f,0.78f,0.20f),
                     D2D1::ColorF(0.27f,0.82f,0.45f), D2D1::ColorF(0.25f,0.67f,1.0f), D2D1::ColorF(0.72f,0.45f,0.95f)
                 };
-                if (SUCCEEDED(renderTarget_->CreateSolidColorBrush(colors[item.color], &labelBrush)))
-                    brush = labelBrush.Get();
+                // Device-dependent brushes are created once per render target (they
+                // were created per badge per card per frame) and released with it.
+                ComPtr<ID2D1SolidColorBrush>& cached = badgeColorBrushes_[static_cast<std::size_t>(item.color)];
+                if (!cached) renderTarget_->CreateSolidColorBrush(colors[item.color], &cached);
+                if (cached) brush = cached.Get();
             }
             ID2D1Brush* fill = item.matchCardSurface ? nullptr : overlayBrush_.Get();
             ID2D1Brush* border = item.matchCardSurface ? glassBorderBrush_.Get() : nullptr;
             // Capsule badge with centred text.
-            uiFramework_.PaintOverlayLabel(renderTarget_.Get(), badge,
-                quicksift::ui::tokens::CapsuleRadius(badgeHeight),
-                item.text, smallText_.Get(), fill, brush, border, 1.0f, /*centered=*/true);
+            withOpacity(fill, [&] { withOpacity(brush, [&] { withOpacity(border, [&] {
+                uiFramework_.PaintOverlayLabel(renderTarget_.Get(), badge,
+                    quicksift::ui::tokens::CapsuleRadius(badgeHeight),
+                    item.text, smallText_.Get(), fill, brush, border, 1.0f, /*centered=*/true);
+            }); }); });
             x += width + 4.0f;
         }
     }
@@ -1133,6 +1358,11 @@ namespace quicksift::app {
         const float top = areaCenterY - view.state.centerY * drawHeight;
         const D2D1_RECT_F destination = D2D1::RectF(
             left, top, left + drawWidth, top + drawHeight);
+        // Panned fully out of its pane (zoomed Single/Compare): nothing to draw, so
+        // skip the clip push and the bitmap draw. Rotated views keep the full path.
+        if (clip && view.state.rotation == 0 && (destination.right <= area.left ||
+            destination.left >= area.right || destination.bottom <= area.top ||
+            destination.top >= area.bottom)) return;
         if (clip) renderTarget_->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         D2D1_MATRIX_3X2_F oldTransform{};
         renderTarget_->GetTransform(&oldTransform);
@@ -1304,18 +1534,25 @@ namespace quicksift::app {
             sourceBottom / sourceTileSpan + 1);
         const int scheduleLimit = systemProfile_.lowMemory ? 16 : 36;
         int scheduled = 0;
+        // Hoisted out of the tile loop: one path copy and one clock read per frame.
+        const std::wstring photoPath = photo.path.wstring();
+        const auto frameTime = std::chrono::steady_clock::now();
         renderTarget_->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        for (int tileY = tileTop; tileY <= tileBottom && scheduled < scheduleLimit; ++tileY) {
-            for (int tileX = tileLeft; tileX <= tileRight && scheduled < scheduleLimit;
-                ++tileX, ++scheduled) {
+        // The schedule limit bounds NEW tile decodes per frame. It used to count
+        // every visited tile (cached ones included), so at deep zoom with many
+        // visible tiles the later, already-decoded tiles were never drawn.
+        for (int tileY = tileTop; tileY <= tileBottom; ++tileY) {
+            for (int tileX = tileLeft; tileX <= tileRight; ++tileX) {
                 const int sourceX = tileX * sourceTileSpan;
                 const int sourceY = tileY * sourceTileSpan;
                 const int sourceWidth = std::min(sourceTileSpan, photo.sourceWidth - sourceX);
                 const int sourceHeight = std::min(sourceTileSpan, photo.sourceHeight - sourceY);
-                TileKey key{ photo.path.wstring(), sourceX, sourceY,
+                TileKey key{ photoPath, sourceX, sourceY,
                     sourceWidth, sourceHeight, level };
                 const auto iterator = tileCache_.find(key);
                 if (iterator == tileCache_.end()) {
+                    if (scheduled >= scheduleLimit) continue;
+                    ++scheduled;
                     worker_.EnqueueTile(photo.path, sourceX, sourceY, sourceWidth,
                         sourceHeight, level, generation_, reviewState_.Epochs().navigation);
                     continue;
@@ -1328,7 +1565,7 @@ namespace quicksift::app {
                     continue;
                 }
                 iterator->second.lastUse = ++useCounter_;
-                iterator->second.lastUseTime = std::chrono::steady_clock::now();
+                iterator->second.lastUseTime = frameTime;
                 const D2D1_RECT_F destination = D2D1::RectF(
                     left + sourceX * scale, top + sourceY * scale,
                     left + (sourceX + sourceWidth) * scale,
@@ -1353,28 +1590,26 @@ namespace quicksift::app {
         const auto currentIndexOpt = IndexForPath(reviewState_.SinglePath());
         if (!currentIndexOpt) return;
         const size_t currentIndex = *currentIndexOpt;
-        const int cacheTargetSize = 256;
+        // Round 22: the grid's bucket, matching PrefetchFilmstrip (shared cache).
+        const int cacheTargetSize = quicksift::core::filmstrip::ThumbnailTarget(ThumbnailDecodeTarget());
 
         const D2D1_RECT_F bgRect = D2D1::RectF(
             bounds.right - kFilmstripWidth, bounds.top,
             bounds.right, bounds.bottom);
         const ThemePalette palette = Palette();
-        ComPtr<ID2D1SolidColorBrush> bgBrush;
-        const D2D1_COLOR_F filmstripBackground = {
-            static_cast<float>(GetRValue(palette.panelStrong)) / 255.0f,
-            static_cast<float>(GetGValue(palette.panelStrong)) / 255.0f,
-            static_cast<float>(GetBValue(palette.panelStrong)) / 255.0f,
-            0.90f * filmstripOpacity_
+        // Round 22: cached brushes, theme colours (accent / border instead of fixed
+        // blue and white, which vanished on the light theme's panel).
+        const D2D1_COLOR_F backgroundColor = ToD2D(palette.panelStrong, 0.90f * filmstripOpacity_);
+        const D2D1_COLOR_F activeColor = ToD2D(palette.accent, filmstripOpacity_);
+        const D2D1_COLOR_F inactiveColor = ToD2D(palette.border, 0.90f * filmstripOpacity_);
+        auto ensure = [this](ComPtr<ID2D1SolidColorBrush>& brush, const D2D1_COLOR_F& color) {
+            if (brush) brush->SetColor(color);
+            else renderTarget_->CreateSolidColorBrush(color, &brush);
         };
-        renderTarget_->CreateSolidColorBrush(filmstripBackground, &bgBrush);
-        if (bgBrush) renderTarget_->FillRectangle(bgRect, bgBrush.Get());
-
-        ComPtr<ID2D1SolidColorBrush> activeBorder;
-        ComPtr<ID2D1SolidColorBrush> inactiveBorder;
-        renderTarget_->CreateSolidColorBrush(
-            D2D1::ColorF(0.0f, 0.55f, 1.0f, filmstripOpacity_), &activeBorder);
-        renderTarget_->CreateSolidColorBrush(
-            D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.40f * filmstripOpacity_), &inactiveBorder);
+        ensure(filmstripBackgroundBrush_, backgroundColor);
+        ensure(filmstripActiveBrush_, activeColor);
+        ensure(filmstripInactiveBrush_, inactiveColor);
+        if (filmstripBackgroundBrush_) renderTarget_->FillRectangle(bgRect, filmstripBackgroundBrush_.Get());
 
         float currentY = topOffset + kPadding;
         for (size_t i = layout.firstIndex; i < layout.lastIndex; ++i) {
@@ -1393,9 +1628,10 @@ namespace quicksift::app {
             BitmapEntry* bmp = FindBitmapNoTouch(photo.path, cacheTargetSize, CacheClass::Thumbnail);
             if (bmp && bmp->bitmap) {
                 const ViewState fitState{};
-                const auto fitView = ResolveViewForPath(photo.path.wstring(), thumbRect, fitState,
+                const auto fitView = ResolveViewForPath(photo.path.native(), thumbRect, fitState,
                     bmp->sourceWidth, bmp->sourceHeight);
-                if (fitView.valid) DrawBitmapFit(bmp, thumbRect, fitView, true);
+                // Round 22: thumbnails fade with the strip (were drawn opaque).
+                if (fitView.valid) DrawBitmapFit(bmp, thumbRect, fitView, true, filmstripOpacity_);
             } else if (!failedThumbnailPaths_.empty() &&
                 failedThumbnailPaths_.contains(NormalizedPathKey(photo.path))) {
                 // 0.9.4.0: cache-only filmstrip; synchronous Shell extraction only for
@@ -1406,9 +1642,39 @@ namespace quicksift::app {
                 }
             }
 
-            ID2D1Brush* border = i == currentIndex
-                ? activeBorder.Get() : inactiveBorder.Get();
-            if (border) renderTarget_->DrawRectangle(thumbRect, border, i == currentIndex ? 2.0f : 1.0f);
+            // Round 23: the grid's blurry-photo cue (red dashed outline, inside the
+            // cell) and the grid's rating / pick badges, both fading with the strip.
+            const bool current = i == currentIndex;
+            const bool blurry = blurOutlineBrush_ && HasFaceFocusWarning(photo);
+            if (blurry) {
+                namespace blur = quicksift::core::blur_outline;
+                const float half = blur::kFilmstripStrokeDip * 0.5f;
+                const float previous = blurOutlineBrush_->GetOpacity();
+                blurOutlineBrush_->SetOpacity(previous * filmstripOpacity_);
+                renderTarget_->DrawRectangle(D2D1::RectF(thumbRect.left + half, thumbRect.top + half,
+                    thumbRect.right - half, thumbRect.bottom - half), blurOutlineBrush_.Get(),
+                    blur::kFilmstripStrokeDip, blurOutlineStrokeStyle_.Get());
+                blurOutlineBrush_->SetOpacity(previous);
+                // The current-image accent stays visible just outside the dashes.
+                if (current && filmstripActiveBrush_)
+                    renderTarget_->DrawRectangle(D2D1::RectF(thumbRect.left - 2.0f, thumbRect.top - 2.0f,
+                        thumbRect.right + 2.0f, thumbRect.bottom + 2.0f), filmstripActiveBrush_.Get(), 2.0f);
+            } else {
+                ID2D1Brush* border = current ? filmstripActiveBrush_.Get() : filmstripInactiveBrush_.Get();
+                if (border) renderTarget_->DrawRectangle(thumbRect, border, current ? 2.0f : 1.0f);
+            }
+            {
+                namespace film = quicksift::core::filmstrip;
+                const float badgeHeight = film::BadgeHeightDip(kThumbSize);
+                const D2D1_RECT_F badgeArea = D2D1::RectF(thumbRect.left + film::kBadgeInsetDip,
+                    thumbRect.bottom - film::kBadgeInsetDip - badgeHeight,
+                    thumbRect.right - film::kBadgeInsetDip, thumbRect.bottom - film::kBadgeInsetDip);
+                ThumbnailBadgeStyle badgeStyle{};
+                badgeStyle.includeColorLabel = false;
+                badgeStyle.includeFormat = false;
+                badgeStyle.opacity = filmstripOpacity_;
+                DrawThumbnailBadges(photo, badgeArea, badgeStyle);
+            }
             currentY += kThumbSize + kPadding;
         }
     }

@@ -2,6 +2,7 @@
 #include "app/quicksift_application_internal.h"
 #include "diagnostics/log_categories.h"
 #include "core/log_rate_limiter.h"
+#include "core/metadata_progress.h"
 
 #include <cmath>
 namespace quicksift::app {
@@ -307,11 +308,32 @@ void QuickSiftApplicationImpl::RetryFailedImageLoads() {
         // A folder switch is an infrequent, natural boundary where releasing that
         // storage is worth more than preserving allocation capacity.
         catalog_.ClearAndRelease();
-        OnSearchFolderChanged(); // keeps the query text; drops per-folder match state
+        // New folder: drop applied filters and search so the user starts clean.
+        ratingFilter_ = RatingFilter::All;
+        pickFilter_ = PickFilter::All;
+        colorLabelFilter_ = ColorLabelFilter::All;
+        dateFilter_ = DateFilter::Any;
+        isoFilter_ = -1;
+        apertureFilter_ = 0.0;
+        focalFilter_ = 0.0;
+        shutterFilter_ = 0.0;
+        cameraFilter_.clear();
+        hourFilter_ = -1;
+        formatExtFilter_.clear();
+        dateExactFilter_.clear();
+        searchText_.clear();
+        searchAppliedText_.clear();
+        searchQuery_ = {};
+        if (searchInput_) SetWindowTextW(searchInput_, L"");
+        OnSearchFolderChanged();
         selection_.Reset(true);
         pendingRatings_ = 0;
         metadataJobsInFlight_ = 0;
         std::deque<size_t>().swap(pendingMetadataIndices_);
+        metadataReadAttempts_.clear();
+        thumbnailShownPositions_ = {};
+        metadataPromotedWindow_ = {};
+        metadataPromotedQueueSize_ = 0;
         metadataUiDirty_ = false;
         KillTimer(hwnd_, ID_TIMER_METADATA_UI);
         thumbnailPrefetchPlanner_.Reset(reviewState_.Thumbnails().scrollDip);
@@ -329,17 +351,58 @@ void QuickSiftApplicationImpl::RetryFailedImageLoads() {
         UpdateStatus();
         InvalidateCanvas();
     }
+    quicksift::core::metadata_order::VisibleWindow QuickSiftApplicationImpl::MetadataPriorityWindow() const {
+        namespace mo = quicksift::core::metadata_order;
+        const size_t count = catalog_.VisibleCount();
+        if (reviewState_.Mode() == ViewMode::Thumbnails) {
+            if (thumbnailShownPositions_.Empty()) return {};
+            // One screen above, two below (the usual scroll direction).
+            const size_t page = thumbnailShownPositions_.last - thumbnailShownPositions_.first + 1;
+            return mo::WindowAround(thumbnailShownPositions_.first, thumbnailShownPositions_.last,
+                count, page, 2 * page);
+        }
+        const auto catalogIndex = CatalogIndexForPath(reviewState_.SinglePath());
+        if (!catalogIndex) return {};
+        const size_t position = catalog_.VisiblePosition(*catalogIndex);
+        if (position == quicksift::core::CatalogStore::InvalidVisiblePosition) return {};
+        return mo::WindowAround(position, position, count, 32, 64); // filmstrip neighbourhood
+    }
     void QuickSiftApplicationImpl::PumpMetadataQueue() {
+        namespace mo = quicksift::core::metadata_order;
+        // With a rating/pick/label filter (or rating sort) every pending photo
+        // decides what is shown: all of it goes at Predictive, FIFO, which also
+        // bumps the not-yet-dispatched remainder the moment such a filter is
+        // turned on. Otherwise visible + nearby photos are dispatched first at
+        // Predictive and the rest stays Idle. Both are below decode/user work.
+        const bool metadataUrgent = sortMode_ == SortMode::RatingHigh ||
+            ratingFilter_ != RatingFilter::All || pickFilter_ != PickFilter::All ||
+            colorLabelFilter_ != ColorLabelFilter::All ||
+            (searchActive_ && quicksift::core::predicate::NeedsRatingFacts(searchQuery_.clauses));
+        const auto positionOf = [this](size_t index) {
+            return index < catalog_.PhotoCount() ? catalog_.VisiblePosition(index)
+                : quicksift::core::CatalogStore::InvalidVisiblePosition;
+        };
+        mo::VisibleWindow window;
+        if (!metadataUrgent && !pendingMetadataIndices_.empty()) {
+            window = MetadataPriorityWindow();
+            // Reorder only when the window moved or new entries arrived (O(n) each).
+            if (window != metadataPromotedWindow_ || pendingMetadataIndices_.size() > metadataPromotedQueueSize_)
+                mo::PromoteWindow(pendingMetadataIndices_, window, positionOf);
+            metadataPromotedWindow_ = window;
+            metadataPromotedQueueSize_ = pendingMetadataIndices_.size();
+        }
         while (metadataJobsInFlight_ < metadataQueueLimit_ && !pendingMetadataIndices_.empty()) {
             const size_t index = pendingMetadataIndices_.front();
             pendingMetadataIndices_.pop_front();
-            if (index >= catalog_.PhotoCount()) continue;
+            if (metadataPromotedQueueSize_ > 0) --metadataPromotedQueueSize_;
+            if (index >= catalog_.PhotoCount()) {
+                if (pendingRatings_ > 0) --pendingRatings_; // keep the counter paired with entries
+                continue;
+            }
             const PhotoItem& photo = catalog_.PhotoAt(index);
-            const bool metadataUrgent = sortMode_ == SortMode::RatingHigh ||
-                ratingFilter_ != RatingFilter::All || pickFilter_ != PickFilter::All ||
-                colorLabelFilter_ != ColorLabelFilter::All;
+            const bool nearView = !metadataUrgent && window.Contains(positionOf(index));
             if (worker_.EnqueueMetadata(photo.path, generation_, photo.metadataRevision,
-                metadataUrgent ? JobPriority::Predictive : JobPriority::Idle)) {
+                (metadataUrgent || nearView) ? JobPriority::Predictive : JobPriority::Idle)) {
                 ++metadataJobsInFlight_;
             } else if (pendingRatings_ > 0) {
                 // A coalesced or rejected job will not produce a second completion.
@@ -620,6 +683,8 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
         return std::clamp(finalTimeout, 1000, 60000);
     }
 
+    // Posted worker result integration (0.9.5.0 round 19: split into one helper per
+    // result kind / admission stage, with no behaviour change).
     void QuickSiftApplicationImpl::OnWorkReady(const std::shared_ptr<WorkResult>& result) {
         if (!result) return;
         worker_.AcknowledgePostedResult(*result);
@@ -633,152 +698,210 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
         if (admission != quicksift::review::ResultAdmission::Accept) return;
         const std::wstring path = result->path.wstring();
 
+        if (result->kind == JobKind::Metadata) {
+            ApplyMetadataWorkResult(result, path);
+            return;
+        }
+        if (result->kind == JobKind::Exif) {
+            ApplyExifWorkResult(result, path);
+            return;
+        }
+        if (result->kind == JobKind::Face) {
+            ApplyFaceWorkResult(result, path);
+            return;
+        }
+        if (result->pixels.empty() || result->width <= 0 || result->height <= 0) {
+            HandleUnusableDecodeResult(result, path);
+            return;
+        }
+        ClearDecodeFailureStateOnSuccess(result, path);
+        if (DecodedResultIsObsolete(result, path)) return;
+        RefreshCatalogGeometryFromDecode(result, path);
+        AdmitDecodedPixels(result, path);
+    }
+
+    void QuickSiftApplicationImpl::ApplyMetadataWorkResult(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         auto updateCatalogPhoto = [&](const std::function<void(PhotoItem&)>& fn) {
             if (const auto index = CatalogIndexForPath(path)) {
                 catalog_.EditPhoto(*index, fn);
                 PersistPhotoRecord(catalog_.PhotoAt(*index));
             }
         };
-
-        if (result->kind == JobKind::Metadata) {
-            if (!result->workFailed) {
-                if (const auto index = CatalogIndexForPath(path)) {
-                    const PhotoItem& current = catalog_.PhotoAt(*index);
-                    if (result->metadataRevision == current.metadataRevision) {
-                        updateCatalogPhoto([&](PhotoItem& item) {
-                            if (result->fileSize != 0) item.fileSize = result->fileSize;
-                            if (result->modifiedStamp != 0) item.modifiedStamp = result->modifiedStamp;
-                            item.sidecarStamp = result->sidecarStamp;
-                            item.rating = result->rating;
-                            item.colorLabel = result->colorLabel;
-                            item.pickState = result->pickState;
-                            item.ratingKnowledge = result->ratingKnowledge;
-                            item.colorLabelKnowledge = result->colorLabelKnowledge;
-                            item.pickStateKnowledge = result->pickStateKnowledge;
-                            item.rawRating = result->rawRating;
-                            item.rawColorLabel = result->rawColorLabel;
-                            item.rawPickState = result->rawPickState;
-                        });
-                    } else QS_LOG_INFO(L"Metadata",
-                        L"Discarded stale metadata result for " + path);
-                }
-            }
-            CompleteMetadataJob();
-            return;
-        }
-
-        if (result->kind == JobKind::Exif) {
-            const std::wstring text = result->workFailed ?
-                L"EXIF could not be read because the decoder or filesystem failed temporarily." :
-                (result->exifText.empty() ? L"No EXIF information was exposed for this file." : result->exifText);
-            if (!result->workFailed) {
-                if (!exifCache_.contains(path) && exifCache_.size() >= exifCacheLimit_ && !exifCache_.empty()) {
-                    exifCache_.erase(exifCache_.begin());
-                }
-                exifCache_[path] = text;
-                if (const auto index = CatalogIndexForPath(path)) {
-                    catalog_.EditPhoto(*index, [&](PhotoItem& item) {
+        namespace mp = quicksift::core::metadata_progress;
+        if (const auto index = CatalogIndexForPath(path)) {
+            const PhotoItem& current = catalog_.PhotoAt(*index);
+            if (result->metadataRevision != current.metadataRevision) {
+                QS_LOG_INFO(L"Metadata", L"Discarded stale metadata result for " + path);
+            } else {
+                const bool anyUnknown = result->ratingKnowledge == MetadataKnowledge::Unknown ||
+                    result->colorLabelKnowledge == MetadataKnowledge::Unknown ||
+                    result->pickStateKnowledge == MetadataKnowledge::Unknown;
+                int& attempts = metadataReadAttempts_[*index];
+                const mp::Outcome outcome = mp::Classify(result->cancelled, result->workFailed,
+                    anyUnknown, attempts);
+                if (outcome == mp::Outcome::Apply) {
+                    metadataReadAttempts_.erase(*index);
+                    updateCatalogPhoto([&](PhotoItem& item) {
                         if (result->fileSize != 0) item.fileSize = result->fileSize;
                         if (result->modifiedStamp != 0) item.modifiedStamp = result->modifiedStamp;
                         item.sidecarStamp = result->sidecarStamp;
+                        item.rating = result->rating;
+                        item.colorLabel = result->colorLabel;
+                        item.pickState = result->pickState;
+                        item.ratingKnowledge = result->ratingKnowledge;
+                        item.colorLabelKnowledge = result->colorLabelKnowledge;
+                        item.pickStateKnowledge = result->pickStateKnowledge;
+                        item.rawRating = result->rawRating;
+                        item.rawColorLabel = result->rawColorLabel;
+                        item.rawPickState = result->rawPickState;
                     });
-                    PersistPhotoRecord(catalog_.PhotoAt(*index), text);
+                } else if (outcome == mp::Outcome::Retry) {
+                    // Never overwrite the photo with an empty cancelled result.
+                    ++attempts;
+                    pendingMetadataIndices_.push_back(*index);
+                    ++pendingRatings_; // paired with the new queue entry
+                } else {
+                    // Terminal: in memory only, so the next folder load tries again.
+                    metadataReadAttempts_.erase(*index);
+                    QS_LOG_WARNING(L"Metadata", L"Metadata could not be read; marked unreadable: " + path);
+                    catalog_.EditPhoto(*index, [&](PhotoItem& item) {
+                        const auto settle = [&](MetadataKnowledge& own, MetadataKnowledge got) {
+                            if (own != MetadataKnowledge::Unknown) return;
+                            own = (!result->cancelled && !result->workFailed &&
+                                got != MetadataKnowledge::Unknown) ? got : MetadataKnowledge::Unreadable;
+                        };
+                        settle(item.ratingKnowledge, result->ratingKnowledge);
+                        settle(item.colorLabelKnowledge, result->colorLabelKnowledge);
+                        settle(item.pickStateKnowledge, result->pickStateKnowledge);
+                    });
                 }
             }
-            if (ActiveInfoPath() == path && exif_) {
-                SetWindowTextW(exif_, Tr(text).c_str());
-                InvalidateRect(exif_, nullptr, FALSE);
-            }
-            return;
         }
+        CompleteMetadataJob();
+        return;
+    }
 
-        if (result->kind == JobKind::Face) {
-            HandleFaceAnalysisOutcome(*result);
-            // A transient WinRT/decoder failure is not the same as a completed
-            // scan with zero faces. Do not poison the persistent record and prevent
-            // future retries when memory or the decoder becomes available again.
-            if (result->facesScanned) {
-                updateCatalogPhoto([&](PhotoItem& item) {
+    void QuickSiftApplicationImpl::ApplyExifWorkResult(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
+        const std::wstring text = result->workFailed ?
+            L"EXIF could not be read because the decoder or filesystem failed temporarily." :
+            (result->exifText.empty() ? L"No EXIF information was exposed for this file." : result->exifText);
+        if (!result->workFailed) {
+            if (!exifCache_.contains(path) && exifCache_.size() >= exifCacheLimit_ && !exifCache_.empty()) {
+                exifCache_.erase(exifCache_.begin());
+            }
+            exifCache_[path] = text;
+            if (const auto index = CatalogIndexForPath(path)) {
+                catalog_.EditPhoto(*index, [&](PhotoItem& item) {
                     if (result->fileSize != 0) item.fileSize = result->fileSize;
                     if (result->modifiedStamp != 0) item.modifiedStamp = result->modifiedStamp;
                     item.sidecarStamp = result->sidecarStamp;
-                    item.facesScanned = true;
-                    item.faces = result->faces;
-                    item.faceBlurScanned = result->faceBlurScanned;
-                    item.faceBlurry = result->faceBlurry;
-                    item.faceSharpness = result->faceSharpness;
-                    item.faceQualities = result->faceBlurScanned ? result->faceQualities :
-                        std::vector<quicksift::FaceQualityRecord>{};
-                    // A FaceLock choice made in this session (or already hydrated) wins
-                    // over the persisted one carried by the worker's cache lookup.
-                    if (!item.faceSelectionKnown && result->faceSelectionKnown) {
-                        item.faceSelectionKnown = true;
-                        item.faceSelection = result->faceSelection;
-                    }
                 });
-                if (reviewState_.FaceLockEnabled() && ActiveInfoPath() == path) ApplyFaceLockForActive(false);
-                InvalidateCanvas();
+                PersistPhotoRecord(catalog_.PhotoAt(*index), text);
             }
-            return;
         }
+        if (ActiveInfoPath() == path && exif_) {
+            SetWindowTextW(exif_, Tr(text).c_str());
+            InvalidateRect(exif_, nullptr, FALSE);
+        }
+        return;
+    }
 
-        if (result->pixels.empty() || result->width <= 0 || result->height <= 0) {
-            const bool thumbnail = result->cacheClass == CacheClass::Thumbnail;
-            const bool thumbnailMode = reviewState_.Mode() == ViewMode::Thumbnails;
-            const bool visibleThumbnail = thumbnail && thumbnailMode &&
-                reviewState_.IsThumbnailPathDesired(path);
-            const bool timedOut = result->timedOut;
-            const bool retryableFailure = result->workFailed || timedOut;
-            const std::wstring failureKey = DecodeFailureKey(path, result->targetSize,
-                result->kind, result->cacheClass);
-
-            if (result->cancelled && !timedOut) {
-                // Viewport/navigation cancellation is not a decode failure. A later
-                // viewport pass will request the image again if it becomes visible.
-                failedDecodes_.erase(failureKey);
-                if (thumbnail && thumbnailMode) {
-                    // Cancelled work (fling, viewport jump, stale target) re-enters
-                    // through the reconciliation sweep once the grid settles.
-                    ScheduleVisibleWork();
-                    ArmThumbnailReconcile(0);
+    void QuickSiftApplicationImpl::ApplyFaceWorkResult(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
+        auto updateCatalogPhoto = [&](const std::function<void(PhotoItem&)>& fn) {
+            if (const auto index = CatalogIndexForPath(path)) {
+                catalog_.EditPhoto(*index, fn);
+                PersistPhotoRecord(catalog_.PhotoAt(*index));
+            }
+        };
+        HandleFaceAnalysisOutcome(*result);
+        // A transient WinRT/decoder failure is not the same as a completed
+        // scan with zero faces. Do not poison the persistent record and prevent
+        // future retries when memory or the decoder becomes available again.
+        if (result->facesScanned) {
+            updateCatalogPhoto([&](PhotoItem& item) {
+                if (result->fileSize != 0) item.fileSize = result->fileSize;
+                if (result->modifiedStamp != 0) item.modifiedStamp = result->modifiedStamp;
+                item.sidecarStamp = result->sidecarStamp;
+                item.facesScanned = true;
+                item.faces = result->faces;
+                item.faceBlurScanned = result->faceBlurScanned;
+                item.faceBlurry = result->faceBlurry;
+                item.faceSharpness = result->faceSharpness;
+                item.faceQualities = result->faceBlurScanned ? result->faceQualities :
+                    std::vector<quicksift::FaceQualityRecord>{};
+                // A FaceLock choice made in this session (or already hydrated) wins
+                // over the persisted one carried by the worker's cache lookup.
+                if (!item.faceSelectionKnown && result->faceSelectionKnown) {
+                    item.faceSelectionKnown = true;
+                    item.faceSelection = result->faceSelection;
                 }
-                InvalidateCanvas();
-                return;
-            }
+            });
+            if (reviewState_.FaceLockEnabled() && ActiveInfoPath() == path) ApplyFaceLockForActive(false);
+            InvalidateCanvas();
+        }
+        return;
+    }
 
-            if (thumbnail && retryableFailure) {
-                // 0.9.4.0 retry policy: record the attempt; the backoff timer / the
-                // visible-cell reconciliation sweep issues the next attempt (with the
-                // worker's escalated timeout) only while the cell is still wanted.
-                failedDecodes_.erase(failureKey);
-                RecordThumbnailDecodeFailure(*result);
-                (void)visibleThumbnail;
-                InvalidateCanvas();
-                return;
-            }
+    // No usable pixels: a cancellation, a retryable failure (bounded retry policy)
+    // or a terminal/transient failure that is remembered.
+    void QuickSiftApplicationImpl::HandleUnusableDecodeResult(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
+        const bool thumbnail = result->cacheClass == CacheClass::Thumbnail;
+        const bool thumbnailMode = reviewState_.Mode() == ViewMode::Thumbnails;
+        const bool visibleThumbnail = thumbnail && thumbnailMode &&
+            reviewState_.IsThumbnailPathDesired(path);
+        const bool timedOut = result->timedOut;
+        const bool retryableFailure = result->workFailed || timedOut;
+        const std::wstring failureKey = DecodeFailureKey(path, result->targetSize,
+            result->kind, result->cacheClass);
 
-            if (!thumbnail && retryableFailure && result->kind != JobKind::DecodeTile) {
-                failedDecodes_.erase(failureKey);
-                RecordViewDecodeFailure(*result);
-                InvalidateCanvas();
-                return;
+        if (result->cancelled && !timedOut) {
+            // Viewport/navigation cancellation is not a decode failure. A later
+            // viewport pass will request the image again if it becomes visible.
+            failedDecodes_.erase(failureKey);
+            if (thumbnail && thumbnailMode) {
+                // Cancelled work (fling, viewport jump, stale target) re-enters
+                // through the reconciliation sweep once the grid settles.
+                ScheduleVisibleWork();
+                ArmThumbnailReconcile(0);
             }
-
-            if (thumbnail) {
-                // Not retryable (e.g. no pixels without a failure flag): treat it as
-                // one failed attempt so it still goes through the bounded policy.
-                RecordThumbnailDecodeFailure(*result);
-            } else {
-                RememberTransientDecodeFailure(failureKey);
-            }
-            QS_LOG_WARNING(L"Decode", L"Decode produced no usable pixels: " + path +
-                L" (kind " + std::to_wstring(static_cast<int>(result->kind)) +
-                L", workFailed=" + (result->workFailed ? L"1" : L"0") +
-                L", timed_out=" + (timedOut ? L"1" : L"0") + L")");
             InvalidateCanvas();
             return;
         }
 
+        if (thumbnail && retryableFailure) {
+            // 0.9.4.0 retry policy: record the attempt; the backoff timer / the
+            // visible-cell reconciliation sweep issues the next attempt (with the
+            // worker's escalated timeout) only while the cell is still wanted.
+            failedDecodes_.erase(failureKey);
+            RecordThumbnailDecodeFailure(*result);
+            (void)visibleThumbnail;
+            InvalidateCanvas();
+            return;
+        }
+
+        if (!thumbnail && retryableFailure && result->kind != JobKind::DecodeTile) {
+            failedDecodes_.erase(failureKey);
+            RecordViewDecodeFailure(*result);
+            InvalidateCanvas();
+            return;
+        }
+
+        if (thumbnail) {
+            // Not retryable (e.g. no pixels without a failure flag): treat it as
+            // one failed attempt so it still goes through the bounded policy.
+            RecordThumbnailDecodeFailure(*result);
+        } else {
+            RememberTransientDecodeFailure(failureKey);
+        }
+        QS_LOG_WARNING(L"Decode", L"Decode produced no usable pixels: " + path +
+            L" (kind " + std::to_wstring(static_cast<int>(result->kind)) +
+            L", workFailed=" + (result->workFailed ? L"1" : L"0") +
+            L", timed_out=" + (timedOut ? L"1" : L"0") + L")");
+        InvalidateCanvas();
+        return;
+    }
+
+    void QuickSiftApplicationImpl::ClearDecodeFailureStateOnSuccess(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         failedDecodes_.erase(DecodeFailureKey(path, result->targetSize, result->kind, result->cacheClass));
 
         // A successful thumbnail/preview/full decode clears any remembered thumbnail
@@ -805,20 +928,26 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                 state.modifiedStamp = result->modifiedStamp;
             }
         }
+    }
 
+    // True when a decoded result must not be admitted (RAW JPG-preview-only mode,
+    // or a thumbnail decoded for an older thumbnail size).
+    bool QuickSiftApplicationImpl::DecodedResultIsObsolete(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         if (loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path)) &&
             (result->kind == JobKind::DecodeTile || !result->previewOnly)) {
             // A RAW decode can already be in flight when the setting changes.
             // Never admit stale demosaiced/tile pixels after JPG-preview-only mode
             // becomes authoritative. New jobs are also cancelled/rerouted in Worker.
-            return;
+            return true;
         }
 
         // A thumbnail-size change can leave older jobs completing out of order.
         // Do not upload a now-obsolete large surface only to evict the current grid.
-        if (result->cacheClass == CacheClass::Thumbnail &&
-            result->targetSize != ThumbnailDecodeTarget()) return;
+        return result->cacheClass == CacheClass::Thumbnail &&
+            result->targetSize != ThumbnailDecodeTarget();
+    }
 
+    void QuickSiftApplicationImpl::RefreshCatalogGeometryFromDecode(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         // Older cache payloads may contain landscape RAW sensor dimensions beside
         // an already-oriented portrait preview. Repair that geometry on admission
         // so the bitmap is fitted, never stretched, even before the cache refreshes.
@@ -845,10 +974,15 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
             }
         }
         if (reviewState_.Mode() == ViewMode::Single && reviewState_.SinglePath() == path) UpdateStatus();
+    }
 
+    // Upload the decoded pixels as a Direct2D bitmap and insert it into the tile or
+    // bitmap cache (admission, reclaim accounting and pre-allocation eviction first).
+    void QuickSiftApplicationImpl::AdmitDecodedPixels(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         const std::uint64_t rowBytes = static_cast<std::uint64_t>(result->width) * 4ull;
         const std::uint64_t expectedBytes = rowBytes * static_cast<std::uint64_t>(result->height);
         if (rowBytes > std::numeric_limits<UINT32>::max() || expectedBytes != result->pixels.size()) {
+            RejectUndisplayableDecode(result, path, L"pixel_size_mismatch", S_OK);
             return;
         }
 
@@ -863,6 +997,78 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
             }
         }
 
+        EnqueueFaceAnalysisAfterDecode(result, path);
+
+        EnsureDeviceResources();
+        if (!renderTarget_) return;
+        const CacheClass incomingClass = result->kind == JobKind::DecodeTile ?
+            CacheClass::Tile : result->cacheClass;
+        const size_t reclaimableBytes = ReclaimableBytesForDecode(result, path, incomingBitmapKey);
+        const size_t additionalBytes = result->pixels.size() > reclaimableBytes ?
+            result->pixels.size() - reclaimableBytes : 0;
+        if (incomingBitmapKey && !ShouldAdmitBitmap(*incomingBitmapKey, *result, additionalBytes)) {
+            // TinyLFU-style admission prevents speculative one-hit scans from
+            // evicting images the photographer repeatedly compares or revisits.
+            return;
+        }
+        // Make room before the GPU allocation rather than after it. This avoids a
+        // transient old-cache + CPU-buffer + new-bitmap peak on 8 GB systems. Only
+        // reserve the net growth when this result replaces an existing surface;
+        // evicting for the full size caused needless cache churn during refinement.
+        EvictBitmapCache(false, incomingClass, additionalBytes);
+        D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        ComPtr<ID2D1Bitmap> bitmap;
+        const HRESULT hr = renderTarget_->CreateBitmap(
+            D2D1::SizeU(static_cast<UINT32>(result->width), static_cast<UINT32>(result->height)),
+            result->pixels.data(), static_cast<UINT32>(rowBytes), properties, &bitmap);
+        if (FAILED(hr)) {
+            if (hr == D2DERR_RECREATE_TARGET) {
+                DiscardDeviceResources();
+                StartUiTimer(ID_TIMER_IDLE_QUALITY, 250, L"render-target recovery");
+            } else {
+                RejectUndisplayableDecode(result, path, L"create_bitmap_failed", hr);
+            }
+            return;
+        }
+
+        if (result->kind == JobKind::DecodeTile) {
+            StoreDecodedTile(result, path, bitmap);
+            return;
+        }
+        StoreDecodedBitmap(result, path, std::move(*incomingBitmapKey), bitmap);
+    }
+
+    // Round 21 (t29u): pixels that cannot be shown (malformed buffer, CreateBitmap
+    // failure other than device loss) used to be dropped silently. Nothing recorded
+    // the failure, so paint re-requested the same decode forever and the image never
+    // appeared. They now count as a failed attempt in the bounded retry policy.
+    void QuickSiftApplicationImpl::RejectUndisplayableDecode(const std::shared_ptr<WorkResult>& result,
+        const std::wstring& path, const wchar_t* reason, HRESULT hr) {
+        static quicksift::core::LogRateLimiter limiter(6, std::chrono::seconds(10));
+        std::uint64_t suppressed = 0;
+        if (limiter.Allow(&suppressed)) {
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Warning, L"Decode", L"decoded_pixels_rejected",
+                { L"reason", reason },
+                { L"file", quicksift::diagnostics::LogFileName(result->path) },
+                { L"path_id", quicksift::diagnostics::LogPathId(result->path) },
+                { L"width", std::to_wstring(result->width) },
+                { L"height", std::to_wstring(result->height) },
+                { L"bytes", std::to_wstring(result->pixels.size()) },
+                { L"hresult", std::to_wstring(static_cast<long>(hr)) },
+                { L"max_bitmap_edge", std::to_wstring(deviceMaxBitmapEdge_) },
+                { L"suppressed", std::to_wstring(suppressed) });
+        }
+        result->workFailed = true;
+        result->cancelled = false;
+        if (result->failureKind == DecodeFailureKind::None) {
+            result->failureKind = hr == S_OK ? DecodeFailureKind::Decode : DecodeFailureKind::Transient;
+        }
+        result->pixels.clear();
+        HandleUnusableDecodeResult(result, path);
+    }
+
+    void QuickSiftApplicationImpl::EnqueueFaceAnalysisAfterDecode(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
         // 0.9.4.0: in Thumbnail view the worker cancels every Face job while the grid
         // viewport is active (Worker::IsCancelled), so enqueueing one per thumbnail
         // completion only produced queue churn (a key build, a worker-lock round trip,
@@ -881,11 +1087,10 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                     photo.facesScanned ? kFaceSharpnessDecodeSize : kFaceDecodeSize);
             }
         }
+    }
 
-        EnsureDeviceResources();
-        if (!renderTarget_) return;
-        const CacheClass incomingClass = result->kind == JobKind::DecodeTile ?
-            CacheClass::Tile : result->cacheClass;
+    size_t QuickSiftApplicationImpl::ReclaimableBytesForDecode(const std::shared_ptr<WorkResult>& result, const std::wstring& path,
+        const std::optional<CacheKey>& incomingBitmapKey) {
         size_t reclaimableBytes = 0;
         if (result->kind == JobKind::DecodeTile) {
             const TileKey existingKey{ path, result->tileX, result->tileY,
@@ -912,50 +1117,28 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
                 }
             }
         }
-        const size_t additionalBytes = result->pixels.size() > reclaimableBytes ?
-            result->pixels.size() - reclaimableBytes : 0;
-        if (incomingBitmapKey && !ShouldAdmitBitmap(*incomingBitmapKey, *result, additionalBytes)) {
-            // TinyLFU-style admission prevents speculative one-hit scans from
-            // evicting images the photographer repeatedly compares or revisits.
-            return;
-        }
-        // Make room before the GPU allocation rather than after it. This avoids a
-        // transient old-cache + CPU-buffer + new-bitmap peak on 8 GB systems. Only
-        // reserve the net growth when this result replaces an existing surface;
-        // evicting for the full size caused needless cache churn during refinement.
-        EvictBitmapCache(false, incomingClass, additionalBytes);
-        D2D1_BITMAP_PROPERTIES properties = D2D1::BitmapProperties(
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
-        ComPtr<ID2D1Bitmap> bitmap;
-        const HRESULT hr = renderTarget_->CreateBitmap(
-            D2D1::SizeU(static_cast<UINT32>(result->width), static_cast<UINT32>(result->height)),
-            result->pixels.data(), static_cast<UINT32>(rowBytes), properties, &bitmap);
-        if (FAILED(hr)) {
-            if (hr == D2DERR_RECREATE_TARGET) {
-                DiscardDeviceResources();
-                StartUiTimer(ID_TIMER_IDLE_QUALITY, 250, L"render-target recovery");
-            }
-            return;
-        }
+        return reclaimableBytes;
+    }
 
-        if (result->kind == JobKind::DecodeTile) {
-            TileKey key{ path, result->tileX, result->tileY, result->tileWidth, result->tileHeight, result->tileLevel };
-            TileEntry entry;
-            entry.bitmap = bitmap;
-            entry.sourceWidth = result->sourceWidth;
-            entry.sourceHeight = result->sourceHeight;
-            entry.bytes = result->pixels.size();
-            entry.lastUse = ++useCounter_;
-            entry.lastUseTime = std::chrono::steady_clock::now();
-            if (const auto existing = tileCache_.find(key); existing != tileCache_.end()) tileCacheBytes_ -= existing->second.bytes;
-            tileCacheBytes_ += entry.bytes;
-            tileCache_[std::move(key)] = std::move(entry);
-            EvictBitmapCache();
-            InvalidateCanvas();
-            return;
-        }
+    void QuickSiftApplicationImpl::StoreDecodedTile(const std::shared_ptr<WorkResult>& result, const std::wstring& path,
+        const ComPtr<ID2D1Bitmap>& bitmap) {
+        TileKey key{ path, result->tileX, result->tileY, result->tileWidth, result->tileHeight, result->tileLevel };
+        TileEntry entry;
+        entry.bitmap = bitmap;
+        entry.sourceWidth = result->sourceWidth;
+        entry.sourceHeight = result->sourceHeight;
+        entry.bytes = result->pixels.size();
+        entry.lastUse = ++useCounter_;
+        entry.lastUseTime = std::chrono::steady_clock::now();
+        if (const auto existing = tileCache_.find(key); existing != tileCache_.end()) tileCacheBytes_ -= existing->second.bytes;
+        tileCacheBytes_ += entry.bytes;
+        tileCache_[std::move(key)] = std::move(entry);
+        EvictBitmapCache();
+        InvalidateCanvas();
+    }
 
-        CacheKey key = std::move(*incomingBitmapKey);
+    void QuickSiftApplicationImpl::StoreDecodedBitmap(const std::shared_ptr<WorkResult>& result, const std::wstring& path,
+        CacheKey key, const ComPtr<ID2D1Bitmap>& bitmap) {
         if (result->cacheClass == CacheClass::Thumbnail) {
             // Keep one GPU thumbnail per photo. Retaining old size buckets is pure
             // memory churn and was the main trigger for Large/Huge grid flicker.

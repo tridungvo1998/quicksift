@@ -1,6 +1,21 @@
-# QuickSift 0.9.4.0 RC
+# QuickSift 0.9.6.0 RC
 
-QuickSift is a native Windows photo-culling application built for fast, careful review of production media. Version **0.9.4.0 RC** is a release candidate: the feature set is substantially complete, but the native Windows binary still requires final build, signing, clean-machine, and destructive-operation validation before public release.
+QuickSift is a native Windows photo-culling application built for fast, careful review of production media. Version **0.9.6.0 RC** is a release candidate: the feature set is substantially complete, but the native Windows binary still requires final build, signing, clean-machine, and destructive-operation validation before public release.
+
+## Documentation map
+
+| You want to… | Read |
+|---|---|
+| Use QuickSift: features, shortcuts, settings | [`USER_GUIDE.md`](USER_GUIDE.md) |
+| Understand or change the code: owners, rules, recipes | [`CODE_GUIDE.md`](CODE_GUIDE.md) |
+| Module boundaries and runtime flows | [`ARCHITECTURE.md`](ARCHITECTURE.md) |
+| Find the file that owns a change, fast | [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md) |
+| Build, sign or package; what a build error means | [`BUILDING.md`](BUILDING.md) |
+| Automated checks and manual tests | [`TESTING.md`](TESTING.md) |
+| Colours, spacing, type and motion tokens | [`docs/DESIGN_SYSTEM.md`](docs/DESIGN_SYSTEM.md) |
+| Which UI file owns a window, control or menu | [`src/ui/README.md`](src/ui/README.md) |
+| The application's state structs | [`src/app/state/README.md`](src/app/state/README.md) |
+| What changed in each release | [`CHANGELOG.md`](CHANGELOG.md) |
 
 ## Current feature set
 
@@ -18,9 +33,9 @@ QuickSift is a native Windows photo-culling application built for fast, careful 
 
 ## Architecture and validation
 
-The former 13,000-line application body is split into separately compiled responsibility-named modules, and `src/main.cpp` is now a roughly 60-line entry point. Catalog storage, Undo/Redo, folder scanning, cross-thread completion ownership, verified file transactions, and metadata transactions have independent services or stores. Worker messages are payload-free wake-ups, while synchronized queues retain result ownership. The release gate uses source verification, clean native builds, binary checks, and targeted manual regression scenarios; the former CTest suite has been retired.
+The former 13,000-line application body is split into separately compiled responsibility-named modules, and `src/main.cpp` is a thin entry point (under 100 lines). Catalog storage, Undo/Redo, folder scanning, cross-thread completion ownership, verified file transactions, and metadata transactions have independent services or stores. Worker messages are payload-free wake-ups, while synchronized queues retain result ownership. The release gate uses source verification, clean native builds, binary checks, and targeted manual regression scenarios; the former CTest suite has been retired.
 
-Start with [CODE_GUIDE.md](CODE_GUIDE.md) for the plain-English map and change recipes. Use [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [src/ui/README.md](src/ui/README.md) for deeper ownership details; see [TESTING.md](TESTING.md) for automated and manual validation.
+Developers start with [CODE_GUIDE.md](CODE_GUIDE.md); the documentation map above lists the other guides.
 
 ## Quick start
 
@@ -32,12 +47,12 @@ Start with [CODE_GUIDE.md](CODE_GUIDE.md) for the plain-English map and change r
 
 ## Diagnostics and runtime data
 
-Open **Settings → Diagnostic log** to inspect recent events, refresh the viewer, or export a text snapshot. QuickSift detects Windows package identity at runtime and uses one canonical writable data root:
+Open **Settings → Diagnostic log** to inspect recent events, refresh the viewer, or export a text snapshot. **Previous sessions…** in that window opens an earlier session's log read-only (newest first; large logs show their newest 2 MB). QuickSift detects Windows package identity at runtime and uses one canonical writable data root:
 
 - **Portable/unpackaged:** `QuickSiftData` beside `QuickSift.exe`.
 - **MSIX/Store:** `%LOCALAPPDATA%\Packages\<QuickSift package family>\LocalState`.
 
-Under that root, session preferences are `QuickSift.session.ini`, the disposable persistent cache is `.cache`, session logs are in `Logs`, and crash reports/minidumps are in `CrashReports`. The newest 20 session logs and newest 20 crash incidents are retained. A packaged process never falls back to writing beside its read-only packaged executable. If the active data root cannot be created and written, QuickSift shows a startup error and refuses to launch.
+Under that root, session preferences are `QuickSift.session.ini`, the disposable persistent cache is `.cache`, session logs are in `Logs`, and crash reports/minidumps are in `CrashReports`. Session logs, crash reports and minidumps older than 7 days are deleted automatically shortly after startup. Only QuickSift's own files are touched, never the current session's log. The newest 20 crash incidents are kept, and each session log is capped at 16 MiB. A packaged process never falls back to writing beside its read-only packaged executable. If the active data root cannot be created and written, QuickSift shows a startup error and refuses to launch.
 
 Logs may contain local paths and filenames. Inspect them before sharing.
 

@@ -2,7 +2,7 @@
 
 QuickSift is organized around one rule: **each decision and mutable resource has one explicit owner**. The Win32 controller coordinates services, but catalog storage, history retention, background completion ownership, scanning, file mutation, metadata mutation, diagnostics, rendering policy, and deterministic calculations are not reimplemented in message handlers.
 
-For a task-oriented route through the code, start with [`CODE_GUIDE.md`](CODE_GUIDE.md). For exact UI edit routing, see [`src/ui/README.md`](src/ui/README.md).
+For a task-oriented route through the code, start with [`CODE_GUIDE.md`](CODE_GUIDE.md) (the hub: philosophy, the owner table and the threading/shutdown rules). This document stays at the level of boundaries and flows. For exact UI edit routing, see [`src/ui/README.md`](src/ui/README.md).
 
 ## Face-analysis capability and retry policy
 
@@ -10,7 +10,7 @@ For a task-oriented route through the code, start with [`CODE_GUIDE.md`](CODE_GU
 
 ## Composition root
 
-`src/main.cpp` is a thin process entry point. It initializes process-wide facilities, constructs `QuickSiftApplication`, and enters `wWinMain`. It is currently about 60 lines and is capped by source verification.
+`src/main.cpp` is a thin process entry point. It initializes process-wide facilities, constructs `QuickSiftApplication`, and enters `wWinMain`. It is under 100 lines; both verifiers reject an application class or a UI include in it.
 
 `src/app/quicksift_application.h` is a small PIMPL facade. The private composition root and the shrinking Win32 orchestration surface live in `src/app/quicksift_application_internal.h`; feature modules include that private header, while consumers of the application do not recompile against rendering, worker, catalog, or transaction state. Implementation fragments and textual inclusion are forbidden. CMake is the only composition mechanism.
 
@@ -29,7 +29,7 @@ The private controller remains the Win32 orchestration boundary, not the owner o
 - `history_partition.h` — deterministic partial-history partitioning.
 - `stable_file_identity.h` — rename-stable identity stamps used by guarded replay.
 - `decode_budget.*` — priority/FIFO decoded-memory admission, cancellable waits, dynamic permit/byte ceilings, exclusive oversized reservations, and RAII release.
-- `performance_policy.*` — the central Normal/Constrained/Critical/Recovery governor, pressure hysteresis, runtime decode/codec/read-ahead/buffer/cache limits, and UI integration budgets.
+- `performance_policy.*` — the fixed maximum-performance policy for visual decoding (see `MAXIMUM_PERFORMANCE_POLICY.md`); runtime CPU/RAM/GPU pressure is telemetry only and never throttles normal decoding.
 - `system_profile.*` — runtime sizing for workers, caches, codecs, and read-ahead.
 - `work_queue_policy.h` — deterministic worker-priority mechanics.
 - `face_policy.*` — FaceLock multi-face policy: centre-closest default ordering (ties: area, top, left) with a small-face eligibility rule, conservative detection noise filter, persisted-selection matching (IoU / nearest centre), target resolution, outline hit testing, and the click/framing constants.
@@ -39,8 +39,23 @@ The private controller remains the Win32 orchestration boundary, not the owner o
 - `photo_predicate.*` — the shared predicate engine used by both the Filter tab and Thumbnail search: `Clause`, `ClauseMatches` / `MatchesAll`, compilation of the Filter-tab criteria, and accent folding.
 - `search_query.*` — the Thumbnail search query language (tokenizer, fuzzy keyword resolution, precedence), compiled to `predicate::Clause`.
 - `exif_capture_time.*` — a bounded EXIF capture-time reader for JPEG APP1, TIFF/RAW IFDs and embedded TIFF blocks.
+- `priority_policy.*` — the P0–P5 tier model, the foreground-demand signal and bounded yield/starvation rules (see "Priority model" below).
+- Metadata read lane: `metadata_lane_policy.h` (when a read may start: 750 ms share age, 10 s cap behind pending writes), `metadata_progress.h` (apply / bounded retry / mark unreadable), `metadata_gate_policy.h` (Exiv2 gate admission; the writer's own reads pass), `metadata_queue_order.h` (visible-first queue order), `hydrated_facts.h` (merge rule for background-hydrated facts), `filter_value_index.h` (distinct filter-menu values kept by `CatalogStore`).
+- Metadata writes: `metadata_edit_queue.h` (edit coalescing), `write_retry_policy.h` (failure classes and lock-resolution retry), `sidecar_write_policy.h` (XMP sidecar write plan), `metadata_state.h` (field patches and conflict comparison).
+- Decode helpers: `decode_timeout_policy.h` (adaptive decode timeout), `embedded_jpeg_scan.h` (largest embedded RAW preview).
+- UI models without Win32: `blocking_wait.h` (blocking-wait dialog text), `hud_snapshot.h` (Performance HUD text), `pane_scroll_policy.h` (left-pane scroll geometry and `caption::Truncated`), `pane_timing.h` (`[Pane]`/`[Startup]` timing records), `presentation_settings.h` (early theme value).
+- Lifecycle and diagnostics policy: `worker_lifetime.h` (shutdown token for app-owned threads), `log_retention.h` (7-day diagnostic-file retention decisions), `log_and_continue.h` (contained-failure message and per-site rate limit), `log_rate_limiter.h`, `user_error_catalog.h`, `lock_order.h`.
 
 Portable modules build into `QuickSiftCore` and are exercised on Windows and non-Windows hosts.
+
+### `src/app`: facade, composition root and state
+
+- `quicksift_application.h` — the public PIMPL facade; no state.
+- `quicksift_application.cpp` — application lifetime: construction, deferred startup (`StartDeferredStartup`), diagnostics cleanup start, `StopAllWorkersForTeardown` and `PostFromWorker`.
+- `quicksift_application_internal.h` — `QuickSiftApplicationImpl`: private method declarations, services, COM objects (whose release order it owns) and the worker-lifetime gate `workerLifetime_`.
+- `state/*.h` — the plain data of `QuickSiftApplicationImpl`, split into ten data-only structs (`ChromeState`, `PaneState`, `ViewerState`, `BrowseState`, `MetadataState`, `RatingsExchangeState`, `BatchState`, `SearchState`, `HudState`, `SessionLogBrowserState`) that it inherits privately; see [`src/app/state/README.md`](src/app/state/README.md).
+- `application_support.*` — registered classes, private messages, timers, subclass/property keys, and the sidecar read/write adapters (`ReadSidecarMetadata`, `WritePhotoMetadataPatch`, `ReadPhotoMetadata`).
+- `application_text_io.cpp` — verified atomic text-file publication.
 
 ### `src/transactions`: mutation boundaries
 
@@ -55,7 +70,8 @@ The UI may build immutable plans and integrate results. It must not execute tran
 
 ### `src/work`: asynchronous decode and scanning
 
-- `background_work_engine.*` and `background_performance_controller.cpp` — decoder execution, priority queues, guarded fairness, viewport cancellation, adaptive permits, telemetry, cache writing, path-scoped read-ahead, and decoder-exclusion coordination.
+- `background_work_engine.*` and `background_performance_controller.cpp` — decoder execution, priority queues, guarded fairness, viewport cancellation, permits, telemetry, cache writing, path-scoped read-ahead, and decoder-exclusion coordination. `Worker::Run` is a short loop over named steps (`WaitForNextJob`, `BeginJobActivity`, `FingerprintJobSource`, `ExecuteJobKind` → `ExecuteMetadataReadJob` / `ExecuteExifJob` / `ExecuteFaceJob` / `ExecuteTileJob` / `ExecuteDecodeJob`, `PublishJobResult`, `LogCompletedJob`); per-job state is `JobActivity` / `JobRunContext` in `background_work_engine.h`.
+- `background_decode_policy.cpp` — RAW decode-mode switching and visual decode coalescing.
 - `folder_scanner.*` — bounded folder enumeration, explicit success/partial/failure completion, native error reporting, and acknowledgement-backed batch publication.
 - `background_completion_queue.h` — synchronized ownership of worker results and scan batches, priority-aware one-item removal, completion age, and scanner ordering barriers. Win32 messages are payload-free wake-ups; the queue retains the actual objects.
 
@@ -78,7 +94,9 @@ Workers mirror review epochs for execution/cancellation; they do not generate or
 ### `src/diagnostics`
 
 - `platform/application_data_paths.h` — the single owner of executable-adjacent runtime paths: `QuickSiftData`, `.cache`, and `QuickSift.session.ini`. New runtime persistence must not invent a second root.
-- `diagnostic_log.*` — thread-safe logging under executable-adjacent `QuickSiftData`, bounded viewer snapshots, 20-session/20-crash retention, UTF-8 log files, manual export, crash reports, and minidumps. `QuickSiftData` storage is a required startup dependency.
+- `diagnostic_log.*` — thread-safe logging under the data root, bounded viewer snapshots, UTF-8 log files (16 MiB cap per session log), manual export, crash reports and minidumps (newest 20 crash incidents kept), and `CleanupOldDiagnosticFiles`. That cleanup runs about 3 s after startup on a background-priority thread and deletes QuickSift's own session logs, crash reports and minidumps older than 7 days. The decisions come from `core/log_retention.h`: own names only, never the current session log, never a reparse point, never recursive, every deletion logged. There is no session-log count limit. `ListPreviousSessionLogs` / `ReadSessionLogTail` serve the read-only Previous sessions browser (same `Logs` folder, `core/session_log_browser.h` policy, at most 2 MiB read, reparse points skipped). The data root is a required startup dependency.
+- `log_and_continue.h` — `QS_LOG_AND_CONTINUE(category, site)` and `QS_CATCH_SILENT_BY_DESIGN(reason)` for `catch (...)` boundaries (portable core in `core/log_and_continue.h`).
+- `log_categories.h` — category names and privacy-preserving `file=` / `path_id=` fields.
 
 ### `src/platform`
 
@@ -92,7 +110,7 @@ Central component framework and foundation:
 - `framework/macos_ui_framework.*` — one macOS-inspired facade for child-control creation, button interaction, panels, labels, status surfaces, title-bar traffic lights, dropdowns, toasts, alerts, cards, badges, and shared text rendering. GDI, popup-host, and Direct2D implementations are separately compiled.
 - `ui_command_ids.h` — authoritative command/control IDs.
 - `ui_control_catalog.h` — authoritative persistent main-window button catalog.
-- `ui_layout_metrics.h` — shared device-independent geometry.
+- `ui_layout_metrics.h` — shared device-independent geometry used across areas; `ui_layout_constants.h` — per-area named DIPs (`main_window`, `left_pane`, `status_bar`, `document`).
 - `ui_design_tokens.h` — the design tokens (radii, spacing, strokes, type, motion, glass, accessibility policy); see `docs/DESIGN_SYSTEM.md`.
 - `ui_design_system.*` — semantic palettes, contrast, DPI conversion, and low-level failure-safe primitives used by the component framework.
 - `../app/application_support.*` — registered application classes, private messages, timers, and application-specific subclass/property keys.
@@ -115,6 +133,15 @@ Separately compiled feature modules:
 - `navigation_input_and_session.cpp`
 - `metadata_history_and_file_safety.cpp`
 - `settings_filters_and_file_commands.cpp`
+- `metadata_write_lane_controller.cpp`
+- `thumbnail_search_controller.cpp`
+- `ratings_exchange_commands.cpp`
+- `batch_processing_commands.cpp`
+- `blocking_wait_controller.cpp`
+- `face_analysis_controller.cpp`
+- `performance_policy_controller.cpp`
+
+`graphics_resources_and_image_cache.cpp` owns the bitmap/tile caches only. The unused Direct2D image-source cache (`wicImageSources_`) was removed in 0.9.5.0, and a verifier rule keeps it out, because the UI thread never decodes.
 
 These modules implement methods declared only in the private `quicksift_application_internal.h`; the public facade exposes no UI or rendering state. None is textually included into another source file.
 
@@ -248,7 +275,13 @@ History replay uses the same transaction services as forward operations and reta
 
 ### Shutdown
 
-The window stops accepting new work, requests cancellation, and waits only for safe transaction boundaries. Transaction services stop before the decoder worker they may coordinate with. Queue-owned completions can be discarded without freeing raw message payloads because private messages contain no object pointers.
+The window stops accepting new work, requests cancellation, and waits only for safe transaction boundaries. `WM_DESTROY` (normal close and Force quit) calls `OnMainWindowDestroyed`, which runs in this order:
+1. background stop request
+2. timer teardown
+3. `StopAllWorkersForTeardown`, which revokes the `core/worker_lifetime.h` token and then joins the ratings, batch, search, deferred-startup, diagnostics-cleanup and session-log-browser threads
+4. `StopServicesForShutdown`: resource monitor, then transactions, then scanner, then decoder worker, then completion drain, then `persistentCache_.CloseForShutdown()`
+
+Transaction services stop before the decoder worker they may coordinate with, and nothing closes the cache while a worker can still run. Queue-owned completions can be discarded without freeing raw message payloads, because private messages contain no object pointers. Exact steps and log stages: CODE_GUIDE §8.1.
 
 ## Dependency direction
 
@@ -280,7 +313,8 @@ Portable core and portable transaction modules must not include Win32 UI headers
 - path-scoped decoder/read-ahead exclusion and overlap-preserving thumbnail cancellation;
 - constructor-safe worker startup, non-allocating worker callback snapshots, and service-stop ordering;
 - Windows logoff cancellation/reopening and mid-file verified-copy cancellation;
-- absence of generated, editor-backup, and obsolete source files.
+- absence of generated, editor-backup, and obsolete source files;
+- 0.9.5.0 round 19: worker shutdown tokens and join-before-teardown, 7-day diagnostic retention safety, no `wicImageSources_`, the title-layout skip guard, data-only `src/app/state` structs, no empty `catch (...)` in the app layer, and named layout constants (CODE_GUIDE §16, TESTING.md).
 
 ## Change rules
 
@@ -371,7 +405,7 @@ Locks may only be taken in increasing rank. Ranks are declared in `src/core/lock
 | 21 | `FileTransactionService::mutex_` | Same rules as the metadata service. |
 | 30 | search `searchMutex_` | Never held over file I/O, cache-database calls or `PostMessageW`. |
 | 31 / 32 | `ratingsWorkerMutex_` / `batchWorkerMutex_` | Held only to move a result in or out. |
-| 40–43 | Worker `blockedMutex_`, `readAheadGateMutex_`, `desiredMutex_`, `mutex_` | `BeginExclusivePathWrites` takes them one after another, never nested. `PopWork` and all dequeue decisions run under `mutex_` (may log). |
+| 40–44 | Worker `blockedMutex_` (40), `readAheadGateMutex_` (41), `mutex_` (43), `desiredMutex_` (44) | `BeginExclusivePathWrites` takes them one after another, never nested. `PopWork` and all dequeue decisions run under `mutex_` (may log). `Enqueue` and the view-lane reconcile take `desiredMutex_` (a leaf) and `viewPrefetchMutex_` (a leaf) under `mutex_`. The decode-budget cancellation callback (`Worker::IsCancelled`) runs under the budget mutex and takes only leaf worker mutexes. |
 | 50 | `PersistentCache::databaseMutex_` (timed) | UI callers use `try_lock_for(30 ms)`. Every holder drains deferred UI writes first. |
 | 51 | `PersistentCache::deferredMutex_` | Leaf except for logging. |
 | 60 | logger stream mutex | Disk writes only; taken by the writer thread, Critical sync drains and shutdown. |
@@ -379,7 +413,7 @@ Locks may only be taken in increasing rank. Ranks are declared in `src/core/lock
 
 Lock-free shared state: `priority::Demand()` atomics, `searchMessagePosted_` / `searchUnconsumed_`, worker counters, the crash-state snapshot. `TransactionCoordinator` and `CatalogStore` (including `Snapshot()` chunk rebuilds) are UI-thread objects; workers only receive immutable `CatalogSnapshot` chunks via `shared_ptr<const ...>`.
 
-Shutdown/join paths: WM_CLOSE flushes or (after confirmation) discards queued edits, then the coordinator stops services (`Stop()` notifies `condition_`, so a 30 s wait ends at once), workers are joined after their stop flags and condition variables are signalled, and the ratings/batch/search workers are stopped before the window is destroyed. Completion sinks capture the `HWND` by value, so a late post after destruction is harmless.
+Shutdown/join paths: WM_CLOSE flushes or (after confirmation) discards queued edits, then the coordinator stops services (`Stop()` notifies `condition_`, so a 30 s wait ends at once), workers are joined after their stop flags and condition variables are signalled, and the ratings/batch/search/deferred-startup/diagnostics-cleanup workers are revoked and joined (`StopAllWorkersForTeardown`) before services and the cache close. App-owned workers post only through `PostFromWorker`, which posts only while their lifetime token is alive. Transaction completion sinks capture the `HWND` by value, so a late post after destruction is harmless.
 
 ## Localization (0.9.4.0 polish)
 

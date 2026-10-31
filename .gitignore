@@ -1,0 +1,24 @@
+# Build output
+/build/
+/out/
+/x64/
+/Release/
+/Debug/
+/vcpkg_installed/
+/dist/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.msix
+*.appx
+*.zip
+# Build transcripts
+QuickSift-BuildLog-*.txt
+# IDE
+.vs/
+*.user
+/CMakeUserPresets.json
+# Python
+__pycache__/
+*.pyc

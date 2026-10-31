@@ -1,7 +1,16 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "core/pane_scroll_policy.h"
+#include "ui/ui_layout_constants.h"
 
 namespace quicksift::app {
+
+namespace {
+// Milliseconds since `start` on the steady clock ([Pane] timing).
+[[nodiscard]] double PaneMsSince(std::chrono::steady_clock::time_point start) noexcept {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+} // namespace
 
 // CODE GUIDE: See CODE_GUIDE.md -> "Where new code goes".
 // OWNER: Required child controls, layout, left hover pane, fonts, and owner-drawn control painting.
@@ -95,6 +104,7 @@ namespace quicksift::app {
         libraryTooltipSpec.toolId = 1;
         libraryTooltipSpec.text = &libraryTooltipText_;
         libraryTooltip_ = uiFramework_.CreateTooltip(libraryTooltipSpec);
+        RestyleTooltips();
         if (!CreateMainWindowButton(ID_REMOVE_LIBRARY, L"Remove from library")) return -1;
         ShowWindow(controls_[ID_REMOVE_LIBRARY], SW_HIDE);
         EnableWindow(controls_[ID_REMOVE_LIBRARY], FALSE);
@@ -214,6 +224,7 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::OnDpiChanged(UINT newDpi, const RECT* suggested) {
         currentDpi_ = newDpi ? newDpi : USER_DEFAULT_SCREEN_DPI;
+        MarkTitleLayoutDirty();
         // Fonts and DPI-scaled resources FIRST: SetWindowPos below sends WM_SIZE,
         // whose layout pass used to run with the previous DPI's fonts/item heights
         // (one visibly wrong frame, then a second full layout).
@@ -521,6 +532,26 @@ namespace quicksift::app {
     }
 
 
+    void QuickSiftApplicationImpl::LogPaneTiming(std::wstring_view event, FlyoutPanel panel, bool first,
+        double totalMs, const quicksift::core::pane_timing::Recorder* segments) {
+        namespace timing = quicksift::core::pane_timing;
+        const auto level = timing::Decide(first, totalMs) == timing::LogLevel::Info
+            ? quicksift::diagnostics::Level::Info : quicksift::diagnostics::Level::Trace;
+        if (segments) {
+            QS_LOG_EVENT(level, L"Pane", std::wstring(event),
+                {L"section", std::to_wstring(static_cast<int>(panel))},
+                {L"first", first ? L"1" : L"0"},
+                {L"ms", timing::Recorder::FormatMs(totalMs)},
+                {L"slowest", std::wstring(segments->Slowest())},
+                {L"segments", segments->Format()});
+        } else {
+            QS_LOG_EVENT(level, L"Pane", std::wstring(event),
+                {L"section", std::to_wstring(static_cast<int>(panel))},
+                {L"first", first ? L"1" : L"0"},
+                {L"ms", timing::Recorder::FormatMs(totalMs)});
+        }
+    }
+
     void QuickSiftApplicationImpl::SetActiveFlyout(FlyoutPanel panel) {
         if (activeFlyout_ == panel) return;
         if (activeFlyout_ == FlyoutPanel::Folders && panel != FlyoutPanel::Folders) {
@@ -534,12 +565,29 @@ namespace quicksift::app {
         lastFlyoutHover_ = std::chrono::steady_clock::now();
         // Opening: refresh the frost from the canvas under the pane (next canvas frame).
         if (opening) MarkLeftPaneFrostDirty();
+        const auto layoutStart = std::chrono::steady_clock::now();
+        if (opening) {
+            paneOpenRequestedAt_ = layoutStart;
+            paneFirstPaintPending_ = true;
+        }
         // Tab switch: LayoutControls hides ONLY the previous section's children
         // (HideLeftPaneSectionContentExcept) and moves/shows the new one with
         // SWP_NOREDRAW, then composes the pane once (buffered surfaces, no erase).
         RECT client{};
         GetClientRect(hwnd_, &client);
         LayoutControls(client.right, client.bottom);
+        if (panel != FlyoutPanel::None) {
+            const double layoutMs = PaneMsSince(layoutStart);
+            // Opening only starts the width animation (content is revealed later);
+            // a tab switch with the pane open lays out and composes the section now.
+            const bool revealedNow = leftPaneContentVisible_;
+            const auto index = static_cast<std::size_t>(panel);
+            const bool firstReveal = revealedNow && index < paneSectionRevealed_.size() && !paneSectionRevealed_[index];
+            if (firstReveal) paneSectionRevealed_[index] = true;
+            LogPaneTiming(opening ? L"pane_open" : L"pane_section_switch", panel,
+                opening ? !paneEverOpened_ : firstReveal, layoutMs, revealedNow ? &paneLayoutTiming_ : nullptr);
+            if (opening) paneEverOpened_ = true;
+        }
         // Tabs are invalidated inside RedrawActiveFlyoutContents / LayoutControls.
         // Do not parent-erase or UPDATENOW tabs again here (that flashed the canvas).
     }
@@ -617,26 +665,33 @@ namespace quicksift::app {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
         };
         for (HWND tab : flyoutTabs_) raise(tab);
+        ForEachActiveSectionChild(raise);
+    }
+
+    void QuickSiftApplicationImpl::ForEachActiveSectionChild(const std::function<void(HWND)>& visit) const {
+        // One enumeration of the active section's child windows (stable order:
+        // controls by id, then section labels/selector; or the Folders / Info
+        // children). Raise, invalidate and synchronous-paint passes share it.
         if (activeFlyout_ == FlyoutPanel::File || activeFlyout_ == FlyoutPanel::Cull ||
             activeFlyout_ == FlyoutPanel::Filter || activeFlyout_ == FlyoutPanel::Settings) {
             for (const auto& [id, control] : controls_) {
                 const bool belongs = activeFlyout_ == FlyoutPanel::File ? IsFileControlId(id) :
                     activeFlyout_ == FlyoutPanel::Cull ? IsCullControlId(id) :
                     activeFlyout_ == FlyoutPanel::Filter ? IsFilterControlId(id) : IsSettingsControlId(id);
-                if (belongs) raise(control);
+                if (belongs) visit(control);
             }
             if (activeFlyout_ == FlyoutPanel::Settings) {
-                for (HWND label : settingsSectionLabels_) raise(label);
-                raise(languageSelector_);
+                for (HWND label : settingsSectionLabels_) visit(label);
+                visit(languageSelector_);
             }
         } else if (activeFlyout_ == FlyoutPanel::Folders) {
-            raise(libraryList_);
-            if (auto it = controls_.find(ID_REMOVE_LIBRARY); it != controls_.end()) raise(it->second);
+            visit(libraryList_);
+            if (auto it = controls_.find(ID_REMOVE_LIBRARY); it != controls_.end()) visit(it->second);
         } else if (activeFlyout_ == FlyoutPanel::Info) {
-            raise(exif_);
-            raise(userCommentLabel_);
-            raise(userCommentEdit_);
-            if (auto it = controls_.find(ID_SAVE_USER_COMMENT); it != controls_.end()) raise(it->second);
+            visit(exif_);
+            visit(userCommentLabel_);
+            visit(userCommentEdit_);
+            if (auto it = controls_.find(ID_SAVE_USER_COMMENT); it != controls_.end()) visit(it->second);
         }
     }
 
@@ -669,6 +724,9 @@ namespace quicksift::app {
         auto hideQuiet = [&](HWND window, int id) {
             if (!window || !IsWindowVisible(window)) return;
             if (keep != FlyoutPanel::None && LeftPaneWindowBelongsTo(window, id, keep)) return;
+            InvalidateUnderHiddenPaneChild(window);
+            const auto clipped = std::find(paneClippedChildren_.begin(), paneClippedChildren_.end(), window);
+            if (clipped != paneClippedChildren_.end()) paneClippedChildren_.erase(clipped);
             SetWindowPos(window, nullptr, 0, 0, 0, 0,
                 SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                 SWP_NOACTIVATE | SWP_NOREDRAW);
@@ -689,8 +747,178 @@ namespace quicksift::app {
         hideQuiet(userCommentLabel_, 0);
     }
 
-    void QuickSiftApplicationImpl::HideAllLeftPaneSectionContent() {
-        HideLeftPaneSectionContentExcept(FlyoutPanel::None);
+    bool QuickSiftApplicationImpl::IsPaneScrollableChild(HWND window) const {
+        if (!window || window == flyoutBackdrop_) return false;
+        for (HWND tab : flyoutTabs_) if (tab == window) return false;
+        return window == userCommentEdit_ || IsLeftPaneSurface(window);
+    }
+
+    void QuickSiftApplicationImpl::InvalidateUnderHiddenPaneChild(HWND window) {
+        // SWP_NOREDRAW hides expose nothing: when the child stood outside the pane
+        // backdrop (the overflowing language selector over the status bar/canvas),
+        // its pixels stayed behind. Repaint whatever lies under its old rect.
+        if (!window || !hwnd_) return;
+        RECT rc{};
+        GetWindowRect(window, &rc);
+        MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&rc), 2);
+        RECT pane{};
+        if (flyoutBackdrop_ && IsWindowVisible(flyoutBackdrop_)) {
+            GetWindowRect(flyoutBackdrop_, &pane);
+            MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&pane), 2);
+        }
+        RECT inside{};
+        if (IntersectRect(&inside, &rc, &pane) && EqualRect(&inside, &rc)) return; // backdrop recomposes it
+        RedrawWindow(hwnd_, &rc, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+
+    void QuickSiftApplicationImpl::ApplyPaneScroll(const RECT& viewport) {
+        // Called at the end of LayoutControls: every visible child of the active
+        // section was just placed at its natural (unscrolled) position.
+        paneViewport_ = viewport;
+        paneNaturalRects_.clear();
+        int contentBottom = viewport.top;
+        for (HWND child = GetWindow(hwnd_, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+            if (!IsWindowVisible(child) || !IsPaneScrollableChild(child)) continue;
+            RECT rc{};
+            GetWindowRect(child, &rc);
+            MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&rc), 2);
+            // Anything placed (and possibly painted) outside the viewport at its
+            // natural position: repaint whatever lies under that part.
+            if (rc.bottom > viewport.bottom || rc.top < viewport.top) InvalidateUnderHiddenPaneChild(child);
+            paneNaturalRects_.emplace_back(child, rc);
+            contentBottom = std::max(contentBottom, static_cast<int>(rc.bottom));
+        }
+        const int previousContent = paneContentHeight_;
+        paneContentHeight_ = contentBottom - static_cast<int>(viewport.top);
+        // Content change (relocalized captions, wrapped sections, resize): keep the
+        // offset but re-clamp it; RepositionPaneScroll clamps.
+        (void)previousContent;
+        RepositionPaneScroll();
+    }
+
+    void QuickSiftApplicationImpl::RepositionPaneScroll() {
+        namespace pane = quicksift::core::pane;
+        const auto index = static_cast<std::size_t>(activeFlyout_);
+        if (index >= paneScrollOffset_.size()) return;
+        const int viewTop = static_cast<int>(paneViewport_.top);
+        const int viewBottom = static_cast<int>(paneViewport_.bottom);
+        const int viewH = viewBottom - viewTop;
+        int& offset = paneScrollOffset_[index];
+        offset = pane::ClampScroll(offset, paneContentHeight_, viewH);
+        for (const auto& [child, natural] : paneNaturalRects_) {
+            if (!IsWindow(child)) continue;
+            const int w = static_cast<int>(natural.right - natural.left);
+            const int h = static_cast<int>(natural.bottom - natural.top);
+            const int top = static_cast<int>(natural.top) - offset;
+            const auto visibility = pane::Classify(top, top + h, viewTop, viewBottom);
+            const auto clipped = std::find(paneClippedChildren_.begin(), paneClippedChildren_.end(), child);
+            const bool wasClipped = clipped != paneClippedChildren_.end();
+            RECT current{};
+            GetWindowRect(child, &current);
+            MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&current), 2);
+            const bool moving = current.top != top || current.left != natural.left;
+            if (visibility == pane::Visibility::Hidden) {
+                if (IsWindowVisible(child) && GetFocus() != child) {
+                    InvalidateUnderHiddenPaneChild(child); // old pixels outside the pane
+                    SetWindowPos(child, nullptr, natural.left, top, 0, 0,
+                        SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+                }
+                continue;
+            }
+            if (offset != 0 || wasClipped || !IsWindowVisible(child)) {
+                if (moving && IsWindowVisible(child)) InvalidateUnderHiddenPaneChild(child);
+                SetWindowPos(child, nullptr, natural.left, top, 0, 0,
+                    SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+            }
+            if (visibility == pane::Visibility::Partial) {
+                // Clip to the pane viewport so nothing paints over the status bar,
+                // canvas or tab rail.
+                const int clipTop = std::max(0, viewTop - top);
+                const int clipBottom = std::min(h, viewBottom - top);
+                if (HRGN region = CreateRectRgn(0, clipTop, w, clipBottom)) {
+                    if (!SetWindowRgn(child, region, FALSE)) DeleteObject(region);
+                }
+                if (!wasClipped) paneClippedChildren_.push_back(child);
+            } else if (wasClipped) {
+                paneClippedChildren_.erase(clipped);
+                if (child == libraryList_ || child == exif_) {
+                    uiFramework_.ApplyRoundedControlRegion(child, w, h, DipToPx(kLeftPaneContentRadiusDip), false);
+                } else if (child == languageSelector_) {
+                    uiFramework_.ApplyRoundedControlRegion(child, w, h, DipToPx(kButtonRadiusDip), false);
+                } else {
+                    uiFramework_.ApplyAntialiasedControlRegion(child, w, h, DipToPx(kButtonRadiusDip), false);
+                }
+            }
+        }
+    }
+
+    bool QuickSiftApplicationImpl::ScrollPaneBy(int deltaPx) {
+        const auto index = static_cast<std::size_t>(activeFlyout_);
+        if (index >= paneScrollOffset_.size() || paneNaturalRects_.empty()) return false;
+        const int viewH = static_cast<int>(paneViewport_.bottom - paneViewport_.top);
+        const int before = paneScrollOffset_[index];
+        const int after = quicksift::core::pane::ClampScroll(before + deltaPx, paneContentHeight_, viewH);
+        if (after == before) return false;
+        paneScrollOffset_[index] = after;
+        quicksift::ui::framework::MacOsUiFramework::HideOverflowTip(nullptr);
+        RepositionPaneScroll();
+        if (flyoutBackdrop_) {
+            RedrawWindow(flyoutBackdrop_, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN);
+        }
+        RedrawActiveFlyoutContents();
+        return true;
+    }
+
+    bool QuickSiftApplicationImpl::HandlePaneWheel(WPARAM wParam, LPARAM lParam) {
+        if (activeFlyout_ == FlyoutPanel::None || paneNaturalRects_.empty()) return false;
+        const int viewH = static_cast<int>(paneViewport_.bottom - paneViewport_.top);
+        if (quicksift::core::pane::MaxScroll(paneContentHeight_, viewH) <= 0) return false;
+        POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd_, &point);
+        RECT client{};
+        GetClientRect(hwnd_, &client);
+        RECT pane = LeftPaneRect(static_cast<int>(client.right), static_cast<int>(client.bottom));
+        if (!PtInRect(&pane, point)) return false;
+        UINT lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        if (lines == WHEEL_PAGESCROLL) {
+            ScrollPaneBy(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -viewH : viewH);
+            return true;
+        }
+        ScrollPaneBy(quicksift::core::pane::WheelStep(GET_WHEEL_DELTA_WPARAM(wParam), DipToPx(16),
+            static_cast<int>(lines)));
+        return true; // consumed even at the ends: the canvas must not scroll under the pane
+    }
+
+    void QuickSiftApplicationImpl::EnsurePaneControlVisible(HWND control) {
+        const auto index = static_cast<std::size_t>(activeFlyout_);
+        if (!control || index >= paneScrollOffset_.size()) return;
+        for (const auto& [child, natural] : paneNaturalRects_) {
+            if (child != control) continue;
+            const int viewH = static_cast<int>(paneViewport_.bottom - paneViewport_.top);
+            const int top = static_cast<int>(natural.top - paneViewport_.top);
+            const int bottom = static_cast<int>(natural.bottom - paneViewport_.top);
+            const int target = quicksift::core::pane::ScrollIntoView(paneScrollOffset_[index], top, bottom,
+                paneContentHeight_, viewH, DipToPx(6));
+            if (target != paneScrollOffset_[index]) ScrollPaneBy(target - paneScrollOffset_[index]);
+            return;
+        }
+    }
+
+    bool QuickSiftApplicationImpl::PaneScrollbarGeometry(RECT& track, RECT& thumb) const {
+        const auto index = static_cast<std::size_t>(activeFlyout_);
+        if (index >= paneScrollOffset_.size() || paneNaturalRects_.empty()) return false;
+        const int viewTop = static_cast<int>(paneViewport_.top);
+        const int viewBottom = static_cast<int>(paneViewport_.bottom);
+        const int viewH = viewBottom - viewTop;
+        if (quicksift::core::pane::MaxScroll(paneContentHeight_, viewH) <= 0) return false;
+        const int barW = DipToPx(4);
+        const int x = static_cast<int>(paneViewport_.right) + DipToPx(2);
+        track = RECT{ x, viewTop, x + barW, viewBottom };
+        const auto t = quicksift::core::pane::ThumbFor(paneScrollOffset_[index], paneContentHeight_, viewH,
+            viewTop, viewBottom, DipToPx(24));
+        thumb = RECT{ x, t.top, x + barW, t.bottom };
+        return t.bottom > t.top;
     }
 
     void QuickSiftApplicationImpl::EraseLeftPaneBackdropFully() {
@@ -721,7 +949,14 @@ namespace quicksift::app {
         // once at reveal, then stay shown until hide (moved/raised, not re-shown).
         if (showContent != leftPaneContentVisible_) {
             leftPaneContentVisible_ = showContent;
+            const auto revealStart = std::chrono::steady_clock::now();
             LayoutControls(width, height);
+            if (showContent) {
+                const auto index = static_cast<std::size_t>(activeFlyout_);
+                const bool first = index < paneSectionRevealed_.size() && !paneSectionRevealed_[index];
+                if (first) paneSectionRevealed_[index] = true;
+                LogPaneTiming(L"pane_reveal", activeFlyout_, first, PaneMsSince(revealStart), &paneLayoutTiming_);
+            }
             return;
         }
         if (leftPaneContentVisible_) {
@@ -808,6 +1043,13 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::DrawFlyoutBackdrop(DRAWITEMSTRUCT* draw) {
         if (!draw || !draw->hDC) return;
+        if (paneFirstPaintPending_ && activeFlyout_ != FlyoutPanel::None) {
+            // Open request -> first backdrop paint (the input-to-pixels latency).
+            paneFirstPaintPending_ = false;
+            const bool first = !paneEverPainted_;
+            paneEverPainted_ = true;
+            LogPaneTiming(L"pane_first_paint", activeFlyout_, first, PaneMsSince(paneOpenRequestedAt_), nullptr);
+        }
         const RECT& rc = draw->rcItem;
         const int width = std::max(0, static_cast<int>(rc.right - rc.left));
         const int height = std::max(0, static_cast<int>(rc.bottom - rc.top));
@@ -866,6 +1108,22 @@ namespace quicksift::app {
                     cx - dot / 2 + dot, midY + i * DipToPx(7) - gripH / 6 + dot };
                 quicksift::ui::FillSolidRect(target, bead,
                     BlendColor(palette.muted, palette.accent, 0.55f));
+            }
+        }
+
+        // Themed overlay scrollbar for an overflowing pane section (in the inset
+        // gutter right of the content viewport).
+        if (raised) {
+            RECT track{}, thumb{};
+            if (PaneScrollbarGeometry(track, thumb)) {
+                RECT self{};
+                GetWindowRect(flyoutBackdrop_, &self);
+                MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&self), 2);
+                const int dx = static_cast<int>(local.left - self.left);
+                const int dy = static_cast<int>(local.top - self.top);
+                OffsetRect(&track, dx, dy);
+                OffsetRect(&thumb, dx, dy);
+                uiFramework_.PaintOverlayScrollbar(target, thumb, track, false, false, palette, currentDpi_);
             }
         }
 
@@ -962,6 +1220,16 @@ namespace quicksift::app {
         leftPaneFrostCapturedAt_ = now;
         leftPaneFrostDirty_ = false;
         leftPaneFrostPending_ = false;
+        struct FrostTimingScope {
+            QuickSiftApplicationImpl& self;
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            ~FrostTimingScope() {
+                const double ms = PaneMsSince(start);
+                const bool first = !self.paneFirstFrostLogged_;
+                self.paneFirstFrostLogged_ = true;
+                self.LogPaneTiming(L"pane_frost_capture", self.activeFlyout_, first, ms, nullptr);
+            }
+        } frostTiming{ *this };
 
         RECT client{};
         GetClientRect(hwnd_, &client);
@@ -1128,67 +1396,34 @@ namespace quicksift::app {
             RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_NOERASE);
         };
 
-        if (activeFlyout_ == FlyoutPanel::File || activeFlyout_ == FlyoutPanel::Cull ||
-            activeFlyout_ == FlyoutPanel::Filter || activeFlyout_ == FlyoutPanel::Settings) {
-            for (const auto& [id, control] : controls_) {
-                const bool belongs = activeFlyout_ == FlyoutPanel::File ? IsFileControlId(id) :
-                    activeFlyout_ == FlyoutPanel::Cull ? IsCullControlId(id) :
-                    activeFlyout_ == FlyoutPanel::Filter ? IsFilterControlId(id) : IsSettingsControlId(id);
-                if (belongs) raiseAndInvalidate(control);
-            }
-            if (activeFlyout_ == FlyoutPanel::Settings) {
-                for (HWND label : settingsSectionLabels_) raiseAndInvalidate(label);
-                raiseAndInvalidate(languageSelector_);
-            }
-        } else if (activeFlyout_ == FlyoutPanel::Folders) {
-            raiseAndInvalidate(libraryList_);
-            if (auto it = controls_.find(ID_REMOVE_LIBRARY); it != controls_.end()) raiseAndInvalidate(it->second);
-        } else if (activeFlyout_ == FlyoutPanel::Info) {
-            raiseAndInvalidate(exif_);
-            raiseAndInvalidate(userCommentLabel_);
-            raiseAndInvalidate(userCommentEdit_);
-            if (auto it = controls_.find(ID_SAVE_USER_COMMENT); it != controls_.end()) raiseAndInvalidate(it->second);
-        }
+        ForEachActiveSectionChild(raiseAndInvalidate);
         for (HWND tab : flyoutTabs_) raiseAndInvalidate(tab);
 
         // Synchronous compose of pane chrome only — never parent RDW_ALLCHILDREN
         // (that would force a D2D canvas repaint and flash under the pane).
-        auto updateNow = [](HWND window) {
-            if (window && IsWindowVisible(window)) UpdateWindow(window);
+        // [Pane] timing: the synchronous paints are where a first-ever paint
+        // (fonts, buffers, regions) would show up; keep the slowest one.
+        double slowestPaintMs = 0.0;
+        int slowestPaintId = -1;
+        auto updateNow = [&](HWND window) {
+            if (!window || !IsWindowVisible(window)) return;
+            const auto paintStart = std::chrono::steady_clock::now();
+            UpdateWindow(window);
+            const double ms = PaneMsSince(paintStart);
+            if (ms > slowestPaintMs) {
+                slowestPaintMs = ms;
+                slowestPaintId = GetDlgCtrlID(window);
+            }
         };
         updateNow(flyoutBackdrop_);
-        if (activeFlyout_ == FlyoutPanel::File || activeFlyout_ == FlyoutPanel::Cull ||
-            activeFlyout_ == FlyoutPanel::Filter || activeFlyout_ == FlyoutPanel::Settings) {
-            for (const auto& [id, control] : controls_) {
-                const bool belongs = activeFlyout_ == FlyoutPanel::File ? IsFileControlId(id) :
-                    activeFlyout_ == FlyoutPanel::Cull ? IsCullControlId(id) :
-                    activeFlyout_ == FlyoutPanel::Filter ? IsFilterControlId(id) : IsSettingsControlId(id);
-                if (belongs) updateNow(control);
-            }
-            if (activeFlyout_ == FlyoutPanel::Settings) {
-                for (HWND label : settingsSectionLabels_) updateNow(label);
-                updateNow(languageSelector_);
-            }
-        } else if (activeFlyout_ == FlyoutPanel::Folders) {
-            updateNow(libraryList_);
-            if (auto it = controls_.find(ID_REMOVE_LIBRARY); it != controls_.end()) updateNow(it->second);
-        } else if (activeFlyout_ == FlyoutPanel::Info) {
-            updateNow(exif_);
-            updateNow(userCommentLabel_);
-            updateNow(userCommentEdit_);
-            if (auto it = controls_.find(ID_SAVE_USER_COMMENT); it != controls_.end()) updateNow(it->second);
-        }
+        ForEachActiveSectionChild(updateNow);
         for (HWND tab : flyoutTabs_) updateNow(tab);
-    }
-
-
-    void QuickSiftApplicationImpl::DrawActiveFlyoutPanel(HDC dc, const RECT& client) {
-        if (activeFlyout_ == FlyoutPanel::None) return;
-        const RECT panel = LeftPaneRect(client.right, client.bottom);
-        if (IsRectEmpty(&panel)) return;
-        uiFramework_.PaintPanel(dc, panel,
-            quicksift::ui::framework::PanelPresentation{ true, true, 16 },
-            Palette(), currentDpi_);
+        if (slowestPaintId >= 0) paneLayoutTiming_.Add(L"slowest_paint", slowestPaintMs);
+        if (slowestPaintMs >= quicksift::core::pane_timing::kSlowPaneMs) {
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Pane", L"pane_slow_paint",
+                {L"control_id", std::to_wstring(slowestPaintId)},
+                {L"ms", quicksift::core::pane_timing::Recorder::FormatMs(slowestPaintMs)});
+        }
     }
 
 
@@ -1244,8 +1479,25 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::LayoutTitleControls(int width) {
+    QuickSiftApplicationImpl::TitleLayoutKey QuickSiftApplicationImpl::CurrentTitleLayoutKey(int width) const {
+        TitleLayoutKey key;
+        key.width = width;
+        key.dpi = currentDpi_;
+        key.fullscreen = fullscreen_;
+        key.fullscreenTitleVisible = fullscreenTitleVisible_;
+        key.singleOrCompare = reviewState_.Mode() == ViewMode::Single || reviewState_.Mode() == ViewMode::Compare;
+        key.theme = theme_;
+        key.widths = MeasuredTitleButtonWidthsPx(); // cheap: text extents only
+        return key;
+    }
+
+    void QuickSiftApplicationImpl::LayoutTitleControls(int width, bool force) {
         if (width <= 0) return;
+        const TitleLayoutKey key = CurrentTitleLayoutKey(width);
+        // Fullscreen always re-applies: its overlay is shown/raised here.
+        if (!force && !titleLayoutDirty_ && !key.fullscreen && titleLayoutApplied_ == key) return;
+        titleLayoutApplied_ = key;
+        titleLayoutDirty_ = false;
         const int outer = DipToPx(kOuterMarginDip);
         const int gap = DipToPx(kTitleControlGapDip);
         const int titleButtonHeight = DipToPx(kTitleButtonHeightDip);
@@ -1303,14 +1555,14 @@ namespace quicksift::app {
                 titlePillRadius);
         }
 
-        const bool singleOrCompare = reviewState_.Mode() == ViewMode::Single || reviewState_.Mode() == ViewMode::Compare;
+        const bool singleOrCompare = key.singleOrCompare;
         for (const ButtonDefinition& spec : kTitleButtons) {
             const bool show = !((spec.id == ID_SORT || spec.id == ID_THUMB_SIZE) && singleOrCompare) &&
                 !((spec.id == ID_ZOOM_MODE || spec.id == ID_ROTATE_LEFT || spec.id == ID_ROTATE_RIGHT) && !singleOrCompare);
             if (const auto it = controls_.find(spec.id); it != controls_.end()) ShowWindow(it->second, show ? SW_SHOW : SW_HIDE);
         }
 
-        const auto controlWidths = MeasuredTitleButtonWidthsPx();
+        const auto& controlWidths = key.widths;
         int row = 0;
         int rowStart = DipToPx(158);
         int rowLimit = std::max(rowStart, helpX - gap);
@@ -1340,17 +1592,62 @@ namespace quicksift::app {
     }
 
 
-    void QuickSiftApplicationImpl::LayoutControls(int width, int height) {
-        if (!canvas_ || width <= 0 || height <= 0) return;
+    void QuickSiftApplicationImpl::SetFilmstripToggleGlyph() {
+        // Caption only when it changes: SetWindowTextW on a visible BUTTON repaints
+        // it synchronously (WM_SETTEXT), and layout used to do that twice per pass.
+        if (!filmstripToggle_) return;
+        const wchar_t* glyph = filmstripVisible_ ? L"‹" : L"›";
+        wchar_t current[8]{};
+        GetWindowTextW(filmstripToggle_, current, static_cast<int>(std::size(current)));
+        if (wcscmp(current, glyph) != 0) SetWindowTextW(filmstripToggle_, glyph);
+    }
 
-        const int outer = DipToPx(kOuterMarginDip);
-        LayoutTitleControls(width);
+    void QuickSiftApplicationImpl::PlaceFilmstripToggle(int width, int height) {
+        // One placement for the Single-view filmstrip toggle (was duplicated in
+        // LayoutControls, with the later copy's geometry winning): vertically
+        // centred on the canvas right edge, hidden outside Single view.
+        if (!filmstripToggle_) return;
+        const bool show = reviewState_.Mode() == ViewMode::Single;
+        namespace film = quicksift::core::filmstrip;
+        const int toggleSize = DipToPx(film::kToggleDip);
+        const int margin = DipToPx(film::kToggleMarginDip);
+        const RECT canvas = CanvasLayoutRect(width, height);
+        const int canvasTop = static_cast<int>(canvas.top);
+        const int canvasBottom = static_cast<int>(canvas.bottom);
+        // Round 22: left of the open strip (it used to cover part of a cell).
+        // The strip is drawn at the canvas right edge; closed keeps the old spot.
+        const bool open = show && filmstripVisible_;
+        const int toggleX = film::ToggleLeftPx(open ? static_cast<int>(canvas.right) : width,
+            toggleSize, margin, DipToPx(static_cast<int>(film::kWidthDip)), open);
+        const int toggleY = std::max(canvasTop + margin,
+            canvasTop + (canvasBottom - canvasTop - toggleSize) / 2);
+        SetWindowPos(filmstripToggle_, HWND_TOP, toggleX, toggleY, toggleSize, toggleSize,
+            (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW) | SWP_NOACTIVATE);
+        if (!show) return;
+        SetFilmstripToggleGlyph(); // lock-step with ToggleFilmstrip()
+        uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(kCompactControlRadiusDip));
+    }
 
-        // Hide every flyout section child EXCEPT the one being laid out (sections share
-        // one content rect, so stale WS_VISIBLE children stacked). The kept section is
-        // moved in place below (never hidden and re-shown: that flashed and reset hover).
-        HideLeftPaneSectionContentExcept(LeftPaneShouldShowContent() ? activeFlyout_ : FlyoutPanel::None);
+    // ---- LayoutControls section helpers (0.9.5.0 round 19: split with no behaviour
+    // change). Everything from here to closeFlyoutLayout() in LayoutControls runs
+    // before ApplyPaneScroll, so none of it may repaint a pane child synchronously.
 
+    // Show (if hidden) and move a pane child without redrawing, then give it its
+    // rounded or antialiased region. Shared by every pane section below.
+    namespace lp = quicksift::ui::layout::left_pane;
+
+    void QuickSiftApplicationImpl::PlacePaneChild(HWND child, int x, int y, int width, int height,
+        int radius, PaneChildRegion region) {
+        UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
+        if (!IsWindowVisible(child)) f |= SWP_SHOWWINDOW;
+        SetWindowPos(child, HWND_TOP, x, y, width, height, f);
+        if (region == PaneChildRegion::Antialiased)
+            uiFramework_.ApplyAntialiasedControlRegion(child, width, height, radius, /*redraw=*/false);
+        else
+            uiFramework_.ApplyRoundedControlRegion(child, width, height, radius, /*redraw=*/false);
+    }
+
+    void QuickSiftApplicationImpl::LayoutCanvasArea(int width, int height) {
         RECT canvasRect = CanvasLayoutRect(width, height);
         const int canvasW = std::max(0, static_cast<int>(canvasRect.right - canvasRect.left));
         const int canvasH = std::max(0, static_cast<int>(canvasRect.bottom - canvasRect.top));
@@ -1367,13 +1664,13 @@ namespace quicksift::app {
         // (radius kPanelRadiusDip) in the background colour inside the region.
         if (canvasGeometryChanged) uiFramework_.ApplyAntialiasedControlRegion(canvas_, canvasW, canvasH, DipToPx(kPanelRadiusDip));
         LayoutSearchField(); // keeps the field glued to the canvas (and just above it in z-order)
+    }
 
+    void QuickSiftApplicationImpl::LayoutFlyoutTabs(int width, int height, bool showPaneContent) {
         // Left-pane vertical tabs live inside the open pane. Content uses hysteresis
         // (LeftPaneShouldShowContent) so open sessions keep children shown until close.
         const std::array<FlyoutPanel, 6> flyoutPanels{{ FlyoutPanel::Folders, FlyoutPanel::File, FlyoutPanel::Cull, FlyoutPanel::Filter,
             FlyoutPanel::Info, FlyoutPanel::Settings }};
-        const bool showPaneContent = LeftPaneShouldShowContent();
-        leftPaneContentVisible_ = showPaneContent;
         for (size_t i = 0; i < flyoutTabs_.size(); ++i) {
             const FlyoutPanel panel = flyoutPanels[i];
             RECT tab = FlyoutTabRect(panel, width, height);
@@ -1392,275 +1689,172 @@ namespace quicksift::app {
                     SWP_NOACTIVATE | SWP_NOREDRAW);
             }
         }
+    }
 
-
-        if (filmstripToggle_) {
-            const bool showFilmstripToggle = reviewState_.Mode() == ViewMode::Single;
-            const int toggleSize = DipToPx(36);
-            const int margin = DipToPx(6);
-            const int titleHeight = TitleBarHeightPxForWidth(width);
-            const int canvasTop = std::max(titleHeight, static_cast<int>(CanvasLayoutRect(width, height).top));
-            const int canvasBottom = CanvasLayoutRect(width, height).bottom;
-            const int toggleX = std::max(0, width - toggleSize - margin);
-            const int toggleY = std::max(canvasTop + margin,
-                canvasTop + (canvasBottom - canvasTop - toggleSize) / 2);
-            SetWindowPos(filmstripToggle_, HWND_TOP, toggleX, toggleY, toggleSize, toggleSize,
-                (showFilmstripToggle ? SWP_SHOWWINDOW : SWP_HIDEWINDOW) | SWP_NOACTIVATE);
-            if (showFilmstripToggle) {
-                // Keep glyphs in lock-step with ToggleFilmstrip().
-                SetWindowTextW(filmstripToggle_, filmstripVisible_ ? L"‹" : L"›");
-                uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(kCompactControlRadiusDip));
-            }
+    void QuickSiftApplicationImpl::LayoutFoldersSection(const RECT& flyout) {
+        const int listW = std::max(0, static_cast<int>(flyout.right - flyout.left));
+        const int listH = std::max(0, static_cast<int>(flyout.bottom - flyout.top) - DipToPx(lp::kFolderActionReserveDip));
+        const int contentRadius = DipToPx(kLeftPaneContentRadiusDip);
+        PlacePaneChild(libraryList_, flyout.left, flyout.top, listW, listH, contentRadius,
+            PaneChildRegion::Rounded);
+        auto it = controls_.find(ID_REMOVE_LIBRARY);
+        if (it != controls_.end()) {
+            const int bh = DipToPx(lp::kFolderActionHeightDip);
+            const int bw = std::min(listW, DipToPx(lp::kFolderActionMaxWidthDip));
+            // Match File/Cull action buttons: rounded HWND so PaintButton chrome
+            // cannot leave a sharp rectangular underlay behind the pill fill.
+            PlacePaneChild(it->second, flyout.left + (listW - bw) / 2, flyout.bottom - bh, bw, bh,
+                DipToPx(kButtonRadiusDip), PaneChildRegion::Antialiased);
         }
+    }
 
-        RECT flyout = showPaneContent ? FlyoutRect(activeFlyout_, width, height) : RECT{};
-        // Animated backdrop sits above the canvas and below pane content siblings.
-        if (flyoutBackdrop_) {
-            PlaceLeftPaneBackdrop(LeftPaneRect(width, height), true);
+    void QuickSiftApplicationImpl::LayoutInfoSection(const RECT& flyout) {
+        const int infoW = std::max(0, static_cast<int>(flyout.right - flyout.left));
+        const int saveH = DipToPx(lp::kInfoSaveButtonHeightDip);
+        const int labelH = DipToPx(lp::kInfoLabelHeightDip);
+        const int gap = DipToPx(lp::kInfoGapDip);
+        // Keep a small pad so the D2D text-input border stroke is not clipped
+        // by the pane edge / rounded region.
+        const int edgePad = DipToPx(std::max(lp::kInfoEdgePadMinDip, kTextInputBorderInsetDip + 1));
+        const int availableH = std::max(0,
+            static_cast<int>(flyout.bottom - flyout.top) - edgePad);
+        int commentH = DipToPx(lp::kInfoCommentHeightDip);
+        int chromeH = labelH + gap + commentH + gap + saveH;
+        int infoH = availableH - chromeH;
+        if (infoH < DipToPx(lp::kInfoExifMinHeightDip)) {
+            const int deficit = DipToPx(lp::kInfoExifMinHeightDip) - infoH;
+            commentH = std::max(DipToPx(lp::kInfoCommentMinHeightDip), commentH - deficit);
+            chromeH = labelH + gap + commentH + gap + saveH;
+            infoH = std::max(0, availableH - chromeH);
         }
-        // HideAll already ran; one opaque backdrop erase BEFORE children become
-        // visible so the shared content rect cannot keep prior section pixels.
-        // RedrawActiveFlyoutContents then does a single raise+compose (no second
-        // erase thrash beyond the batched UPDATENOW at the end of that helper).
-        if (showPaneContent) EraseLeftPaneBackdropFully();
-        // Content rect already includes inset; place children flush to it.
-        if (showPaneContent && activeFlyout_ == FlyoutPanel::Folders && !IsRectEmpty(&flyout)) {
-            const int listW = std::max(0, static_cast<int>(flyout.right - flyout.left));
-            const int listH = std::max(0, static_cast<int>(flyout.bottom - flyout.top) - DipToPx(50));
-            const int contentRadius = DipToPx(kLeftPaneContentRadiusDip);
-            {
-                UINT lf = SWP_NOACTIVATE | SWP_NOREDRAW;
-                if (!IsWindowVisible(libraryList_)) lf |= SWP_SHOWWINDOW;
-                SetWindowPos(libraryList_, HWND_TOP, flyout.left, flyout.top, listW, listH, lf);
-                uiFramework_.ApplyRoundedControlRegion(libraryList_, listW, listH, contentRadius,
-                    /*redraw=*/false);
-            }
-            auto it = controls_.find(ID_REMOVE_LIBRARY);
-            if (it != controls_.end()) {
-                const int bh = DipToPx(32);
-                const int bw = std::min(listW, DipToPx(160));
-                {
-                    UINT bf = SWP_NOACTIVATE | SWP_NOREDRAW;
-                    if (!IsWindowVisible(it->second)) bf |= SWP_SHOWWINDOW;
-                    SetWindowPos(it->second, HWND_TOP, flyout.left + (listW - bw) / 2,
-                        flyout.bottom - bh, bw, bh, bf);
-                    // Match File/Cull action buttons: rounded HWND so PaintButton chrome
-                    // cannot leave a sharp rectangular underlay behind the pill fill.
-                    uiFramework_.ApplyAntialiasedControlRegion(it->second, bw, bh,
-                        DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                }
-            }
+        int y = flyout.top;
+        PlacePaneChild(exif_, flyout.left, y, infoW, infoH, DipToPx(kLeftPaneContentRadiusDip),
+            PaneChildRegion::Rounded);
+        y += infoH + gap;
+        PlacePaneChild(userCommentLabel_, flyout.left, y, infoW, labelH, DipToPx(kButtonRadiusDip),
+            PaneChildRegion::Antialiased);
+        y += labelH + gap;
+        PlacePaneChild(userCommentEdit_, flyout.left, y, infoW, commentH, DipToPx(kTextInputRadiusDip),
+            PaneChildRegion::Rounded);
+        uiFramework_.SetD2DTextInputPalette(userCommentEdit_, Palette(), currentDpi_);
+        y += commentH + gap;
+        auto save = controls_.find(ID_SAVE_USER_COMMENT);
+        if (save != controls_.end()) {
+            PlacePaneChild(save->second, flyout.left, y, infoW, saveH, DipToPx(kButtonRadiusDip),
+                PaneChildRegion::Antialiased);
         }
-        if (showPaneContent && activeFlyout_ == FlyoutPanel::Info && !IsRectEmpty(&flyout)) {
-            const int infoW = std::max(0, static_cast<int>(flyout.right - flyout.left));
-            const int saveH = DipToPx(32);
-            const int labelH = DipToPx(22);
-            const int gap = DipToPx(8);
-            // Keep a small pad so the D2D text-input border stroke is not clipped
-            // by the pane edge / rounded region.
-            const int edgePad = DipToPx(std::max(2, kTextInputBorderInsetDip + 1));
-            const int availableH = std::max(0,
-                static_cast<int>(flyout.bottom - flyout.top) - edgePad);
-            int commentH = DipToPx(110);
-            int chromeH = labelH + gap + commentH + gap + saveH;
-            int infoH = availableH - chromeH;
-            if (infoH < DipToPx(48)) {
-                const int deficit = DipToPx(48) - infoH;
-                commentH = std::max(DipToPx(56), commentH - deficit);
-                chromeH = labelH + gap + commentH + gap + saveH;
-                infoH = std::max(0, availableH - chromeH);
-            }
-            int y = flyout.top;
-            {
-                UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                if (!IsWindowVisible(exif_)) f |= SWP_SHOWWINDOW;
-                SetWindowPos(exif_, HWND_TOP, flyout.left, y, infoW, infoH, f);
-                uiFramework_.ApplyRoundedControlRegion(exif_, infoW, infoH,
-                    DipToPx(kLeftPaneContentRadiusDip), /*redraw=*/false);
-            }
-            y += infoH + gap;
-            {
-                UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                if (!IsWindowVisible(userCommentLabel_)) f |= SWP_SHOWWINDOW;
-                SetWindowPos(userCommentLabel_, HWND_TOP, flyout.left, y, infoW, labelH, f);
-                uiFramework_.ApplyAntialiasedControlRegion(userCommentLabel_, infoW, labelH,
-                    DipToPx(kButtonRadiusDip), /*redraw=*/false);
-            }
-            y += labelH + gap;
-            {
-                UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                if (!IsWindowVisible(userCommentEdit_)) f |= SWP_SHOWWINDOW;
-                SetWindowPos(userCommentEdit_, HWND_TOP, flyout.left, y, infoW, commentH, f);
-                uiFramework_.ApplyRoundedControlRegion(userCommentEdit_, infoW, commentH,
-                    DipToPx(kTextInputRadiusDip), /*redraw=*/false);
-            }
-            uiFramework_.SetD2DTextInputPalette(userCommentEdit_, Palette(), currentDpi_);
-            y += commentH + gap;
-            auto save = controls_.find(ID_SAVE_USER_COMMENT);
-            if (save != controls_.end()) {
-                {
-                    UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                    if (!IsWindowVisible(save->second)) f |= SWP_SHOWWINDOW;
-                    SetWindowPos(save->second, HWND_TOP, flyout.left, y, infoW, saveH, f);
-                    uiFramework_.ApplyAntialiasedControlRegion(save->second, infoW, saveH,
-                        DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                }
-            }
-        }
+    }
 
-        HDC flyoutMeasureDc = GetDC(hwnd_);
-        HFONT flyoutOldFont = nullptr;
-        if (flyoutMeasureDc) {
-            flyoutOldFont = static_cast<HFONT>(SelectObject(flyoutMeasureDc,
-                uiFontSemibold_ ? uiFontSemibold_ :
-                static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))));
-        }
-
-        if (showPaneContent && !IsRectEmpty(&flyout) &&
-            (activeFlyout_ == FlyoutPanel::File || activeFlyout_ == FlyoutPanel::Cull ||
-             activeFlyout_ == FlyoutPanel::Filter || activeFlyout_ == FlyoutPanel::Settings)) {
-            const int panelRowHeight = DipToPx(activeFlyout_ == FlyoutPanel::Settings ? 34 : 30);
-            const int gapX = DipToPx(kTitleControlGapDip);
-            const int gapY = DipToPx(6);
-            const int leftEdge = flyout.left;
-            const int rightEdge = flyout.right;
-            int x = leftEdge;
-            int y = flyout.top;
-            auto place = [&](const ButtonDefinition& def) {
-                auto it = controls_.find(def.id);
-                if (it == controls_.end()) return;
-                const int widthLimit = std::max(1, rightEdge - leftEdge);
-                const int buttonWidth = std::min(widthLimit, FlyoutButtonWidthPx(flyoutMeasureDc, def.id, 96));
-                if (x != leftEdge && x + buttonWidth > rightEdge) {
-                    x = leftEdge;
-                    y += panelRowHeight + gapY;
-                }
-                {
-                    UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                    if (!IsWindowVisible(it->second)) f |= SWP_SHOWWINDOW;
-                    SetWindowPos(it->second, HWND_TOP, x, y, buttonWidth, panelRowHeight, f);
-                    uiFramework_.ApplyAntialiasedControlRegion(it->second, buttonWidth, panelRowHeight,
-                        DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                }
-                x += buttonWidth + gapX;
-            };
-            if (activeFlyout_ == FlyoutPanel::File) for (const auto& def : kFileButtons) place(def);
-            else if (activeFlyout_ == FlyoutPanel::Cull) for (const auto& def : kCullButtons) place(def);
-            else if (activeFlyout_ == FlyoutPanel::Filter) for (const auto& def : kFilterButtons) place(def);
-            else {
-                const int sectionHeight = DipToPx(22);
-                const int sectionControlGap = DipToPx(5);
-                const int rowGap = DipToPx(6);
-                const int selectorHeight = DipToPx(34);
-                const int availableWidth = std::max(1, rightEdge - leftEdge);
-                const int columnGap = DipToPx(kTitleControlGapDip);
-                const int columnWidth = std::max(1, (availableWidth - columnGap) / 2);
-
-                auto placeSection = [&](std::size_t sectionIndex, std::initializer_list<int> ids) {
-                    x = leftEdge;
-                    if (sectionIndex < settingsSectionLabels_.size()) {
-                        HWND label = settingsSectionLabels_[sectionIndex];
-                        if (label) {
-                            {
-                                UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                                if (!IsWindowVisible(label)) f |= SWP_SHOWWINDOW;
-                                SetWindowPos(label, HWND_TOP, leftEdge, y, availableWidth, sectionHeight, f);
-                                uiFramework_.ApplyAntialiasedControlRegion(label, availableWidth, sectionHeight,
-                                    DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                            }
-                        }
-                    }
-                    y += sectionHeight + sectionControlGap;
-                    int used = 0;
-                    int rowY = y;
-                    for (int id : ids) {
-                        auto it = controls_.find(id);
-                        if (it == controls_.end()) continue;
-                        const int measured = FlyoutButtonWidthPx(flyoutMeasureDc, id, 110);
-                        const int buttonWidth = std::min(columnWidth, measured);
-                        if (used != 0 && x + buttonWidth > rightEdge) {
-                            x = leftEdge;
-                            rowY += panelRowHeight + rowGap;
-                        }
-                        {
-                            UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                            if (!IsWindowVisible(it->second)) f |= SWP_SHOWWINDOW;
-                            SetWindowPos(it->second, HWND_TOP, x, rowY, buttonWidth, panelRowHeight, f);
-                            uiFramework_.ApplyAntialiasedControlRegion(it->second, buttonWidth, panelRowHeight,
-                                DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                        }
-                        x += buttonWidth + columnGap;
-                        used++;
-                    }
-                    y = rowY + panelRowHeight + sectionControlGap;
-                };
-
-                placeSection(0, { ID_SETTING_BADGE_STARS, ID_SETTING_BADGE_COLOR,
-                    ID_SETTING_BADGE_PICK, ID_SETTING_BADGE_PAIR });
-                placeSection(1, { ID_SETTING_COPY_MOVE_RAW_WITH_JPG, ID_SETTING_RAW_JPEG_PREVIEWS_ONLY });
-                placeSection(2, { ID_SETTING_SAFE_JPEG, ID_SETTING_METADATA_RAW,
-                    ID_SETTING_METADATA_LOSSY, ID_SETTING_METADATA_TIFF });
-                placeSection(3, { ID_SETTING_PERFORMANCE_HUD, ID_SETTING_DIAGNOSTIC_LOG,
-                    ID_SETTING_CLEAR_MEMORY_CACHE, ID_SETTING_CLEAR_DISK_CACHE,
-                    ID_SETTING_HELP, ID_SETTING_ABOUT });
-
-                if (settingsSectionLabels_.size() > 4 && settingsSectionLabels_[4]) {
-                    {
-                        UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                        if (!IsWindowVisible(settingsSectionLabels_[4])) f |= SWP_SHOWWINDOW;
-                        SetWindowPos(settingsSectionLabels_[4], HWND_TOP, leftEdge, y, availableWidth, sectionHeight, f);
-                        uiFramework_.ApplyAntialiasedControlRegion(settingsSectionLabels_[4], availableWidth, sectionHeight,
-                            DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                    }
-                }
-                y += sectionHeight + sectionControlGap;
-                if (languageSelector_) {
-                    const int selectorWidth = std::min(DipToPx(210), availableWidth);
-                    {
-                        UINT f = SWP_NOACTIVATE | SWP_NOREDRAW;
-                        if (!IsWindowVisible(languageSelector_)) f |= SWP_SHOWWINDOW;
-                        SetWindowPos(languageSelector_, HWND_TOP, leftEdge, y, selectorWidth, selectorHeight, f);
-                        UpdateLanguageSelectorButton();
-                        uiFramework_.ApplyRoundedControlRegion(languageSelector_, selectorWidth, selectorHeight,
-                            DipToPx(kButtonRadiusDip), /*redraw=*/false);
-                    }
-                }
+    // File / Cull / Filter: flow the section's buttons left to right, wrapping rows.
+    void QuickSiftApplicationImpl::LayoutButtonFlowSection(const RECT& flyout, HDC flyoutMeasureDc) {
+        const int panelRowHeight = DipToPx(lp::kFlowRowHeightDip);
+        const int gapX = DipToPx(kTitleControlGapDip);
+        const int gapY = DipToPx(lp::kFlowRowGapDip);
+        const int leftEdge = flyout.left;
+        const int rightEdge = flyout.right;
+        int x = leftEdge;
+        int y = flyout.top;
+        auto place = [&](const ButtonDefinition& def) {
+            auto it = controls_.find(def.id);
+            if (it == controls_.end()) return;
+            const int widthLimit = std::max(1, rightEdge - leftEdge);
+            const int buttonWidth = std::min(widthLimit, FlyoutButtonWidthPx(flyoutMeasureDc, def.id, lp::kFlowButtonFallbackWidthDip));
+            if (x != leftEdge && x + buttonWidth > rightEdge) {
+                x = leftEdge;
+                y += panelRowHeight + gapY;
             }
-        }
-        auto closeFlyoutLayout = [&] {
-            if (flyoutMeasureDc) {
-                if (flyoutOldFont) SelectObject(flyoutMeasureDc, flyoutOldFont);
-                ReleaseDC(hwnd_, flyoutMeasureDc);
-            }
+            PlacePaneChild(it->second, x, y, buttonWidth, panelRowHeight, DipToPx(kButtonRadiusDip),
+                PaneChildRegion::Antialiased);
+            x += buttonWidth + gapX;
         };
-        closeFlyoutLayout();
+        if (activeFlyout_ == FlyoutPanel::File) for (const auto& def : kFileButtons) place(def);
+        else if (activeFlyout_ == FlyoutPanel::Cull) for (const auto& def : kCullButtons) place(def);
+        else if (activeFlyout_ == FlyoutPanel::Filter) for (const auto& def : kFilterButtons) place(def);
+    }
 
-        if (showPaneContent) RedrawActiveFlyoutContents();
-        else if (flyoutBackdrop_ && IsWindowVisible(flyoutBackdrop_)) {
-            // Closing / content hidden: one buffered backdrop paint (no erase pass).
-            RedrawWindow(flyoutBackdrop_, nullptr, nullptr,
-                RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN | RDW_UPDATENOW);
+    void QuickSiftApplicationImpl::LayoutSettingsSection(const RECT& flyout, HDC flyoutMeasureDc) {
+        const int panelRowHeight = DipToPx(lp::kSettingsRowHeightDip);
+        const int leftEdge = flyout.left;
+        const int rightEdge = flyout.right;
+        int x = leftEdge;
+        int y = flyout.top;
+        const int sectionHeight = DipToPx(lp::kSettingsSectionHeaderHeightDip);
+        const int sectionControlGap = DipToPx(lp::kSettingsSectionControlGapDip);
+        const int rowGap = DipToPx(lp::kSettingsRowGapDip);
+        const int selectorHeight = DipToPx(lp::kSettingsSelectorHeightDip);
+        const int availableWidth = std::max(1, rightEdge - leftEdge);
+        const int columnGap = DipToPx(kTitleControlGapDip);
+        const int columnWidth = std::max(1, (availableWidth - columnGap) / 2);
+
+        // Toggles (on/off state) get one full-width row each so long EN/VI captions
+        // fit; one-shot actions stay in two columns. Anything still too long shows
+        // the ellipsis tooltip (UpdateTruncationTooltip).
+        auto placeSection = [&](std::size_t sectionIndex, std::initializer_list<int> ids,
+                bool fullWidth, bool withHeader = true) {
+            x = leftEdge;
+            if (!withHeader) y -= sectionControlGap - rowGap;
+            if (withHeader && sectionIndex < settingsSectionLabels_.size()) {
+                HWND label = settingsSectionLabels_[sectionIndex];
+                if (label) {
+                    PlacePaneChild(label, leftEdge, y, availableWidth, sectionHeight,
+                        DipToPx(kButtonRadiusDip), PaneChildRegion::Antialiased);
+                }
+            }
+            if (withHeader) y += sectionHeight + sectionControlGap;
+            int used = 0;
+            int rowY = y;
+            for (int id : ids) {
+                auto it = controls_.find(id);
+                if (it == controls_.end()) continue;
+                const int buttonWidth = fullWidth ? availableWidth :
+                    std::min(columnWidth, FlyoutButtonWidthPx(flyoutMeasureDc, id, lp::kSettingsButtonFallbackWidthDip));
+                if (used != 0 && x + buttonWidth > rightEdge) {
+                    x = leftEdge;
+                    rowY += panelRowHeight + rowGap;
+                }
+                PlacePaneChild(it->second, x, rowY, buttonWidth, panelRowHeight,
+                    DipToPx(kButtonRadiusDip), PaneChildRegion::Antialiased);
+                x += buttonWidth + columnGap;
+                used++;
+            }
+            y = rowY + panelRowHeight + sectionControlGap;
+        };
+
+        placeSection(0, { ID_SETTING_BADGE_STARS, ID_SETTING_BADGE_COLOR,
+            ID_SETTING_BADGE_PICK, ID_SETTING_BADGE_PAIR }, true);
+        placeSection(1, { ID_SETTING_COPY_MOVE_RAW_WITH_JPG, ID_SETTING_RAW_JPEG_PREVIEWS_ONLY }, true);
+        placeSection(2, { ID_SETTING_SAFE_JPEG, ID_SETTING_METADATA_RAW,
+            ID_SETTING_METADATA_LOSSY, ID_SETTING_METADATA_TIFF }, true);
+        placeSection(3, { ID_SETTING_PERFORMANCE_HUD }, true);
+        placeSection(3, { ID_SETTING_DIAGNOSTIC_LOG,
+            ID_SETTING_CLEAR_MEMORY_CACHE, ID_SETTING_CLEAR_DISK_CACHE,
+            ID_SETTING_HELP, ID_SETTING_ABOUT }, false, false);
+
+        if (settingsSectionLabels_.size() > 4 && settingsSectionLabels_[4]) {
+            PlacePaneChild(settingsSectionLabels_[4], leftEdge, y, availableWidth, sectionHeight,
+                DipToPx(kButtonRadiusDip), PaneChildRegion::Antialiased);
         }
-
-        if (filmstripToggle_ && reviewState_.Mode() == ViewMode::Single) {
-            const int toggleSize = DipToPx(36);
-            const int margin = DipToPx(6);
-            const RECT canvas = CanvasLayoutRect(width, height);
-            const int canvasTop = static_cast<int>(canvas.top);
-            const int canvasBottom = static_cast<int>(canvas.bottom);
-            const int toggleX = std::max(0, width - toggleSize - margin);
-            const int toggleY = std::max(canvasTop + margin,
-                canvasTop + (canvasBottom - canvasTop - toggleSize) / 2);
-            SetWindowPos(filmstripToggle_, HWND_TOP, toggleX, toggleY, toggleSize, toggleSize,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            SetWindowTextW(filmstripToggle_, filmstripVisible_ ? L"‹" : L"›");
-            uiFramework_.ApplyRoundedControlRegion(filmstripToggle_, toggleSize, toggleSize, DipToPx(kCompactControlRadiusDip));
+        y += sectionHeight + sectionControlGap;
+        if (languageSelector_) {
+            const int selectorWidth = std::min(DipToPx(lp::kLanguageSelectorMaxWidthDip), availableWidth);
+            // No caption update here: SetWindowTextW on a visible BUTTON paints
+            // it synchronously (WM_DRAWITEM) at this natural, unscrolled y,
+            // over the status bar; the scroll pass then moves it with
+            // SWP_NOREDRAW and those pixels were never invalidated (the
+            // "second language selector"). RefreshLocalizedText and
+            // ShowLanguageMenu own the caption.
+            PlacePaneChild(languageSelector_, leftEdge, y, selectorWidth, selectorHeight,
+                DipToPx(kButtonRadiusDip), PaneChildRegion::Rounded);
         }
+    }
 
+    void QuickSiftApplicationImpl::LayoutStatusBar(int width, int height) {
+        const int outer = DipToPx(kOuterMarginDip);
         const int statusX = outer;
-        const int statusY = height - DipToPx(kStatusHeightDip) + DipToPx(2);
+        const int statusY = height - DipToPx(kStatusHeightDip) + DipToPx(quicksift::ui::layout::status_bar::kTopOffsetDip);
         const int statusW = std::max(0, width - outer * 2);
-        const int statusH = DipToPx(statusProgressText_.empty() ? 34 : 44);
+        const int statusH = DipToPx(statusProgressText_.empty() ? quicksift::ui::layout::status_bar::kHeightDip :
+            quicksift::ui::layout::status_bar::kHeightWithProgressDip);
         RECT statusBefore{};
         if (GetWindowRect(status_, &statusBefore)) MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&statusBefore), 2);
         const bool statusSizeChanged = statusBefore.right - statusBefore.left != statusW ||
@@ -1673,6 +1867,93 @@ namespace quicksift::app {
         if (statusMoved) MoveWindow(status_, statusX, statusY, statusW, statusH, TRUE);
         if (statusSizeChanged)
             uiFramework_.ApplyAntialiasedControlRegion(status_, statusW, statusH, DipToPx(kStatusRadiusDip));
+    }
+
+    void QuickSiftApplicationImpl::LayoutControls(int width, int height) {
+        if (!canvas_ || width <= 0 || height <= 0) return;
+
+        // [Pane] timing: named segments of this pass (core/pane_timing.h).
+        paneLayoutTiming_.Clear();
+        auto segmentStart = std::chrono::steady_clock::now();
+        auto mark = [&](std::wstring_view name) {
+            const auto now = std::chrono::steady_clock::now();
+            paneLayoutTiming_.Add(name, std::chrono::duration<double, std::milli>(now - segmentStart).count());
+            segmentStart = now;
+        };
+        LayoutTitleControls(width, /*force=*/false); // skipped when its inputs are unchanged
+        mark(L"title");
+
+        // Hide every flyout section child EXCEPT the one being laid out (sections share
+        // one content rect, so stale WS_VISIBLE children stacked). The kept section is
+        // moved in place below (never hidden and re-shown: that flashed and reset hover).
+        HideLeftPaneSectionContentExcept(LeftPaneShouldShowContent() ? activeFlyout_ : FlyoutPanel::None);
+        mark(L"hide");
+
+        LayoutCanvasArea(width, height);
+        mark(L"canvas");
+
+        const bool showPaneContent = LeftPaneShouldShowContent();
+        leftPaneContentVisible_ = showPaneContent;
+        LayoutFlyoutTabs(width, height, showPaneContent);
+
+
+        PlaceFilmstripToggle(width, height); // shown in Single view only
+
+        mark(L"tabs");
+        RECT flyout = showPaneContent ? FlyoutRect(activeFlyout_, width, height) : RECT{};
+        // Animated backdrop sits above the canvas and below pane content siblings.
+        if (flyoutBackdrop_) {
+            PlaceLeftPaneBackdrop(LeftPaneRect(width, height), true);
+        }
+        // HideAll already ran; one opaque backdrop erase BEFORE children become
+        // visible so the shared content rect cannot keep prior section pixels.
+        // RedrawActiveFlyoutContents then does a single raise+compose (no second
+        // erase thrash beyond the batched UPDATENOW at the end of that helper).
+        if (showPaneContent) EraseLeftPaneBackdropFully();
+        // Content rect already includes inset; place children flush to it.
+        if (showPaneContent && activeFlyout_ == FlyoutPanel::Folders && !IsRectEmpty(&flyout))
+            LayoutFoldersSection(flyout);
+        if (showPaneContent && activeFlyout_ == FlyoutPanel::Info && !IsRectEmpty(&flyout))
+            LayoutInfoSection(flyout);
+
+        HDC flyoutMeasureDc = GetDC(hwnd_);
+        HFONT flyoutOldFont = nullptr;
+        if (flyoutMeasureDc) {
+            flyoutOldFont = static_cast<HFONT>(SelectObject(flyoutMeasureDc,
+                uiFontSemibold_ ? uiFontSemibold_ :
+                static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))));
+        }
+
+        if (showPaneContent && !IsRectEmpty(&flyout) &&
+            (activeFlyout_ == FlyoutPanel::File || activeFlyout_ == FlyoutPanel::Cull ||
+             activeFlyout_ == FlyoutPanel::Filter || activeFlyout_ == FlyoutPanel::Settings)) {
+            if (activeFlyout_ == FlyoutPanel::Settings) LayoutSettingsSection(flyout, flyoutMeasureDc);
+            else LayoutButtonFlowSection(flyout, flyoutMeasureDc);
+        }
+        auto closeFlyoutLayout = [&] {
+            if (flyoutMeasureDc) {
+                if (flyoutOldFont) SelectObject(flyoutMeasureDc, flyoutOldFont);
+                ReleaseDC(hwnd_, flyoutMeasureDc);
+            }
+        };
+        closeFlyoutLayout();
+        mark(L"place");
+        if (showPaneContent && !IsRectEmpty(&flyout)) ApplyPaneScroll(flyout);
+        else paneNaturalRects_.clear();
+        mark(L"scroll");
+
+        if (showPaneContent) RedrawActiveFlyoutContents();
+        else if (flyoutBackdrop_ && IsWindowVisible(flyoutBackdrop_)) {
+            // Closing / content hidden: one buffered backdrop paint (no erase pass).
+            RedrawWindow(flyoutBackdrop_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_NOERASE | RDW_NOCHILDREN | RDW_UPDATENOW);
+        }
+        mark(L"compose");
+
+        // Again after the pane compose so the toggle stays above raised pane children.
+        if (reviewState_.Mode() == ViewMode::Single) PlaceFilmstripToggle(width, height);
+
+        LayoutStatusBar(width, height);
         RaiseFullscreenTitleOverlay();
     }
 
@@ -2051,22 +2332,8 @@ namespace quicksift::app {
 
 
     bool QuickSiftApplicationImpl::ButtonHasPopupMenu(int id) const {
-        switch (id) {
-        case ID_FORMATS:
-        case ID_DATE_FILTER:
-        case ID_SORT:
-        case ID_THUMB_SIZE:
-        case ID_STAR_FILTER:
-        case ID_PICK_FILTER:
-        case ID_COLOR_LABEL:
-        case ID_ZOOM_MODE:
-        case ID_RATING_MENU:
-        case ID_PICK_STATE_MENU:
-        case ID_SETTING_LANGUAGE_SELECTOR:
-            return true;
-        default:
-            return false;
-        }
+        // One registry (ui_command_ids.h) for chevron paint and width reserve.
+        return quicksift::ui::command_id::IsPopupMenuButton(id);
     }
 
 
@@ -2093,6 +2360,9 @@ namespace quicksift::app {
             (id == ID_SETTING_DIRECT_PNG && (metadataDirectMask_ & MetadataDirectPng) != 0) ||
             (id == ID_SETTING_DIRECT_TIFF && (metadataDirectMask_ & MetadataDirectTiff) != 0) ||
             (id == ID_SETTING_DIRECT_RAW && (metadataDirectMask_ & MetadataDirectRaw) != 0) ||
+            (id == ID_SETTING_METADATA_RAW && (metadataDirectMask_ & MetadataDirectRaw) != 0) ||
+            (id == ID_SETTING_METADATA_LOSSY && (metadataDirectMask_ & (MetadataDirectJpeg | MetadataDirectPng)) != 0) ||
+            (id == ID_SETTING_METADATA_TIFF && (metadataDirectMask_ & MetadataDirectTiff) != 0) ||
             (id == ID_COLOR_LABEL && ActiveColorLabelForUi() > 0) ||
             (id == ID_STAR_FILTER && ratingFilter_ != RatingFilter::All) ||
             (id == ID_PICK_FILTER && pickFilter_ != PickFilter::All) ||
@@ -2135,8 +2405,9 @@ namespace quicksift::app {
         // Pane buttons: the buffer already holds the frost slice behind the button
         // (OnDrawItem), so the AA corners blend into the real backdrop pixels.
         if (paneItemBuffering_ && IsLeftPaneSurface(draw->hwndItem)) presentation.parentSurface.reset();
-        uiFramework_.PaintButton(draw->hDC, draw->rcItem, presentation, Palette(),
+        const bool truncated = uiFramework_.PaintButton(draw->hDC, draw->rcItem, presentation, Palette(),
             currentDpi_, uiFont_, uiFontSemibold_);
+        UpdateTruncationTooltip(draw->hwndItem, truncated, presentation.text);
     }
 
 

@@ -1,6 +1,7 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
 #include "platform/application_data_paths.h"
+#include "core/presentation_settings.h"
 
 namespace quicksift::app {
 
@@ -56,7 +57,6 @@ namespace quicksift::app {
             (void)entry;
             if (key.path == path) return true;
         }
-        if (wicImageSources_.contains(path)) return true;
         for (const auto& [key, entry] : tileCache_) {
             (void)entry;
             if (key.path == path) return true;
@@ -122,12 +122,6 @@ namespace quicksift::app {
         // Detection completion merely makes the stored offset renderable.
         if (!photo->faces.empty() && IsBeyondFitZoom(path,
             ViewAreaForPath(path), BaseViewForPath(path))) InvalidateCanvas();
-    }
-
-    std::pair<int, int> QuickSiftApplicationImpl::ActiveSourceSize() const {
-        const PhotoItem* photo = PhotoForPath(EditableViewPath());
-        if (photo && photo->sourceWidth > 0 && photo->sourceHeight > 0) return { photo->sourceWidth, photo->sourceHeight };
-        return { 0, 0 };
     }
 
     void QuickSiftApplicationImpl::SetZoomMode(ZoomMode mode) {
@@ -310,6 +304,7 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::OnTimer(UINT_PTR timer) {
+        if (timer == ID_TIMER_BLOCKING_WAIT) { UpdateBlockingWaitDialog(); return; }
         // Lost-wake backstop (0.9.4.0 polish): a finished ratings / batch worker whose
         // WM_APP completion post failed would otherwise never be consumed (and the
         // dialog would stay busy). Both completion handlers are idempotent.
@@ -485,6 +480,20 @@ namespace quicksift::app {
         else KillTimer(hwnd_, ID_TIMER_PERFORMANCE_HUD);
     }
 
+    void QuickSiftApplicationImpl::LoadEarlyPresentationSettings() {
+        // A tiny INI read (no cache, no folder I/O). Same keys/encoding as LoadSession.
+        const fs::path path = quicksift::platform::SessionFilePath();
+        const auto readInt = [&](const wchar_t* key, int fallback) {
+            return static_cast<int>(GetPrivateProfileIntW(kAppTitle, key, fallback, path.c_str()));
+        };
+        theme_ = quicksift::core::presentation::ThemeFromSetting(readInt(L"Theme", 0)) ? AppTheme::Light : AppTheme::Dark;
+        localizer_.SetLanguage(readInt(L"Language", 0) == 1 ?
+            quicksift::Language::Vietnamese : quicksift::Language::English);
+        // HUD position (DIPs, -1 = default corner): before the first paint.
+        hudX_ = static_cast<float>(readInt(L"HudX", -1));
+        hudY_ = static_cast<float>(readInt(L"HudY", -1));
+    }
+
     void QuickSiftApplicationImpl::LoadSession() {
         const fs::path sessionDirectory = quicksift::platform::DataRootPath();
         sessionPath_ = quicksift::platform::SessionFilePath();
@@ -499,6 +508,7 @@ namespace quicksift::app {
         restoredCurrentPath_ = buffer;
         restoredMode_ = static_cast<ViewMode>(std::clamp(readInt(L"Mode", 0), 0, 2));
         performanceHudVisible_ = readInt(L"PerformanceHud", 0) != 0;
+        filmstripVisible_ = readInt(L"Filmstrip", 0) != 0; // round 22: remembered
         sortMode_ = static_cast<SortMode>(std::clamp(readInt(L"Sort", 0), 0, 5));
         dateFilter_ = static_cast<DateFilter>(std::clamp(readInt(L"DateFilter", 0), 0, 4));
         int savedRatingFilter = readInt(L"RatingFilter", 0);
@@ -523,7 +533,7 @@ namespace quicksift::app {
         badgePair_ = readInt(L"BadgePair", 0) != 0;
         copyMoveRawWithJpg_ = readInt(L"CopyMoveRawWithJpg", 0) != 0;
         loadOnlyRawJpegPreviews_ = readInt(L"LoadOnlyRawJpegPreviews", 0) != 0;
-        theme_ = readInt(L"Theme", 0) == 1 ? AppTheme::Light : AppTheme::Dark;
+        theme_ = quicksift::core::presentation::ThemeFromSetting(readInt(L"Theme", 0)) ? AppTheme::Light : AppTheme::Dark;
         localizer_.SetLanguage(readInt(L"Language", 0) == 1 ?
             quicksift::Language::Vietnamese : quicksift::Language::English);
         metadataDirectMask_ = static_cast<std::uint32_t>(readInt(L"MetadataDirectMask",
@@ -595,6 +605,9 @@ namespace quicksift::app {
         appendInt(L"MetadataDirectMask", static_cast<int>(metadataDirectMask_));
         appendInt(L"SafeJpegMetadataWrites", safeJpegMetadataWrites_ ? 1 : 0);
         appendInt(L"PerformanceHud", performanceHudVisible_ ? 1 : 0);
+        appendInt(L"Filmstrip", filmstripVisible_ ? 1 : 0);
+        appendInt(L"HudX", hudX_ < 0.0f ? -1 : static_cast<int>(std::lround(hudX_)));
+        appendInt(L"HudY", hudY_ < 0.0f ? -1 : static_cast<int>(std::lround(hudY_)));
         int formatMask = 0;
         if (formats_[FormatGroup::Jpeg]) formatMask |= 1 << 0;
         if (formats_[FormatGroup::Png]) formatMask |= 1 << 1;
@@ -777,6 +790,9 @@ namespace quicksift::app {
                 ResetView();
             }
         } else {
+            // Round 22: the first click of a double-click on a filmstrip cell already
+            // navigated; the second must not toggle Fit/100% on the new image.
+            if (reviewState_.Mode() == ViewMode::Single && FilmstripContains(x, y)) return;
             // The first click of a double-click on a face outline already selected and
             // framed that face; do not let the double-click undo it with Fit/100%.
             if (lastFaceClickTick_ != 0 &&
@@ -843,6 +859,16 @@ namespace quicksift::app {
                 }
             }
         } else {
+            // Round 22: wheel over the open filmstrip steps through the images (it
+            // zoomed the photo hidden under the strip). Accumulated per WHEEL_DELTA
+            // so precision touchpads do not race through the folder.
+            if (reviewState_.Mode() == ViewMode::Single && FilmstripContains(x, y)) {
+                const int steps = quicksift::core::filmstrip::TakeWheelSteps(
+                    filmstripWheelAccumulator_, delta, WHEEL_DELTA);
+                for (int i = 0; i < std::abs(steps); ++i) Navigate(steps > 0 ? 1 : -1, false);
+                return;
+            }
+            filmstripWheelAccumulator_ = 0;
             if (reviewState_.Mode() == ViewMode::Compare) {
                 if (const auto slot = HitCompareSlot(x, y)) {
                     const bool changed = reviewState_.SetActiveCompareSlot(*slot);
@@ -1177,9 +1203,24 @@ namespace quicksift::app {
         if (previousMode == ViewMode::Compare && mode != ViewMode::Compare)
             reviewState_.ClearCompare();
         reviewState_.SetMode(mode);
-        if (filmstripToggle_ && mode != ViewMode::Single) {
-            ShowWindow(filmstripToggle_, SW_HIDE);
-            filmstripVisible_ = false;
+        // Round 22: the filmstrip is a remembered preference (session "Filmstrip"),
+        // no longer switched off by every Grid/Compare round trip. The toggle is
+        // placed (shown in Single, hidden elsewhere) and an open strip starts loading
+        // its cells as soon as Single View is entered.
+        filmstripWheelAccumulator_ = 0;
+        if (filmstripToggle_ && hwnd_) {
+            RECT client{};
+            GetClientRect(hwnd_, &client);
+            PlaceFilmstripToggle(client.right - client.left, client.bottom - client.top);
+        }
+        // Round 23: fade in on entering Single View, snap hidden on leaving it, and
+        // drop every queued/in-flight strip decode while the strip is not shown.
+        SyncFilmstripMotion(std::chrono::steady_clock::now());
+        if (mode != ViewMode::Single) PublishFilmstripDecodeWindow({});
+        if (mode == ViewMode::Single && filmstripVisible_) {
+            filmstripLayoutCacheValid_ = false;
+            const D2D1_SIZE_F canvas = CanvasSizeInDips();
+            PrefetchFilmstrip(CurrentFilmstripLayout(D2D1::RectF(0.0f, 0.0f, canvas.width, canvas.height)));
         }
         static_cast<void>(AdvanceReviewNavigationEpoch());
         UpdateModeButtons();

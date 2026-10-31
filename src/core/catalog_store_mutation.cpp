@@ -31,6 +31,7 @@ CatalogStore::Index CatalogStore::Append(PhotoItem item) {
     try { InsertPath(index, path); }
     catch (...) { photos_.pop_back(); throw; }
     MarkFactsChanged(index);
+    try { filterValues_.Add(photos_[index]); } catch (...) { filterValuesStale_ = true; }
     return index;
 }
 
@@ -71,6 +72,10 @@ std::vector<CatalogStore::Index> CatalogStore::AppendBatch(
         throw;
     }
     MarkFactsChanged(originalSize); // the partial tail chunk (later chunks are new)
+    if (!filterValuesStale_) {
+        try { for (const Index index : indexes) filterValues_.Add(photos_[index]); }
+        catch (...) { filterValuesStale_ = true; }
+    }
     return indexes;
 }
 
@@ -108,6 +113,10 @@ void CatalogStore::EditPhoto(Index index,
         throw std::logic_error("catalog path identity must be changed through ReplacePath");
     }
     const bool factsChanged = !SameMetadataFacts(item, candidate);
+    if (!filterValuesStale_ && !FilterValueIndex::SameContribution(item, candidate)) {
+        try { filterValues_.Remove(item); filterValues_.Add(candidate); }
+        catch (...) { filterValuesStale_ = true; }
+    }
     item = std::move(candidate);
     if (factsChanged) MarkFactsChanged(index);
 }

@@ -4,6 +4,9 @@
 #include "core/metadata_vocabulary.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <ctime>
 
 namespace quicksift::core::predicate {
 namespace {
@@ -184,13 +187,66 @@ bool ClauseMatches(const Clause& clause, const MetadataFactsView& facts) {
     case ClauseKind::Lens:
         return facts.cameraSettingsKnown && !facts.lens.empty() &&
             NameMatchesText(facts.lens, clause.text);
+    case ClauseKind::Format: {
+        if (clause.text.empty() || facts.name.empty()) return false;
+        // Fold only the extension tail in place (no per-photo allocations).
+        const auto hasExtension = [&](std::wstring_view ext) noexcept {
+            const std::size_t needed = ext.size() + 1;
+            if (facts.name.size() < needed) return false;
+            const std::wstring_view tail = std::wstring_view(facts.name).substr(facts.name.size() - needed);
+            if (tail[0] != L'.') return false;
+            for (std::size_t i = 0; i < ext.size(); ++i) {
+                if (StripDiacritic(LowerChar(tail[i + 1])) != ext[i]) return false;
+            }
+            return true;
+        };
+        if (hasExtension(clause.text)) return true;
+        // The parser canonicalises "jpeg" to "jpg"; ".jpeg"/".tiff" files must still match.
+        if (clause.text == L"jpg") return hasExtension(L"jpeg");
+        if (clause.text == L"tif") return hasExtension(L"tiff");
+        if (clause.text == L"tiff") return hasExtension(L"tif");
+        return false;
+    }
+    case ClauseKind::Age: {
+        if (!HasCapture(facts)) return false;
+        const int spanDays = clause.b == 1 ? clause.a * 30 : clause.a;
+        const int captureOrd = facts.capture.year * 372 + facts.capture.month * 31 + facts.capture.day;
+        int todayOrd = clause.c;
+        if (todayOrd <= 0) {
+            // localtime is comparatively expensive and this runs per photo per
+            // clause: reuse the result for the same wall-clock minute.
+            thread_local std::time_t cachedMinute = -1;
+            thread_local int cachedOrd = 0;
+            const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            if (t / 60 != cachedMinute) {
+                std::tm local{};
+#if defined(_WIN32)
+                localtime_s(&local, &t);
+#else
+                localtime_r(&t, &local);
+#endif
+                cachedOrd = (local.tm_year + 1900) * 372 + (local.tm_mon + 1) * 31 + local.tm_mday;
+                cachedMinute = t / 60;
+            }
+            todayOrd = cachedOrd;
+        }
+        if (clause.op == Comparison::Equal) {
+            const int target = todayOrd - spanDays;
+            return std::abs(captureOrd - target) <= (clause.b == 1 ? 15 : 0);
+        }
+        const int cutoff = todayOrd - spanDays;
+        if (clause.op == Comparison::AtMost) return captureOrd >= cutoff;
+        if (clause.op == Comparison::AtLeast) return captureOrd <= cutoff;
+        return false;
+    }
     }
     return false;
 }
 
 bool MatchesAll(std::span<const Clause> clauses, const MetadataFactsView& facts) {
     for (const Clause& clause : clauses) {
-        if (!ClauseMatches(clause, facts)) return false;
+        const bool hit = ClauseMatches(clause, facts);
+        if (clause.negated ? hit : !hit) return false;
     }
     return true;
 }
@@ -198,13 +254,21 @@ bool MatchesAll(std::span<const Clause> clauses, const MetadataFactsView& facts)
 bool NeedsCaptureTime(std::span<const Clause> clauses) noexcept {
     return std::any_of(clauses.begin(), clauses.end(), [](const Clause& clause) {
         return clause.kind == ClauseKind::Time || clause.kind == ClauseKind::DayOfMonth ||
-            clause.kind == ClauseKind::Weekday || clause.kind == ClauseKind::Date;
+            clause.kind == ClauseKind::Weekday || clause.kind == ClauseKind::Date ||
+            clause.kind == ClauseKind::Age;
     });
 }
 
 bool NeedsComments(std::span<const Clause> clauses) noexcept {
     return std::any_of(clauses.begin(), clauses.end(), [](const Clause& clause) {
         return clause.kind == ClauseKind::Text && clause.target != TextTarget::Name;
+    });
+}
+
+bool NeedsRatingFacts(std::span<const Clause> clauses) noexcept {
+    return std::any_of(clauses.begin(), clauses.end(), [](const Clause& clause) {
+        return clause.kind == ClauseKind::Rating || clause.kind == ClauseKind::Pick ||
+            clause.kind == ClauseKind::Color;
     });
 }
 

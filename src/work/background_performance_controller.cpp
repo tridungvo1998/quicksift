@@ -1,6 +1,9 @@
 // OWNER: Fixed maximum-performance worker policy, path-scoped decoder coordination, and telemetry.
 #include "work/background_work_engine.h"
+#include "core/filmstrip_policy.h"
+#include "core/log_rate_limiter.h"
 #include "embedded_metadata.h"
+#include "diagnostics/log_and_continue.h"
 
 namespace quicksift::app {
 namespace {
@@ -15,6 +18,7 @@ std::size_t TelemetryFormatIndex(const fs::path& path) noexcept {
         if (extension == L".tif" || extension == L".tiff") return 4;
         if (extension == L".webp") return 5;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Worker", L"TelemetryFormatIndex");
     }
     return 6;
 }
@@ -49,6 +53,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             if (foregroundVisualPending) readAhead_.Pause();
             else readAhead_.Resume();
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::RefreshReadAheadGate");
             // A conservative failure mode is to keep read-ahead paused. Visual
             // delivery is more important than a speculative I/O hint.
             readAhead_.Pause();
@@ -147,7 +152,27 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             snapshot.analysisQueued = analysisQueue_.size() + analysisInFlight_;
             snapshot.activeVisualJobs = activeVisualJobs_.load(std::memory_order_acquire);
             snapshot.inFlightVisualFamilies = activeVisualFamilies_.size();
+            snapshot.metadataQueued = metadataQueue_.size();
+            snapshot.viewQueued = viewQueue_.size();
+            snapshot.viewPrefetchQueued = viewPrefetchQueue_.size();
+            snapshot.cacheWritesQueued = cacheWriteQueue_.size() + recordWriteQueue_.size();
+            snapshot.activeForegroundVisualJobs = activeForegroundVisualJobs_.load(std::memory_order_acquire);
+            snapshot.stopping = stopping_;
+            // Oldest enqueue time over the heads of every lane (FIFO per lane), O(lanes).
+            const auto now = std::chrono::steady_clock::now();
+            std::chrono::steady_clock::time_point oldest{};
+            for (const std::deque<WorkJob>* lane : { &interactiveQueue_, &visibleQueue_, &predictiveQueue_,
+                    &faceQueue_, &idleQueue_, &analysisQueue_, &metadataQueue_, &viewQueue_, &viewPrefetchQueue_ }) {
+                for (const WorkJob& job : *lane) {
+                    if (job.enqueuedAt == std::chrono::steady_clock::time_point{}) continue;
+                    if (oldest == std::chrono::steady_clock::time_point{} || job.enqueuedAt < oldest) oldest = job.enqueuedAt;
+                    break; // head only: cheap; promotion can reorder, so this is a lower bound
+                }
+            }
+            if (oldest != std::chrono::steady_clock::time_point{})
+                snapshot.oldestQueuedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - oldest).count();
         }
+        snapshot.metadataLaneState = metadataLaneState_.load(std::memory_order_relaxed);
         snapshot.persistentCacheHits = persistentCacheHits_.load(std::memory_order_relaxed);
         snapshot.persistentCacheMisses = persistentCacheMisses_.load(std::memory_order_relaxed);
         return snapshot;
@@ -228,6 +253,74 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
         cv_.notify_all();
     }
 
+    void Worker::SetFilmstripDecodeWindow(const std::vector<std::wstring>& paths) {
+        std::unordered_set<std::wstring> wanted;
+        wanted.reserve(paths.size());
+        for (const std::wstring& path : paths) {
+            if (!path.empty()) wanted.insert(ThumbnailPathKey(fs::path(path)));
+        }
+        const bool active = !wanted.empty();
+        {
+            std::lock_guard viewportLock(thumbnailViewportMutex_);
+            if (filmstripWindowActive_ == active && filmstripWindowPaths_ == wanted) return;
+            filmstripWindowPaths_.swap(wanted);
+            filmstripWindowActive_ = active;
+        }
+        std::size_t dropped = 0;
+        {
+            // Lock order: mutex_ -> thumbnailViewportMutex_ (as ApplyThumbnailViewport).
+            std::lock_guard lock(mutex_);
+            auto drop = [&](std::deque<WorkJob>& queue) {
+                for (auto it = queue.begin(); it != queue.end();) {
+                    if (it->filmstripOwned && FilmstripDecodeDropped(*it)) {
+                        // A queued job holds only its pending key (no family, budget,
+                        // handle or counters yet): releasing it lets a later request
+                        // for the same cell enqueue again.
+                        pending_.erase(it->key.empty() ? JobKey(*it) : it->key);
+                        it = queue.erase(it);
+                        ++dropped;
+                    } else {
+                        ++it;
+                    }
+                }
+            };
+            // Ownership can be OR-merged onto a coalesced job in any pool queue.
+            for (std::deque<WorkJob>* queue : { &interactiveQueue_, &visibleQueue_, &predictiveQueue_,
+                &faceQueue_, &idleQueue_, &analysisQueue_ }) drop(*queue);
+        }
+        if (dropped != 0) {
+            cv_.notify_all();
+            RefreshReadAheadGate();
+            if (quicksift::diagnostics::VerboseLogging()) {
+                static quicksift::core::LogRateLimiter limiter(4, std::chrono::seconds(5));
+                std::uint64_t suppressed = 0;
+                if (limiter.Allow(&suppressed)) {
+                    QS_LOG_EVENT(quicksift::diagnostics::Level::Trace, L"Worker", L"filmstrip_decodes_dropped",
+                        { L"dropped", std::to_wstring(dropped) }, { L"suppressed", std::to_wstring(suppressed) });
+                }
+            }
+        }
+    }
+
+    bool Worker::FilmstripDecodeDropped(const WorkJob& job) const {
+        if (!job.filmstripOwned || job.cacheClass != CacheClass::Thumbnail) return false;
+        try {
+            const std::wstring key = ThumbnailPathKey(job.path);
+            std::lock_guard viewportLock(thumbnailViewportMutex_);
+            return quicksift::core::filmstrip::DecodeDropped(true, filmstripWindowActive_,
+                filmstripWindowPaths_.contains(key), desiredThumbnailPaths_.contains(key));
+        } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::FilmstripDecodeDropped");
+        }
+        return false;
+    }
+
+    void Worker::MergeFilmstripOwnership(WorkJob& queued, const WorkJob& incoming) const noexcept {
+        if (!incoming.filmstripOwned) return;
+        queued.filmstripOwned = true;
+        queued.ignoreThumbnailViewport = true;
+    }
+
     void Worker::ApplyThumbnailViewport(std::uint64_t viewportEpoch,
         const std::vector<std::wstring>& desiredPaths,
         const std::vector<std::wstring>& visiblePaths) {
@@ -292,6 +385,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                             std::lock_guard viewportLock(thumbnailViewportMutex_);
                             isVisible = visibleThumbnailPaths_.contains(ThumbnailPathKey(it->path));
                         } catch (...) {
+                            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::ApplyThumbnailViewport");
                         }
                         it->priority = isVisible ? JobPriority::Interactive : JobPriority::Predictive;
                         ++it;
@@ -357,6 +451,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             std::lock_guard viewportLock(thumbnailViewportMutex_);
             return desiredThumbnailPaths_.contains(key);
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::IsThumbnailPathCurrentKey");
             return false;
         }
     }
@@ -365,6 +460,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
         try {
             return IsThumbnailPathCurrentKey(ThumbnailPathKey(path));
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::IsThumbnailPathCurrent");
             return false;
         }
     }
@@ -510,6 +606,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             });
             if (released && !stoppingAtomic_.load(std::memory_order_acquire)) return true;
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::BeginExclusivePathWrites");
             releaseWritePreference();
             for (std::size_t index = 0; index < registered; ++index) {
                 ReleaseExclusivePathWriteKey(keys[index]);
@@ -562,6 +659,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                 readAhead_.UnblockPaths(std::vector<fs::path>{ fs::path(key) });
             }
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::ReleaseExclusivePathWriteKey");
         }
         unsigned active = exclusivePathWrites_.load(std::memory_order_acquire);
         while (active != 0 && !exclusivePathWrites_.compare_exchange_weak(active, active - 1,
@@ -579,6 +677,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                 decoderSessionPathsByThread_.resize(threadIndex + 1);
             decoderSessionPathsByThread_[threadIndex] = paths;
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::PublishDecoderSessionPaths");
         }
         blockedCv_.notify_all();
     }
@@ -588,6 +687,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
             std::lock_guard lock(blockedMutex_);
             return FindBlockedPathLocked(path.c_str()) != blockedPaths_.end();
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::IsPathBlockedForDecoder");
             return true;
         }
     }
@@ -628,6 +728,7 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                 else --found->second;
             }
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::EndHandleJob");
         }
         blockedCv_.notify_all();
     }
@@ -703,11 +804,14 @@ std::wstring ThumbnailPathKey(const fs::path& path) {
                 const std::size_t index = TelemetryFormatIndex(job.path);
                 telemetry_.decodeMillisecondsByFormat[index] = UpdateEwma(
                     telemetry_.decodeMillisecondsByFormat[index], executionMs);
+                if (!cancelled && std::isfinite(executionMs) && executionMs >= 0.0)
+                    telemetry_.lastDecodeMillisecondsByFormat[index] = executionMs;
             }
             ++telemetry_.completedJobs;
             if (cancelled) ++telemetry_.cancelledJobs;
             if (oversized) ++telemetry_.oversizedReservations;
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::RecordTelemetry");
         }
     }
 

@@ -13,6 +13,10 @@
 #include <string_view>
 #include <initializer_list>
 #include <cstdint>
+#include <functional>
+#include <vector>
+
+#include "core/session_log_browser.h"
 
 namespace quicksift::diagnostics {
 
@@ -47,6 +51,40 @@ void WriteLastError(Level level, std::wstring_view category, std::wstring_view o
 [[nodiscard]] std::filesystem::path CrashReportDirectory();
 [[nodiscard]] bool ExportSnapshot(const std::filesystem::path& destination) noexcept;
 [[nodiscard]] bool ExportSnapshotInteractive(HWND owner, std::filesystem::path* destination = nullptr) noexcept;
+
+// Deletes QuickSift's own session logs (Logs) and crash reports/minidumps
+// (CrashReports) older than core::log_retention::kMaxAge (7 days, last-write
+// time). Never the current session log, never anything that does not match
+// QuickSift's naming pattern, never a reparse point, never recursive. Every
+// deletion is logged. Call on a background thread; `cancelled` is polled
+// between files.
+struct CleanupSummary {
+    std::size_t scanned = 0;
+    std::size_t deleted = 0;
+    std::size_t failed = 0;
+    bool cancelled = false;
+};
+CleanupSummary CleanupOldDiagnosticFiles(const std::function<bool()>& cancelled = {}) noexcept;
+
+// Previous-session log browser (read-only; deletion stays with the 7-day cleanup).
+// The folder is the one this session's log lives in: <data root>\Logs.
+[[nodiscard]] std::filesystem::path SessionLogDirectory();
+// Non-recursive listing of QuickSift's own session logs in SessionLogDirectory(),
+// newest first, without the current session's log. The folder is skipped when it
+// is a reparse point; entries that are links are never listed. Call off the UI thread.
+[[nodiscard]] std::vector<core::session_logs::Listed> ListPreviousSessionLogs() noexcept;
+struct SessionLogText {
+    bool ok = false;
+    std::wstring text;                  // UTF-16, as written (newest part when truncated)
+    std::uint64_t totalBytes = 0;       // file size
+    std::uint64_t shownBytes = 0;       // bytes behind `text`
+    bool truncated = false;             // only the newest core::session_logs::kMaxDisplayBytes
+    DWORD error = ERROR_SUCCESS;
+};
+// Reads one log named by ListPreviousSessionLogs (a bare QuickSift session-log
+// name; anything else is refused) through a handle that never follows a link.
+// Reads at most core::session_logs::kMaxDisplayBytes. Call off the UI thread.
+[[nodiscard]] SessionLogText ReadSessionLogTail(std::wstring_view name) noexcept;
 
 } // namespace quicksift::diagnostics
 

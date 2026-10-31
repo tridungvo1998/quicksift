@@ -2,10 +2,12 @@
 // OWNER: Image decoder implementation; validate dimensions and byte counts before allocation.
 
 #include "bundled_codecs.h"
+#include "core/embedded_jpeg_scan.h"
 #include "core/image_formats.h"
 #include "metadata/jpeg_orientation.h"
 #include "runtime_support.h"
 #include "app/application_support.h"
+#include "diagnostics/log_and_continue.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -97,6 +99,7 @@ bool Cancelled(const DecodeOptions& options) noexcept {
     try {
         return options.isCancelled();
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Decode", L"Cancelled");
         // Cancellation hooks can originate in UI/worker state. Treat a broken
         // hook as cancellation rather than allowing C++ exceptions to cross a
         // third-party C decoder callback boundary.
@@ -401,10 +404,8 @@ bool DecodeRawEmbedded(LibRaw& processor, const DecodeOptions& options,
 #if defined(QS_USE_TURBOJPEG)
         DecodeOptions previewOptions = options;
         previewOptions.preferEmbeddedPreview = false;
-        // Single View (targetSize <= 0 or large): keep the embedded JPEG at full
-        // quality. Grid thumbs may still scale.
-        if (options.rawJpegPreviewOnly && options.targetSize <= 0)
-            previewOptions.targetSize = 0;
+        // Thumbnails scale to targetSize. Single View full-preview path is handled
+        // below and does not use this small thumb.
         if (!DecodeJpegBytes({ thumbnail->data, thumbnail->data_size }, previewOptions, decoded, true)) return false;
 #else
         return false;
@@ -428,13 +429,12 @@ bool DecodeRawEmbedded(LibRaw& processor, const DecodeOptions& options,
     }
 
     if (decoded.pixels.empty()) return false;
-    // Single View with JPEG-preview mode expects the full embedded JPEG, not a
-    // tiny thumbnail. If LibRaw returned a small thumb, reject it so the caller
-    // can fall through to a larger preview scan.
-    if (options.rawJpegPreviewOnly && options.targetSize <= 0) {
+    // Single View wants the largest embedded JPEG. Reject the small LibRaw thumb
+    // so the caller scans for it. Thumbnail view and the thumbnail cache keep it.
+    if (options.singleViewFullPreview) {
         const int longest = std::max(decoded.width, decoded.height);
         const int sourceLongest = std::max(rawWidth, rawHeight);
-        if (sourceLongest > 0 && longest * 4 < sourceLongest) return false;
+        if (sourceLongest > 1600 && longest * 3 < sourceLongest) return false;
     }
     SetRawSourceGeometry(decoded, rawWidth, rawHeight);
     const int longest = std::max(decoded.width, decoded.height);
@@ -460,41 +460,43 @@ bool DecodeRaw(const fs::path& path, const DecodeOptions& options, DecodedImageD
 
     const int rawWidth = static_cast<int>(processor.imgdata.sizes.width);
     const int rawHeight = static_cast<int>(processor.imgdata.sizes.height);
-    if (DecodeRawEmbedded(processor, options, rawWidth, rawHeight, output)) return true;
-    // LibRaw thumb was missing or too small for Single View. Scan the file for
-    // the largest embedded JPEG (the full-quality preview many cameras store).
-    if (options.rawJpegPreviewOnly && options.preferEmbeddedPreview) {
+    // Single View full preview ("Load JPG previews for RAWs" ON): use the largest
+    // embedded JPEG at full quality. Before 0.9.5.0 the LibRaw thumbnail was
+    // decoded at the grid target and rejected by a 1/3 rule, and the fallback
+    // scanner stopped at the first SOS marker, so it never accepted any JPEG and
+    // ON stayed on the small preview. FindLargestEmbeddedJpeg walks the entropy
+    // data to EOI and picks the largest SOF0/1/2 frame.
+    if (options.singleViewFullPreview && options.preferEmbeddedPreview) {
+#if defined(QS_USE_TURBOJPEG)
         MappedFileView mapped;
         const std::uint64_t limit = std::min(options.mappedInputLimit,
             gMappedInputLimit.load(std::memory_order_relaxed));
-        if (mapped.Open(path, MappedFileView::AccessPattern::Sequential, limit, true)) {
+        if (mapped.Open(path, MappedFileView::AccessPattern::Sequential, limit, true) && !Cancelled(options)) {
             const auto bytes = mapped.Bytes();
-            std::size_t bestStart = 0, bestLen = 0;
-            for (std::size_t i = 0; i + 1 < bytes.size(); ++i) {
-                if (bytes[i] == 0xFF && bytes[i + 1] == 0xD8) {
-                    std::size_t end = i + 2;
-                    while (end + 1 < bytes.size() && !(bytes[end] == 0xFF && bytes[end + 1] == 0xD9)) ++end;
-                    if (end + 1 < bytes.size()) {
-                        const std::size_t len = end + 2 - i;
-                        if (len > bestLen && len > 64 * 1024) { bestStart = i; bestLen = len; }
-                    }
-                    i = end;
-                }
-            }
-            if (bestLen > 0) {
-#if defined(QS_USE_TURBOJPEG)
+            const auto best = quicksift::core::FindLargestEmbeddedJpeg(bytes);
+            if (best.Found() && best.LongestEdge() > 800) {
                 DecodeOptions previewOptions = options;
                 previewOptions.preferEmbeddedPreview = false;
-                previewOptions.targetSize = 0; // full quality
+                previewOptions.targetSize = 0;
                 DecodedImageData decoded;
-                if (DecodeJpegBytes(bytes.subspan(bestStart, bestLen), previewOptions, decoded, true)) {
+                if (DecodeJpegBytes(bytes.subspan(best.offset, best.length), previewOptions, decoded, true)) {
+                    decoded.embeddedPreview = true;
                     SetRawSourceGeometry(decoded, rawWidth, rawHeight);
                     output = std::move(decoded);
                     return true;
                 }
-#endif
             }
         }
+#endif
+        if (Cancelled(options)) return false;
+        // Mapping failed or no JPEG found: LibRaw's own thumbnail at native size,
+        // without the small-thumbnail rejection.
+        DecodeOptions thumbOptions = options;
+        thumbOptions.singleViewFullPreview = false;
+        thumbOptions.targetSize = 0;
+        if (DecodeRawEmbedded(processor, thumbOptions, rawWidth, rawHeight, output)) return true;
+    } else if (DecodeRawEmbedded(processor, options, rawWidth, rawHeight, output)) {
+        return true;
     }
     if (options.rawJpegPreviewOnly || Cancelled(options)) return false;
 

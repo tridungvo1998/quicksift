@@ -85,13 +85,6 @@ struct D2DTextInputState {
     COLORREF parentSurface = RGB(35, 38, 45);
 };
 
-COLORREF BlendEditorColor(COLORREF base, COLORREF over, BYTE alpha) noexcept {
-    const int a = alpha;
-    return RGB((GetRValue(base) * (255 - a) + GetRValue(over) * a) / 255,
-        (GetGValue(base) * (255 - a) + GetGValue(over) * a) / 255,
-        (GetBValue(base) * (255 - a) + GetBValue(over) * a) / 255);
-}
-
 D2D1_COLOR_F D2DColor(COLORREF c, float alpha = 1.0f) noexcept {
     return D2D1::ColorF(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
         GetBValue(c) / 255.0f, alpha);
@@ -961,6 +954,7 @@ namespace {
 void ClearButtonHot(HWND window, const MacOsUiFramework* framework) noexcept {
     const bool wasHot = GetPropW(window, kButtonHotProperty) != nullptr;
     RemovePropW(window, kButtonHotProperty);
+    MacOsUiFramework::HideOverflowTip(window);
     if (framework) {
         try { framework->SetButtonHover(window, false, /*animate=*/false); } catch (...) {}
     }
@@ -991,9 +985,21 @@ LRESULT CALLBACK MacOsUiFramework::ButtonSubclassProc(HWND window, UINT message,
             TrackMouseEvent(&track);
             hover(true, true);
             InvalidateRect(window, nullptr, FALSE);
+            if (GetPropW(window, L"QuickSift.OverflowText")) TraceOverflow(window, L"hover-enter");
+            ArmOverflowTip(window); // truncated caption: full text after a short hover
+        }
+        break;
+    case WM_TIMER:
+        if (wParam == 0x51F7) { // overflow tooltip delay (ArmOverflowTip)
+            TraceOverflow(window, L"timer-fired", GetPropW(window, kButtonHotProperty) ? L"hot" : L"not hot");
+            if (GetPropW(window, kButtonHotProperty)) ShowOverflowTip(window);
+            else HideOverflowTip(window);
+            return 0;
         }
         break;
     case WM_MOUSELEAVE:
+        if (GetPropW(window, L"QuickSift.OverflowText")) TraceOverflow(window, L"hover-leave");
+        HideOverflowTip(window);
         RemovePropW(window, kButtonHotProperty);
         hover(false, true); // macOS-style: the hover fades out too
         InvalidateRect(window, nullptr, FALSE);
@@ -1012,6 +1018,9 @@ LRESULT CALLBACK MacOsUiFramework::ButtonSubclassProc(HWND window, UINT message,
         InvalidateRect(window, nullptr, FALSE);
         break;
     case WM_LBUTTONDOWN:
+        HideOverflowTip(window);
+        InvalidateRect(window, nullptr, FALSE);
+        break;
     case WM_LBUTTONUP:
         // Owner-draw ODS_SELECTED updates on press/release; force a crisp repaint.
         InvalidateRect(window, nullptr, FALSE);
@@ -1021,10 +1030,17 @@ LRESULT CALLBACK MacOsUiFramework::ButtonSubclassProc(HWND window, UINT message,
         InvalidateRect(window, nullptr, FALSE);
         break;
     case WM_SETFOCUS:
+        if (HWND parent = GetParent(window)) {
+            PostMessageW(parent, kButtonFocusedMessage, reinterpret_cast<WPARAM>(window), 0);
+        }
+        InvalidateRect(window, nullptr, FALSE);
+        break;
     case WM_KILLFOCUS:
         InvalidateRect(window, nullptr, FALSE);
         break;
     case WM_NCDESTROY:
+        HideOverflowTip(window);
+        RemovePropW(window, L"QuickSift.OverflowText");
         RemovePropW(window, kButtonHotProperty);
         if (framework) {
             // Safe on destroy: the entry (and any frame request for this HWND) goes away.

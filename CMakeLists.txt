@@ -47,6 +47,8 @@ add_library(QuickSiftCore STATIC
     src/core/batch_match_policy.cpp
     src/core/photo_predicate.cpp
     src/core/search_query.cpp
+    src/core/embedded_jpeg_scan.cpp
+    src/core/blocking_wait.cpp
     src/core/exif_capture_time.cpp
     src/core/face_detection_policy.cpp
     src/core/performance_policy.cpp
@@ -73,6 +75,7 @@ add_library(QuickSiftCore STATIC
     src/review/review_state_model.cpp
     src/review/review_async_policy.cpp
     src/metadata/jpeg_orientation.cpp
+    src/metadata/jpeg_xmp_locator.cpp
     src/metadata/xmp_simple_property.cpp
     src/metadata/metadata_value_parser.cpp
     src/ui/framework/ui_models.cpp
@@ -83,6 +86,9 @@ add_library(QuickSiftCore STATIC
     src/core/catalog_policy.h
     src/core/image_formats.h
     src/core/decode_budget.h
+    src/core/view_load_policy.h
+    src/core/filmstrip_policy.h
+    src/core/blur_outline_policy.h
     src/core/face_policy.h
     src/core/face_quality_policy.h
     src/core/ratings_exchange.h
@@ -101,6 +107,7 @@ add_library(QuickSiftCore STATIC
     src/core/metadata_edit_queue.h
     src/core/user_error_catalog.h
     src/core/log_rate_limiter.h
+    src/core/log_and_continue.h
     src/core/lock_order.h
     src/core/path_identity.h
     src/core/selection_store.h
@@ -115,6 +122,24 @@ add_library(QuickSiftCore STATIC
     src/review/review_state_model.h
     src/review/review_async_policy.h
     src/metadata/jpeg_orientation.h
+    src/metadata/jpeg_xmp_locator.h
+    src/core/hydrated_facts.h
+    src/core/filter_value_index.h
+    src/core/embedded_jpeg_scan.h
+    src/core/decode_timeout_policy.h
+    src/core/metadata_lane_policy.h
+    src/core/metadata_progress.h
+    src/core/blocking_wait.h
+    src/core/presentation_settings.h
+    src/core/hud_snapshot.h
+    src/core/pane_scroll_policy.h
+    src/core/pane_timing.h
+    src/core/worker_lifetime.h
+    src/core/log_retention.h
+    src/core/session_log_browser.h
+    src/core/sidecar_write_policy.h
+    src/core/metadata_gate_policy.h
+    src/core/metadata_queue_order.h
     src/metadata/xmp_simple_property.h
     src/metadata/metadata_value_parser.h
     src/ui/framework/ui_models.h
@@ -193,6 +218,17 @@ set(QS_APP_SOURCES
     src/app/quicksift_application.cpp
     src/app/quicksift_application.h
     src/app/quicksift_application_internal.h
+    src/app/state/app_state_common.h
+    src/app/state/chrome_state.h
+    src/app/state/pane_state.h
+    src/app/state/viewer_state.h
+    src/app/state/browse_state.h
+    src/app/state/metadata_state.h
+    src/app/state/ratings_exchange_state.h
+    src/app/state/batch_state.h
+    src/app/state/search_state.h
+    src/app/state/hud_state.h
+    src/app/state/session_log_browser_state.h
     src/work/background_work_engine.cpp
     src/work/background_decode_policy.cpp
     src/work/background_performance_controller.cpp
@@ -224,7 +260,9 @@ set(QS_APP_SOURCES
     src/ui/metadata_photo_values.h
     src/ui/settings_filters_and_file_commands.cpp
     src/ui/ratings_exchange_commands.cpp
+    src/ui/session_log_browser_controller.cpp
     src/ui/batch_processing_commands.cpp
+    src/ui/blocking_wait_controller.cpp
     src/ui/thumbnail_search_controller.cpp
     src/ui/document_and_menu_models.cpp
     src/core/system_profile.cpp
@@ -244,6 +282,24 @@ set(QS_APP_SOURCES
     src/core/selection_store.h
     src/core/history_store.h
     src/metadata/jpeg_orientation.h
+    src/metadata/jpeg_xmp_locator.h
+    src/core/hydrated_facts.h
+    src/core/filter_value_index.h
+    src/core/embedded_jpeg_scan.h
+    src/core/decode_timeout_policy.h
+    src/core/metadata_lane_policy.h
+    src/core/metadata_progress.h
+    src/core/blocking_wait.h
+    src/core/presentation_settings.h
+    src/core/hud_snapshot.h
+    src/core/pane_scroll_policy.h
+    src/core/pane_timing.h
+    src/core/worker_lifetime.h
+    src/core/log_retention.h
+    src/core/session_log_browser.h
+    src/core/sidecar_write_policy.h
+    src/core/metadata_gate_policy.h
+    src/core/metadata_queue_order.h
     src/metadata/xmp_simple_property.h
     src/metadata/metadata_value_parser.h
     src/ui/framework/ui_models.h
@@ -255,6 +311,7 @@ set(QS_APP_SOURCES
     src/core/stable_file_identity.h
     src/core/scoped_boolean_flag.h
     src/diagnostics/diagnostic_log.h
+    src/diagnostics/log_and_continue.h
     src/persistent_cache.h
     src/bundled_codecs.h
     src/face_detector.h
@@ -277,6 +334,7 @@ set(QS_APP_SOURCES
     src/ui/ui_command_ids.h
     src/ui/ui_control_catalog.h
     src/ui/ui_layout_metrics.h
+    src/ui/ui_layout_constants.h
     src/ui/ui_design_tokens.h
     resource.h
     resource.rc.in

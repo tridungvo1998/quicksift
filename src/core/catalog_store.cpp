@@ -9,6 +9,8 @@ namespace quicksift::core {
 
 void CatalogStore::ClearAndRelease() {
     std::vector<PhotoItem>().swap(photos_);
+    filterValues_.Clear();
+    filterValuesStale_ = false;
     BumpMetadataEpoch();
     snapshot_.reset();
     std::vector<std::shared_ptr<const CatalogSnapshot::Chunk>>().swap(snapshotChunks_);
@@ -16,6 +18,16 @@ void CatalogStore::ClearAndRelease() {
     std::unordered_multimap<std::uint64_t, Index>().swap(pathIndex_);
     std::vector<Index>().swap(visibleIndices_);
     std::vector<Index>().swap(visiblePositions_);
+}
+
+const FilterValueIndex& CatalogStore::FilterValues() const {
+    if (filterValuesStale_) {
+        FilterValueIndex rebuilt;
+        for (const PhotoItem& photo : photos_) rebuilt.Add(photo); // may throw: stays stale
+        filterValues_ = std::move(rebuilt);
+        filterValuesStale_ = false;
+    }
+    return filterValues_;
 }
 
 void CatalogStore::MarkFactsChanged(Index index) noexcept {

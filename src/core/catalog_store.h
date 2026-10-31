@@ -2,6 +2,7 @@
 #pragma once
 
 #include "app_types.h"
+#include "filter_value_index.h"
 #include "image_metadata.h"
 #include "path_identity.h"
 
@@ -36,6 +37,9 @@ public:
     // changed through a general record callback.
     void EditPhoto(Index index, const std::function<void(PhotoItem&)>& edit);
     [[nodiscard]] std::span<const PhotoItem> Photos() const noexcept { return photos_; }
+    // Distinct filter-menu values of every record, kept current by each mutation
+    // (rebuilt in one pass only if an incremental update ever failed).
+    [[nodiscard]] const FilterValueIndex& FilterValues() const;
 
     // Metadata epoch: bumped whenever a fact a predicate can test changes (any
     // rating/pick/color/knowledge, capture time, comment, name, or the record set).
@@ -87,6 +91,8 @@ private:
     void MarkFactsChanged(Index index) noexcept;
 
     std::vector<PhotoItem> photos_;
+    mutable FilterValueIndex filterValues_;
+    mutable bool filterValuesStale_ = false;
     std::uint64_t metadataEpoch_ = 1;
     mutable CatalogSnapshotPtr snapshot_;
     // Incremental snapshot state (UI thread only): last built chunks + dirty flags.

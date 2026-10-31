@@ -10,6 +10,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Plain-language failure message (scripts\build-failure-help.ps1): every error that
+# stops this script prints "Build failed / What to do / Technical detail" and exits 1.
+. (Join-Path $PSScriptRoot 'build-failure-help.ps1')
+trap {
+    if (Get-Command Write-QuickSiftFailure -ErrorAction SilentlyContinue) {
+        Write-QuickSiftFailure $_ 'Package' ''
+    } else {
+        Write-Host "Build failed: $_" -ForegroundColor Red
+    }
+    exit 1
+}
+
 if ([string]::IsNullOrWhiteSpace($IdentityName)) {
     $IdentityName = if ($env:QS_MSIX_IDENTITY_NAME) { $env:QS_MSIX_IDENTITY_NAME } else { 'VoHoangTriDung.QuickSift' }
 }
@@ -61,6 +73,7 @@ function Invoke-Native {
     $ExitCode = $LASTEXITCODE
     $Output | Out-Host
     if ($ExitCode -ne 0) {
+        foreach ($Line in $Output) { Add-QuickSiftFailureHint $Line.ToString() }
         $Tail = @($Output | Select-Object -Last 30 | ForEach-Object { $_.ToString() })
         throw "Command failed with exit code $ExitCode`: $FilePath`n$($Tail -join [Environment]::NewLine)"
     }

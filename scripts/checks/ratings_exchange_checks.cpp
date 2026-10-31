@@ -171,6 +171,15 @@ void CheckCorruption() {
         "case-insensitive duplicate name rejected");
     ExpectFailure(Replace(good, "color tagged: 4 files", "color tagged: 5 files"),
         ParseError::DataCountMismatch, "declared data count must equal data lines");
+    // A hostile declared count must fail cleanly (no huge pre-allocation).
+    ExpectFailure(Replace(good, "color tagged: 4 files", "color tagged: 999999999999999999 files"),
+        ParseError::DataCountMismatch, "absurd declared data count rejected without allocation");
+    {
+        const ParseResult unicode = ParseDocumentUtf8(Replace(good, "IMG_0003.jpg |", "\xC3\x89T\xC3\x89.jpg |"));
+        bool found = false;
+        for (const auto& entry : unicode.document.entries) found = found || entry.fileName == L"\u00C9T\u00C9.jpg";
+        Check(unicode.ok && found, "non-ASCII file name parses to the right wide name");
+    }
     std::string badUtf8 = good;
     badUtf8.insert(badUtf8.find("IMG_0001"), "\xC3\x28");
     ExpectFailure(badUtf8, ParseError::InvalidUtf8, "invalid UTF-8 rejected");

@@ -1,6 +1,10 @@
 // OWNER: Background decode, cache, and metadata-read execution.
 #include "work/background_work_engine.h"
+#include "core/filmstrip_policy.h"
 #include "core/priority_policy.h"
+#include "core/decode_timeout_policy.h"
+#include "core/view_load_policy.h"
+#include "core/metadata_lane_policy.h"
 #include "diagnostics/log_categories.h"
 #include "core/log_rate_limiter.h"
 #include "review/review_async_policy.h"
@@ -8,6 +12,7 @@
 #include "core/face_quality_policy.h"
 #include "embedded_metadata.h"
 #include "metadata/jpeg_orientation.h"
+#include "diagnostics/log_and_continue.h"
 
 namespace quicksift::app {
 namespace {
@@ -37,7 +42,7 @@ const wchar_t* JobPriorityName(JobPriority priority) noexcept {
 }
 
 std::wstring DiagnosticFilename(const fs::path& path) {
-    try { return path.filename().wstring(); } catch (...) { return L"<invalid>"; }
+    try { return path.filename().wstring(); } catch (...) { QS_CATCH_SILENT_BY_DESIGN("formats file names for log lines and must not log itself"); return L"<invalid>"; }
 }
 
 DecodePriority DecodePriorityFor(JobPriority priority) noexcept {
@@ -271,6 +276,7 @@ void PublishThreadWicDecoderSessions() noexcept {
         for (const auto& session : gThreadWicDecoderSessions) paths.push_back(session.path);
         gThreadWorkerOwner->PublishDecoderSessionPaths(gThreadWorkerIndex, paths);
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Worker", L"PublishThreadWicDecoderSessions");
     }
 }
 
@@ -371,6 +377,7 @@ HRESULT CALLBACK WicProgressCallback(LPVOID context, ULONG, WICProgressOperation
         return cancellation && cancellation->cancelled && *cancellation->cancelled &&
             (*cancellation->cancelled)() ? WINCODEC_ERR_ABORTED : S_OK;
     } catch (...) {
+        QS_LOG_AND_CONTINUE(L"Worker", L"WicProgressCallback");
         // Never allow a std::function target to unwind through the WIC COM ABI.
         return WINCODEC_ERR_ABORTED;
     }
@@ -452,7 +459,7 @@ bool DecodeWithWic(IWICImagingFactory* factory, const fs::path& path, int target
                     if (closeEnough && stride64 <= UINT_MAX && bytes64 <= UINT_MAX &&
                         bytes64 <= gMaximumDecodedPixelBytes.load(std::memory_order_relaxed)) {
                         try { result.pixels.resize(static_cast<std::size_t>(bytes64)); }
-                        catch (...) { return false; }
+                        catch (...) { QS_LOG_AND_CONTINUE(L"Worker", L"DecodeWithWic"); return false; }
                         if ((!isCancelled || !isCancelled()) && SUCCEEDED(nativeTransform->CopyPixels(
                             nullptr, nativeW, nativeH, &format, transform,
                             static_cast<UINT>(stride64), static_cast<UINT>(bytes64), result.pixels.data()))) {
@@ -533,7 +540,7 @@ bool DecodeWithWic(IWICImagingFactory* factory, const fs::path& path, int target
     if (stride64 > UINT_MAX || bytes64 > UINT_MAX ||
         bytes64 > gMaximumDecodedPixelBytes.load(std::memory_order_relaxed)) return false;
     try { result.pixels.resize(static_cast<std::size_t>(bytes64)); }
-    catch (...) { return false; }
+    catch (...) { QS_LOG_AND_CONTINUE(L"Worker", L"DecodeWithWic [2]"); return false; }
     if ((isCancelled && isCancelled()) || FAILED(converter->CopyPixels(nullptr,
         static_cast<UINT>(stride64), static_cast<UINT>(bytes64), result.pixels.data()))) {
         result.pixels.clear();
@@ -570,7 +577,7 @@ bool CreateWicDerivative(IWICImagingFactory* factory, const WorkResult& source, 
     if (FAILED(factory->CreateBitmapScaler(&scaler)) || FAILED(scaler->Initialize(
         memoryBitmap.Get(), outW, outH, WICBitmapInterpolationModeFant))) return false;
     try { output.pixels.resize(static_cast<std::size_t>(outputBytes64)); }
-    catch (...) { return false; }
+    catch (...) { QS_LOG_AND_CONTINUE(L"Worker", L"CreateWicDerivative"); return false; }
     if (FAILED(scaler->CopyPixels(nullptr, static_cast<UINT>(outputStride64),
         static_cast<UINT>(outputBytes64), output.pixels.data()))) {
         output.pixels.clear();
@@ -657,7 +664,7 @@ bool DecodeTileWithWic(IWICImagingFactory* factory, const fs::path& path, const 
     const UINT stride = static_cast<UINT>(stride64);
     const UINT bytes = static_cast<UINT>(bytes64);
     try { result.pixels.resize(static_cast<size_t>(bytes)); }
-    catch (...) { return false; }
+    catch (...) { QS_LOG_AND_CONTINUE(L"Worker", L"DecodeTileWithWic"); return false; }
     if ((isCancelled && isCancelled()) ||
         FAILED(converter->CopyPixels(nullptr, stride, bytes, result.pixels.data()))) {
         result.pixels.clear();
@@ -894,7 +901,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
             recordWriteQueue_.clear();
             cacheWriteBytes_ = 0;
             pending_.clear();
-        } catch (...) {}
+        } catch (...) { QS_LOG_AND_CONTINUE(L"Worker", L"Worker::RequestStop"); }
         if (decodeBudget_) decodeBudget_->Stop();
         if (viewDecodeBudget_) viewDecodeBudget_->Stop();
         cv_.notify_all();
@@ -948,6 +955,10 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
     }
 
     void Worker::ClearQueuedIdleWork() {
+        // Metadata reads are NOT dropped here. Before 0.9.5.0 "Clear cache" cleared
+        // metadataQueue_ without erasing the dedupe keys or posting a terminal
+        // envelope: the UI in-flight slots and the "metadata pending" counter leaked,
+        // and later reads of those paths were rejected as duplicates forever.
         std::lock_guard lock(mutex_);
         for (const auto& job : predictiveQueue_) pending_.erase(job.key.empty() ? JobKey(job) : job.key);
         for (const auto& job : idleQueue_) pending_.erase(job.key.empty() ? JobKey(job) : job.key);
@@ -955,7 +966,6 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         predictiveQueue_.clear();
         idleQueue_.clear();
         analysisQueue_.clear();
-        metadataQueue_.clear();
         cacheWriteQueue_.clear();
         recordWriteQueue_.clear();
         cacheWriteBytes_ = 0;
@@ -1189,6 +1199,9 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         }
         job.forceWic = cacheClass == CacheClass::Thumbnail && forceWic;
         job.ignoreThumbnailViewport = ignoreThumbnailViewport;
+        // Round 23: the filmstrip is the only caller that opts out of the grid
+        // viewport (PrefetchFilmstrip); its decodes follow the strip's window instead.
+        job.filmstripOwned = ignoreThumbnailViewport && cacheClass == CacheClass::Thumbnail;
         job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
         Enqueue(std::move(job));
     }
@@ -1229,12 +1242,20 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         // Prefetch is not tied to a navigation epoch (a neighbour must survive the
         // arrow key that makes it current); the prefetch set governs its lifetime.
         job.requestEpoch = prefetch ? 0 : epoch;
-        job.viewInteractionEpoch = prefetch ? 0 : (viewInteractionEpoch ? viewInteractionEpoch :
-            currentViewInteractionEpoch_.load(std::memory_order_acquire));
+        // Round 21 (t29u): whole-image view decodes no longer carry the pan/zoom
+        // interaction epoch (see view_load::ViewDecodeInteractionEpoch). It
+        // cancelled the running decode on every pan step and the UI dropped a
+        // result that finished anyway; tiles keep their epoch.
+        (void)viewInteractionEpoch;
+        job.viewInteractionEpoch = quicksift::core::view_load::ViewDecodeInteractionEpoch(true,
+            prefetch ? 0 : currentViewInteractionEpoch_.load(std::memory_order_acquire));
         job.retryAttempt = std::clamp(retryAttempt, 0, 7);
-        job.timeoutMs = CalculateAdaptiveTimeoutMs(path, job.retryAttempt, isSingleView, false);
+        // Every non-prefetch view-lane decode is the image the user is looking at
+        // (Single or Compare, Preview or Full class): give it the foreground budget.
+        const bool foregroundBudget = isSingleView || !prefetch;
+        job.timeoutMs = CalculateAdaptiveTimeoutMs(path, job.retryAttempt, foregroundBudget, false);
         job.timeoutDeferred = true;
-        job.timeoutSingleView = isSingleView;
+        job.timeoutSingleView = foregroundBudget;
         job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
         if (job.rawJpegPreviewOnly && kind == JobKind::DecodeFull && IsRawExtension(ExtensionLower(path))) {
             // JPG-preview-only mode never demosaics RAW; route to the embedded preview.
@@ -1249,6 +1270,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
             allowed.reserve(paths.size());
             for (const std::wstring& path : paths) if (!path.empty()) allowed.insert(path);
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::SetViewPrefetchPaths");
             allowed.clear();
         }
         {
@@ -1277,7 +1299,50 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
             std::lock_guard prefetchLock(viewPrefetchMutex_);
             return viewPrefetchPaths_.contains(key);
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::IsViewPrefetchPathAllowed");
             return false;
+        }
+    }
+
+    std::wstring Worker::DescribeViewLoadState(const fs::path& path) const {
+        try {
+            const std::wstring wanted = path.wstring();
+            std::wstring text;
+            {
+                std::lock_guard lock(mutex_);
+                std::size_t queuedForPath = 0;
+                for (const WorkJob& queued : viewQueue_) if (queued.path == path) ++queuedForPath;
+                std::size_t prefetchForPath = 0;
+                for (const WorkJob& queued : viewPrefetchQueue_) if (queued.path == path) ++prefetchForPath;
+                const bool activeForPath = activeViewJob_.active && activeViewJob_.path == wanted;
+                text = L"view_queue=" + std::to_wstring(viewQueue_.size()) +
+                    L" view_prefetch_queue=" + std::to_wstring(viewPrefetchQueue_.size()) +
+                    L" queued_for_path=" + std::to_wstring(queuedForPath) +
+                    L" prefetch_for_path=" + std::to_wstring(prefetchForPath) +
+                    L" active=" + (activeViewJob_.active ? L"1" : L"0") +
+                    L" active_for_path=" + (activeForPath ? L"1" : L"0") +
+                    L" active_prefetch=" + (activeViewJob_.prefetch ? L"1" : L"0") +
+                    L" active_kind=" + std::to_wstring(static_cast<int>(activeViewJob_.kind)) +
+                    L" active_class=" + std::to_wstring(static_cast<int>(activeViewJob_.cacheClass)) +
+                    L" active_target=" + std::to_wstring(activeViewJob_.targetSize) +
+                    L" active_epoch=" + std::to_wstring(activeViewJob_.requestEpoch) +
+                    L" adopted_epoch=" + std::to_wstring(viewActiveAdoptedEpoch_.load(std::memory_order_acquire)) +
+                    L" nav_epoch=" + std::to_wstring(navigationEpoch_.load(std::memory_order_acquire)) +
+                    L" pending=" + std::to_wstring(pending_.size()) +
+                    L" active_families=" + std::to_wstring(activeVisualFamilies_.size());
+            }
+            if (viewDecodeBudget_) {
+                text += L" view_budget_bytes=" + std::to_wstring(viewDecodeBudget_->BytesInFlightForTesting()) +
+                    L" view_budget_reservations=" + std::to_wstring(viewDecodeBudget_->ActiveReservationsForTesting()) +
+                    L" view_budget_waiters=" + std::to_wstring(viewDecodeBudget_->PendingWaitersForTesting());
+            }
+            text += L" path_blocked=";
+            text += IsPathBlockedForDecoder(path) ? L"1" : L"0";
+            text += L" exclusive_writes=" + std::to_wstring(exclusivePathWrites_.load(std::memory_order_acquire));
+            return text;
+        } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Worker", L"Worker::DescribeViewLoadState");
+            return L"unavailable";
         }
     }
 
@@ -1305,6 +1370,8 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         activeViewJob_.targetSize = job.targetSize;
         activeViewJob_.rawJpegPreviewOnly = job.rawJpegPreviewOnly;
         activeViewJob_.path = job.path.wstring();
+        activeViewJob_.requestEpoch = job.requestEpoch;
+        activeViewJob_.generation = job.generation;
         viewActiveAdoptedEpoch_.store(0, std::memory_order_release);
         return job;
     }
@@ -1458,8 +1525,6 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         // 0.9.4.0 retry policy: attempt 0/1/2 get base, 2x, 4x (8x is the ceiling for
         // any later manual/automatic retry). The former ladder only doubled every
         // second attempt, so the first retry repeated the exact timeout that failed.
-        const int boundedAttempt = std::clamp(attempt, 0, 3);
-        int base = 1000 << boundedAttempt;
         // A file-size probe is a synchronous metadata round-trip (slow on HDD/SMB).
         // UI-thread callers pass probeFileSize=false; the worker refines on start.
         std::uintmax_t size = 0;
@@ -1469,20 +1534,9 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
             size = fs::file_size(path, ec);
             sizeKnown = !ec;
         }
-        std::wstring ext = path.extension().wstring();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
         const bool large = sizeKnown && size > 10ull * 1024ull * 1024ull;
-        const bool raw = IsRawExtension(ext);
-        if (large || raw) base = static_cast<int>(base * 1.5);
-        if (isSingleView) {
-            // Full-resolution Single View decodes can legitimately take many seconds
-            // on large JPEG/TIFF/RAW files. The old 2x multiplier still produced
-            // ~3 seconds for a large file, which cancelled valid native-resolution
-            // requests before they could reach the UI. Give the foreground view a
-            // real decode budget while keeping malformed/stalled codecs bounded.
-            base = std::max(base * 4, large || raw ? 12000 : 8000);
-        }
-        return std::clamp(base, 1000, 60000);
+        const bool raw = IsRawExtension(ExtensionLower(path));
+        return quicksift::core::decode_timeout::AdaptiveTimeoutMs(attempt, large || raw, isSingleView);
     }
 
     void Worker::PromoteQueuedMetadata(uint64_t generation, JobPriority priority) {
@@ -1508,8 +1562,10 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
     }
 
     void Worker::EnqueueExif(const fs::path& path, uint64_t generation) {
-        // EXIF is useful, but never more important than getting pixels on screen.
-        WorkJob job; job.kind = JobKind::Exif; job.priority = JobPriority::Idle;
+        // Info-tab metadata is useful, but never more important than pixels.
+        // Visible priority so it runs ahead of idle/analysis once the view decode
+        // has finished (or yields to it via the view-foreground gate).
+        WorkJob job; job.kind = JobKind::Exif; job.priority = JobPriority::Visible;
         job.path = path; job.generation = generation; Enqueue(std::move(job));
     }
 
@@ -1679,6 +1735,9 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         const int thumbnailTarget = activeThumbnailTarget_.load(std::memory_order_acquire);
         if (job.cacheClass == CacheClass::Thumbnail && thumbnailTarget > 0 &&
             job.targetSize != thumbnailTarget) return true;
+        // Round 23: filmstrip cell decodes that scrolled out of the strip's decode
+        // window (or the strip closed) are dropped queued and cancelled in flight.
+        if (job.filmstripOwned && FilmstripDecodeDropped(job)) return true;
         const uint64_t currentViewportEpoch = thumbnailViewportEpoch_.load(std::memory_order_acquire);
         if (job.cacheClass == CacheClass::Thumbnail && !job.ignoreThumbnailViewport &&
             job.viewportEpoch != 0 && job.viewportEpoch < currentViewportEpoch) {
@@ -1691,6 +1750,7 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
                 // desired by the current prefetch plan.
                 stillDesired = desiredThumbnailPaths_.contains(key);
             } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Worker", L"Worker::IsCancelled");
             }
             // Queued stale work is discarded immediately. During fling (cache-only
             // admission) cancel in-flight off-viewport work with no grace so successive
@@ -1708,7 +1768,11 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
                 if (now - job.startedAt >= std::chrono::milliseconds(dynamicGraceMs)) return true;
             }
         }
-        if (job.priority == JobPriority::Predictive &&
+        // allowPredictive_ throttles speculative DECODES. Metadata reads have their
+        // own lane gate; cancelling them here posted empty Unknown results that left
+        // "Rating pending" forever (visible-first reads run at Predictive).
+        if (job.priority == JobPriority::Predictive && job.kind != JobKind::Metadata &&
+            job.kind != JobKind::Exif &&
             !allowPredictive_.load(std::memory_order_acquire)) return true;
         if (job.priority == JobPriority::Analysis &&
             !allowAnalysis_.load(std::memory_order_acquire)) return true;
@@ -1805,6 +1869,10 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         options.preferEmbeddedPreview = preferEmbeddedPreview;
         options.rawJpegPreviewOnly = job.rawJpegPreviewOnly &&
             IsRawExtension(ExtensionLower(job.path));
+        // Largest embedded JPEG at full quality only for Single/Compare view
+        // lane. Grid thumbnails and the thumbnail cache keep the small LibRaw thumb.
+        options.singleViewFullPreview = options.rawJpegPreviewOnly && job.viewLane &&
+            job.cacheClass != CacheClass::Thumbnail;
         options.allowTurboJpeg = profile_.enableTurboJpeg;
         options.prefetchEncodedInput = job.priority == JobPriority::Interactive ||
             job.priority == JobPriority::Visible || job.priority == JobPriority::Predictive;
@@ -1813,7 +1881,40 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         return DecodeWithBundled(job.path, options, result);
     }
 
+    // Enqueue (0.9.5.0 round 19: split into admission gates and the locked
+    // dedupe/coalesce/queue stages, with no behaviour change). Returns true only
+    // when the job was queued as new work.
     bool Worker::Enqueue(WorkJob job) {
+        if (!ThumbnailDragAdmits(job)) return false;
+        if (!PassesEnqueueGates(job)) return false;
+        if (job.key.empty()) job.key = JobKey(job);
+        {
+            std::lock_guard lock(mutex_);
+            if (stopping_) return false;
+            if (job.viewLane && !ReconcileViewLaneJobLocked(job)) return false;
+            if (IsCoalescibleVisualJob(job)) RaiseDesiredVisualTargetLocked(job);
+            // Coalesce queued requests for the same image/quality family. A larger
+            // bucket satisfies every smaller consumer, so rapid fit/zoom/layout
+            // changes should upgrade one queued decode rather than reopen the file.
+            if (IsCoalescibleVisualJob(job) && CoalesceQueuedVisualJobLocked(job)) return false;
+            if (IsCoalescibleVisualJob(job)) {
+                const std::wstring family = VisualFamilyKey(job);
+                const auto active = activeVisualFamilies_.find(family);
+                if (active != activeVisualFamilies_.end() && active->second >= job.targetSize &&
+                    !RunningViewJobIsStaleForLocked(job)) {
+                    return false;
+                }
+            }
+            if (AbsorbPendingDuplicateLocked(job)) return false;
+            if (!PushNewJobLocked(std::move(job))) return true;
+        }
+        cv_.notify_all();
+        RefreshReadAheadGate();
+        return true;
+    }
+
+    // Scrollbar drag: thumbnail decodes run only in the size-capped rolling budget.
+    bool Worker::ThumbnailDragAdmits(const WorkJob& job) {
         if (thumbnailDragActive_.load(std::memory_order_acquire) &&
             job.cacheClass == CacheClass::Thumbnail &&
             (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull)) {
@@ -1842,6 +1943,12 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
             if (queued < maxDragThumbnailWork) countQueued(visibleQueue_);
             if (queued >= maxDragThumbnailWork) return false;
         }
+        return true;
+    }
+
+    // Read-ahead pause for foreground visuals, policy gates, enqueue stamp and the
+    // blocked-path check (paths held exclusively by a file transaction).
+    bool Worker::PassesEnqueueGates(WorkJob& job) {
         const bool foregroundVisual = (job.kind == JobKind::DecodePreview ||
             job.kind == JobKind::DecodeFull || job.kind == JobKind::DecodeTile) &&
             (job.priority == JobPriority::Interactive || job.priority == JobPriority::Visible);
@@ -1860,238 +1967,273 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
             std::lock_guard blockedLock(blockedMutex_);
             if (FindBlockedPathLocked(job.path.c_str()) != blockedPaths_.end()) return false;
         }
-        if (job.key.empty()) job.key = JobKey(job);
-        const std::wstring& key = job.key;
-        {
-            std::lock_guard lock(mutex_);
-            if (stopping_) return false;
-            if (job.viewLane) {
-                // 0.9.4.0 view-lane identity rules (all under mutex_).
-                const auto sameImage = [&](const WorkJob& other) {
-                    return other.kind == job.kind && other.cacheClass == job.cacheClass &&
-                        other.rawJpegPreviewOnly == job.rawJpegPreviewOnly && other.path == job.path;
-                };
-                // Preview- and Full-class view decodes of the same kind produce
-                // interchangeable pixels (FindBestViewBitmap searches both), so a
-                // running decode of either class with target >= satisfies the request.
-                const bool classCompatible = activeViewJob_.cacheClass == job.cacheClass ||
-                    ((activeViewJob_.cacheClass == CacheClass::Preview || activeViewJob_.cacheClass == CacheClass::Full) &&
-                     (job.cacheClass == CacheClass::Preview || job.cacheClass == CacheClass::Full));
-                const bool activeMatches = activeViewJob_.active &&
-                    activeViewJob_.kind == job.kind && classCompatible &&
-                    activeViewJob_.rawJpegPreviewOnly == job.rawJpegPreviewOnly &&
-                    activeViewJob_.targetSize >= job.targetSize &&
-                    activeViewJob_.path == job.path.wstring();
-                if (job.viewPrefetch) {
-                    // Never prefetch what the foreground lane already has queued/running.
-                    if (activeMatches) return false;
-                    for (const WorkJob& queued : viewQueue_) {
-                        if (sameImage(queued) && queued.targetSize >= job.targetSize) return false;
-                    }
-                } else {
-                    if (activeMatches && (activeViewJob_.prefetch ||
-                        viewActiveAdoptedEpoch_.load(std::memory_order_acquire) != 0)) {
-                        // The neighbour the user just navigated to is already being
-                        // decoded: adopt it instead of starting a duplicate decode.
-                        // Repeat paints keep the adoption on the newest epoch.
-                        const std::uint64_t adopted = std::max<std::uint64_t>(1, job.requestEpoch);
-                        if (adopted > viewActiveAdoptedEpoch_.load(std::memory_order_acquire))
-                            viewActiveAdoptedEpoch_.store(adopted, std::memory_order_release);
-                        activeViewJob_.prefetch = false;
-                        viewForegroundRunning_.store(true, std::memory_order_release);
-                        NoteViewForegroundChanged();
-                        return false;
-                    }
-                    for (auto it = viewPrefetchQueue_.begin(); it != viewPrefetchQueue_.end(); ++it) {
-                        if (!sameImage(*it)) continue;
-                        job.targetSize = std::max(job.targetSize, it->targetSize);
-                        pending_.erase(it->key);
-                        ReleaseDesiredVisualTarget(it->path, it->kind, it->cacheClass, it->generation,
-                            it->requestEpoch, it->viewportEpoch, it->targetSize, it->rawJpegPreviewOnly);
-                        viewPrefetchQueue_.erase(it);
-                        job.key = JobKey(job);
-                        break;
-                    }
-                    // A Single/Compare decode must run on the view lane even if an
-                    // equivalent request is still queued in the shared pool (for
-                    // example from before the mode switch): move it over.
-                    for (std::deque<WorkJob>* poolQueue : { &interactiveQueue_, &visibleQueue_,
-                             &predictiveQueue_, &faceQueue_, &idleQueue_, &analysisQueue_ }) {
-                        const auto it = std::find_if(poolQueue->begin(), poolQueue->end(),
-                            [&](const WorkJob& queued) { return SameDecodeFamily(queued, job); });
-                        if (it == poolQueue->end()) continue;
-                        job.targetSize = std::max(job.targetSize, it->targetSize);
-                        pending_.erase(it->key);
-                        ReleaseDesiredVisualTarget(it->path, it->kind, it->cacheClass, it->generation,
-                            it->requestEpoch, it->viewportEpoch, it->targetSize, it->rawJpegPreviewOnly);
-                        poolQueue->erase(it);
-                        job.key = JobKey(job);
-                    }
-                }
+        return true;
+    }
+
+    // 0.9.4.0 view-lane identity rules (mutex_ held). Returns false when the request
+    // is already satisfied (queued, running or adopted) and must not be queued.
+    bool Worker::ReconcileViewLaneJobLocked(WorkJob& job) {
+        const auto sameImage = [&](const WorkJob& other) {
+            return other.kind == job.kind && other.cacheClass == job.cacheClass &&
+                other.rawJpegPreviewOnly == job.rawJpegPreviewOnly && other.path == job.path;
+        };
+        // Preview- and Full-class view decodes of the same kind produce
+        // interchangeable pixels (FindBestViewBitmap searches both), so a
+        // running decode of either class with target >= satisfies the request.
+        const bool classCompatible = activeViewJob_.cacheClass == job.cacheClass ||
+            ((activeViewJob_.cacheClass == CacheClass::Preview || activeViewJob_.cacheClass == CacheClass::Full) &&
+             (job.cacheClass == CacheClass::Preview || job.cacheClass == CacheClass::Full));
+        const bool activeMatches = activeViewJob_.active &&
+            activeViewJob_.kind == job.kind && classCompatible &&
+            activeViewJob_.rawJpegPreviewOnly == job.rawJpegPreviewOnly &&
+            activeViewJob_.targetSize >= job.targetSize &&
+            activeViewJob_.path == job.path.wstring();
+        if (job.viewPrefetch) {
+            // Never prefetch what the foreground lane already has queued/running.
+            if (activeMatches) return false;
+            for (const WorkJob& queued : viewQueue_) {
+                if (sameImage(queued) && queued.targetSize >= job.targetSize) return false;
             }
-            if (IsCoalescibleVisualJob(job)) {
-                const std::wstring family = VisualFamilyKey(job);
-                std::lock_guard desiredLock(desiredMutex_);
-                int& desired = desiredVisualTargets_[family];
-                desired = std::max(desired, job.targetSize);
-            }
-            // Coalesce queued requests for the same image/quality family. A larger
-            // bucket satisfies every smaller consumer, so rapid fit/zoom/layout
-            // changes should upgrade one queued decode rather than reopen the file.
-            if (IsCoalescibleVisualJob(job)) {
-                auto queueForPriority = [&](JobPriority priority) -> std::deque<WorkJob>& {
-                    switch (priority) {
-                    case JobPriority::Interactive: return interactiveQueue_;
-                    case JobPriority::Visible: return visibleQueue_;
-                    case JobPriority::Predictive: return predictiveQueue_;
-                    case JobPriority::Face: return faceQueue_;
-                    case JobPriority::Idle: return idleQueue_;
-                    case JobPriority::Analysis: return analysisQueue_;
-                    }
-                    return analysisQueue_;
-                };
-                auto coalesceIn = [&](std::deque<WorkJob>& queue, bool viewLaneQueue = false) -> bool {
-                    const auto it = std::find_if(queue.begin(), queue.end(), [&](const WorkJob& queued) {
-                        return SameDecodeFamily(queued, job);
-                    });
-                    if (it == queue.end()) return false;
-                    if (viewLaneQueue) {
-                        // View-lane jobs never migrate into the pool's priority queues.
-                        // Refresh the interaction epoch so a zoom/pan that happened
-                        // while the job waited does not cancel it at dequeue.
-                        it->viewInteractionEpoch = std::max(it->viewInteractionEpoch, job.viewInteractionEpoch);
-                        if (it->targetSize < job.targetSize) {
-                            pending_.erase(it->key);
-                            it->targetSize = job.targetSize;
-                            it->key = JobKey(*it);
-                            pending_.insert(it->key);
-                        }
-                        return true;
-                    }
-                    if (it->targetSize < job.targetSize) {
-                        pending_.erase(it->key);
-                        it->targetSize = job.targetSize;
-                        it->key = JobKey(*it);
-                        pending_.insert(it->key);
-                    }
-                    // Priority is monotonic: a later request may promote an
-                    // existing decode, but it may never demote one that was
-                    // already classified as more important. This is especially
-                    // important for viewport thumbnails, which are Interactive.
-                    if (IsHigherPriority(job.priority, it->priority)) {
-                        PromoteQueuedJob(queue, it, queueForPriority(job.priority), job.priority);
-                    }
-                    return true;
-                };
-                if (coalesceIn(viewQueue_, true) || coalesceIn(viewPrefetchQueue_, true) ||
-                    (!job.viewLane && (coalesceIn(interactiveQueue_) || coalesceIn(visibleQueue_) ||
-                    coalesceIn(predictiveQueue_) || coalesceIn(faceQueue_) || coalesceIn(idleQueue_) || coalesceIn(analysisQueue_)))) {
-                    cv_.notify_all();
-                    return false;
-                }
-            }
-            if (IsCoalescibleVisualJob(job)) {
-                const std::wstring family = VisualFamilyKey(job);
-                const auto active = activeVisualFamilies_.find(family);
-                if (active != activeVisualFamilies_.end() && active->second >= job.targetSize) {
-                    return false;
-                }
-            }
-            if (pending_.contains(key) && job.viewLane) {
-                // Queued on the view lane or posted and not yet integrated by the UI.
-                for (std::deque<WorkJob>* lane : { &viewQueue_, &viewPrefetchQueue_ }) {
-                    for (WorkJob& queued : *lane) {
-                        if (queued.key == key)
-                            queued.viewInteractionEpoch = std::max(queued.viewInteractionEpoch, job.viewInteractionEpoch);
-                    }
-                }
+        } else {
+            if (activeMatches && (activeViewJob_.prefetch ||
+                viewActiveAdoptedEpoch_.load(std::memory_order_acquire) != 0)) {
+                // The neighbour the user just navigated to is already being
+                // decoded: adopt it instead of starting a duplicate decode.
+                // Repeat paints keep the adoption on the newest epoch.
+                const std::uint64_t adopted = std::max<std::uint64_t>(1, job.requestEpoch);
+                if (adopted > viewActiveAdoptedEpoch_.load(std::memory_order_acquire))
+                    viewActiveAdoptedEpoch_.store(adopted, std::memory_order_release);
+                activeViewJob_.prefetch = false;
+                viewForegroundRunning_.store(true, std::memory_order_release);
+                NoteViewForegroundChanged();
                 return false;
             }
-            if (pending_.contains(key)) {
-                auto promoteFrom = [&](std::deque<WorkJob>& queue, std::deque<WorkJob>& destination) {
-                    const auto it = std::find_if(queue.begin(), queue.end(), [&](const WorkJob& queued) {
-                        return queued.key == key;
-                    });
-                    if (it == queue.end()) return false;
-                    WorkJob promoted = std::move(*it);
-                    queue.erase(it);
-                    promoted.priority = job.priority;
-                    promoted.requestEpoch = std::max(promoted.requestEpoch, job.requestEpoch);
-                    destination.push_front(std::move(promoted));
-                    return true;
-                };
-                if (job.priority == JobPriority::Interactive) {
-                    if (!promoteFrom(analysisQueue_, interactiveQueue_) &&
-                        !promoteFrom(idleQueue_, interactiveQueue_) &&
-                        !promoteFrom(faceQueue_, interactiveQueue_) &&
-                        !promoteFrom(predictiveQueue_, interactiveQueue_)) {
-                        promoteFrom(visibleQueue_, interactiveQueue_);
-                    }
-                } else if (job.priority == JobPriority::Visible) {
-                    if (!promoteFrom(analysisQueue_, visibleQueue_) &&
-                        !promoteFrom(idleQueue_, visibleQueue_) &&
-                        !promoteFrom(faceQueue_, visibleQueue_)) {
-                        promoteFrom(predictiveQueue_, visibleQueue_);
-                    }
-                } else if (job.priority == JobPriority::Predictive) {
-                    if (!promoteFrom(analysisQueue_, predictiveQueue_) &&
-                        !promoteFrom(idleQueue_, predictiveQueue_)) {
-                        promoteFrom(faceQueue_, predictiveQueue_);
-                    }
-                } else if (job.priority == JobPriority::Face) {
-                    if (!promoteFrom(analysisQueue_, faceQueue_)) promoteFrom(idleQueue_, faceQueue_);
-                } else if (job.priority == JobPriority::Idle) {
-                    promoteFrom(analysisQueue_, idleQueue_);
-                }
-                cv_.notify_all();
-                return false;
-            }
-            pending_.insert(key);
-            if (job.kind == JobKind::Metadata) {
-                metadataQueue_.push_back(std::move(job));
-                cv_.notify_all();
-                return true;
-            }
-            if (job.viewLane) {
-                std::deque<WorkJob>& lane = job.viewPrefetch ? viewPrefetchQueue_ : viewQueue_;
-                lane.push_back(std::move(job));
-                // Bounded: navigation purges stale foreground work, so this only trims
-                // pathological bursts (oldest first; a repaint re-requests if needed).
-                constexpr std::size_t kViewLaneQueueLimit = 24;
-                while (lane.size() > kViewLaneQueueLimit) {
-                    const WorkJob& dropped = lane.front();
-                    pending_.erase(dropped.key);
-                    ReleaseDesiredVisualTarget(dropped.path, dropped.kind, dropped.cacheClass,
-                        dropped.generation, dropped.requestEpoch, dropped.viewportEpoch,
-                        dropped.targetSize, dropped.rawJpegPreviewOnly);
-                    lane.pop_front();
-                }
-                viewForegroundQueued_.store(static_cast<unsigned>(viewQueue_.size()), std::memory_order_release); NoteViewForegroundChanged();
-                cv_.notify_all();
-                return true;
-            }
-            switch (job.priority) {
-            case JobPriority::Interactive:
-                if (!visualPriorityPaths_.empty() &&
-                    (job.kind == JobKind::DecodeFull || job.kind == JobKind::DecodePreview) &&
-                    std::any_of(visualPriorityPaths_.begin(), visualPriorityPaths_.end(),
-                        [&](const std::wstring& path) {
-                            return _wcsicmp(job.path.c_str(), path.c_str()) == 0;
-                        })) {
-                    interactiveQueue_.push_front(std::move(job));
-                } else {
-                    interactiveQueue_.push_back(std::move(job));
-                }
+            for (auto it = viewPrefetchQueue_.begin(); it != viewPrefetchQueue_.end(); ++it) {
+                if (!sameImage(*it)) continue;
+                job.targetSize = std::max(job.targetSize, it->targetSize);
+                pending_.erase(it->key);
+                ReleaseDesiredVisualTarget(it->path, it->kind, it->cacheClass, it->generation,
+                    it->requestEpoch, it->viewportEpoch, it->targetSize, it->rawJpegPreviewOnly);
+                viewPrefetchQueue_.erase(it);
+                job.key = JobKey(job);
                 break;
-            case JobPriority::Visible: visibleQueue_.push_back(std::move(job)); break;
-            case JobPriority::Predictive: predictiveQueue_.push_back(std::move(job)); break;
-            case JobPriority::Face: faceQueue_.push_back(std::move(job)); break;
-            case JobPriority::Idle: idleQueue_.push_back(std::move(job)); break;
-            case JobPriority::Analysis: analysisQueue_.push_back(std::move(job)); break;
+            }
+            // A Single/Compare decode must run on the view lane even if an
+            // equivalent request is still queued in the shared pool (for
+            // example from before the mode switch): move it over.
+            for (std::deque<WorkJob>* poolQueue : { &interactiveQueue_, &visibleQueue_,
+                     &predictiveQueue_, &faceQueue_, &idleQueue_, &analysisQueue_ }) {
+                const auto it = std::find_if(poolQueue->begin(), poolQueue->end(),
+                    [&](const WorkJob& queued) { return SameDecodeFamily(queued, job); });
+                if (it == poolQueue->end()) continue;
+                job.targetSize = std::max(job.targetSize, it->targetSize);
+                pending_.erase(it->key);
+                ReleaseDesiredVisualTarget(it->path, it->kind, it->cacheClass, it->generation,
+                    it->requestEpoch, it->viewportEpoch, it->targetSize, it->rawJpegPreviewOnly);
+                poolQueue->erase(it);
+                job.key = JobKey(job);
             }
         }
-        cv_.notify_all();
-        RefreshReadAheadGate();
+        return true;
+    }
+
+    // Round 21 (t29u), mutex_ held. A running foreground view job of an older
+    // navigation epoch / generation is cancelled (or its result rejected by the UI),
+    // so it must not absorb a new foreground request for the same image. Before,
+    // A -> B -> A on fast key repeat dropped the new request for A and the image
+    // only appeared after the stale job unwound plus the 400 ms paint backstop.
+    bool Worker::RunningViewJobIsStaleForLocked(const WorkJob& job) const {
+        if (!job.viewLane || job.viewPrefetch) return false;
+        if (!activeViewJob_.active || activeViewJob_.prefetch) return false;
+        if (viewActiveAdoptedEpoch_.load(std::memory_order_acquire) != 0) return false;
+        if (activeViewJob_.path != job.path.wstring()) return false;
+        return quicksift::core::view_load::RunningViewJobIsStaleFor(activeViewJob_.generation,
+            activeViewJob_.requestEpoch, job.generation, job.requestEpoch);
+    }
+
+    void Worker::RaiseDesiredVisualTargetLocked(const WorkJob& job) {
+        const std::wstring family = VisualFamilyKey(job);
+        std::lock_guard desiredLock(desiredMutex_);
+        int& desired = desiredVisualTargets_[family];
+        desired = std::max(desired, job.targetSize);
+    }
+
+    std::deque<WorkJob>& Worker::QueueForPriorityLocked(JobPriority priority) {
+        switch (priority) {
+        case JobPriority::Interactive: return interactiveQueue_;
+        case JobPriority::Visible: return visibleQueue_;
+        case JobPriority::Predictive: return predictiveQueue_;
+        case JobPriority::Face: return faceQueue_;
+        case JobPriority::Idle: return idleQueue_;
+        case JobPriority::Analysis: return analysisQueue_;
+        }
+        return analysisQueue_;
+    }
+
+    // Upgrade/promote an equivalent queued decode instead of adding a new one.
+    // Returns true (after waking the workers) when the request was absorbed.
+    bool Worker::CoalesceQueuedVisualJobLocked(const WorkJob& job) {
+        auto queueForPriority = [&](JobPriority priority) -> std::deque<WorkJob>& {
+            return QueueForPriorityLocked(priority);
+        };
+        auto coalesceIn = [&](std::deque<WorkJob>& queue, bool viewLaneQueue = false) -> bool {
+            const auto it = std::find_if(queue.begin(), queue.end(), [&](const WorkJob& queued) {
+                return SameDecodeFamily(queued, job);
+            });
+            if (it == queue.end()) return false;
+            if (viewLaneQueue) {
+                // View-lane jobs never migrate into the pool's priority queues.
+                // Refresh the interaction epoch so a zoom/pan that happened
+                // while the job waited does not cancel it at dequeue.
+                it->viewInteractionEpoch = std::max(it->viewInteractionEpoch, job.viewInteractionEpoch);
+                if (it->targetSize < job.targetSize) {
+                    pending_.erase(it->key);
+                    it->targetSize = job.targetSize;
+                    it->key = JobKey(*it);
+                    pending_.insert(it->key);
+                }
+                return true;
+            }
+            if (it->targetSize < job.targetSize) {
+                pending_.erase(it->key);
+                it->targetSize = job.targetSize;
+                it->key = JobKey(*it);
+                pending_.insert(it->key);
+            }
+            MergeFilmstripOwnership(*it, job); // round 23
+            // Priority is monotonic: a later request may promote an
+            // existing decode, but it may never demote one that was
+            // already classified as more important. This is especially
+            // important for viewport thumbnails, which are Interactive.
+            if (IsHigherPriority(job.priority, it->priority)) {
+                PromoteQueuedJob(queue, it, queueForPriority(job.priority), job.priority);
+            }
+            return true;
+        };
+        if (coalesceIn(viewQueue_, true) || coalesceIn(viewPrefetchQueue_, true) ||
+            (!job.viewLane && (coalesceIn(interactiveQueue_) || coalesceIn(visibleQueue_) ||
+            coalesceIn(predictiveQueue_) || coalesceIn(faceQueue_) || coalesceIn(idleQueue_) || coalesceIn(analysisQueue_)))) {
+            cv_.notify_all();
+            return true;
+        }
+        return false;
+    }
+
+    // The same key is already queued or posted: refresh epochs / promote the queued
+    // copy. Returns true when the request was absorbed this way.
+    bool Worker::AbsorbPendingDuplicateLocked(const WorkJob& job) {
+        const std::wstring& key = job.key;
+        if (pending_.contains(key) && job.viewLane) {
+            // Queued on the view lane or posted and not yet integrated by the UI.
+            for (std::deque<WorkJob>* lane : { &viewQueue_, &viewPrefetchQueue_ }) {
+                for (WorkJob& queued : *lane) {
+                    if (queued.key == key)
+                        queued.viewInteractionEpoch = std::max(queued.viewInteractionEpoch, job.viewInteractionEpoch);
+                }
+            }
+            return true;
+        }
+        if (pending_.contains(key) && job.filmstripOwned) {
+            // Round 23: a filmstrip request absorbed by a queued duplicate keeps it
+            // under the strip's window rule (a grid job stays protected while the
+            // grid still wants it: filmstrip::DecodeDropped).
+            for (std::deque<WorkJob>* queue : { &interactiveQueue_, &visibleQueue_, &predictiveQueue_,
+                &faceQueue_, &idleQueue_, &analysisQueue_ }) {
+                for (WorkJob& queued : *queue) {
+                    if (queued.key == key) MergeFilmstripOwnership(queued, job);
+                }
+            }
+        }
+        if (pending_.contains(key)) {
+            auto promoteFrom = [&](std::deque<WorkJob>& queue, std::deque<WorkJob>& destination) {
+                const auto it = std::find_if(queue.begin(), queue.end(), [&](const WorkJob& queued) {
+                    return queued.key == key;
+                });
+                if (it == queue.end()) return false;
+                WorkJob promoted = std::move(*it);
+                queue.erase(it);
+                promoted.priority = job.priority;
+                promoted.requestEpoch = std::max(promoted.requestEpoch, job.requestEpoch);
+                destination.push_front(std::move(promoted));
+                return true;
+            };
+            if (job.priority == JobPriority::Interactive) {
+                if (!promoteFrom(analysisQueue_, interactiveQueue_) &&
+                    !promoteFrom(idleQueue_, interactiveQueue_) &&
+                    !promoteFrom(faceQueue_, interactiveQueue_) &&
+                    !promoteFrom(predictiveQueue_, interactiveQueue_)) {
+                    promoteFrom(visibleQueue_, interactiveQueue_);
+                }
+            } else if (job.priority == JobPriority::Visible) {
+                if (!promoteFrom(analysisQueue_, visibleQueue_) &&
+                    !promoteFrom(idleQueue_, visibleQueue_) &&
+                    !promoteFrom(faceQueue_, visibleQueue_)) {
+                    promoteFrom(predictiveQueue_, visibleQueue_);
+                }
+            } else if (job.priority == JobPriority::Predictive) {
+                if (!promoteFrom(analysisQueue_, predictiveQueue_) &&
+                    !promoteFrom(idleQueue_, predictiveQueue_)) {
+                    promoteFrom(faceQueue_, predictiveQueue_);
+                }
+            } else if (job.priority == JobPriority::Face) {
+                if (!promoteFrom(analysisQueue_, faceQueue_)) promoteFrom(idleQueue_, faceQueue_);
+            } else if (job.priority == JobPriority::Idle) {
+                promoteFrom(analysisQueue_, idleQueue_);
+            }
+            cv_.notify_all();
+            return true;
+        }
+        return false;
+    }
+
+    // Queue new work. Metadata and view-lane jobs wake the workers here and return
+    // false (no read-ahead refresh); pool jobs return true and the caller wakes the
+    // workers after releasing mutex_ and refreshes the read-ahead gate.
+    bool Worker::PushNewJobLocked(WorkJob&& job) {
+        const std::wstring& key = job.key;
+        pending_.insert(key);
+        if (job.kind == JobKind::Metadata) {
+            metadataQueue_.push_back(std::move(job));
+            cv_.notify_all();
+            return false;
+        }
+        if (job.viewLane) {
+            std::deque<WorkJob>& lane = job.viewPrefetch ? viewPrefetchQueue_ : viewQueue_;
+            lane.push_back(std::move(job));
+            // Bounded: navigation purges stale foreground work, so this only trims
+            // pathological bursts (oldest first; a repaint re-requests if needed).
+            constexpr std::size_t kViewLaneQueueLimit = 24;
+            while (lane.size() > kViewLaneQueueLimit) {
+                const WorkJob& dropped = lane.front();
+                pending_.erase(dropped.key);
+                ReleaseDesiredVisualTarget(dropped.path, dropped.kind, dropped.cacheClass,
+                    dropped.generation, dropped.requestEpoch, dropped.viewportEpoch,
+                    dropped.targetSize, dropped.rawJpegPreviewOnly);
+                lane.pop_front();
+            }
+            viewForegroundQueued_.store(static_cast<unsigned>(viewQueue_.size()), std::memory_order_release); NoteViewForegroundChanged();
+            cv_.notify_all();
+            return false;
+        }
+        switch (job.priority) {
+        case JobPriority::Interactive:
+            if (!visualPriorityPaths_.empty() &&
+                (job.kind == JobKind::DecodeFull || job.kind == JobKind::DecodePreview) &&
+                std::any_of(visualPriorityPaths_.begin(), visualPriorityPaths_.end(),
+                    [&](const std::wstring& path) {
+                        return _wcsicmp(job.path.c_str(), path.c_str()) == 0;
+                    })) {
+                interactiveQueue_.push_front(std::move(job));
+            } else {
+                interactiveQueue_.push_back(std::move(job));
+            }
+            break;
+        case JobPriority::Visible: visibleQueue_.push_back(std::move(job)); break;
+        case JobPriority::Predictive: predictiveQueue_.push_back(std::move(job)); break;
+        case JobPriority::Face: faceQueue_.push_back(std::move(job)); break;
+        case JobPriority::Idle: idleQueue_.push_back(std::move(job)); break;
+        case JobPriority::Analysis: analysisQueue_.push_back(std::move(job)); break;
+        }
         return true;
     }
 
@@ -2115,7 +2257,22 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
                 job = std::move(queue.front());
                 queue.pop_front();
             };
-            if (!interactiveQueue_.empty()) popFront(interactiveQueue_);
+            // Round 22: Interactive Thumbnail-class decodes (filmstrip cells) share the
+            // one-thumbnail cap (filmstrip::ThumbnailDecodeAdmitted) so a fast step
+            // through Single View cannot run several cell decodes beside the image
+            // on screen. Other interactive work (faces, EXIF, views) is unaffected.
+            const bool thumbnailAdmitted = quicksift::core::filmstrip::ThumbnailDecodeAdmitted(
+                true, activeThumbnailJobs_.load(std::memory_order_acquire), prio::kPoolCapDuringViewLoad);
+            const auto interactiveEligible = std::find_if(interactiveQueue_.begin(), interactiveQueue_.end(),
+                [&](const WorkJob& candidate) {
+                    const bool thumbnail = candidate.cacheClass == CacheClass::Thumbnail &&
+                        (candidate.kind == JobKind::DecodePreview || candidate.kind == JobKind::DecodeFull);
+                    return !thumbnail || thumbnailAdmitted;
+                });
+            if (interactiveEligible != interactiveQueue_.end()) {
+                job = std::move(*interactiveEligible);
+                interactiveQueue_.erase(interactiveEligible);
+            }
             else if (!visibleQueue_.empty() && prio::PoolLaneAdmitted(prio::PoolLane::Visible, true,
                 activeThumbnailJobs_.load(std::memory_order_acquire))) popFront(visibleQueue_);
             else return {};
@@ -2314,6 +2471,9 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         return true;
     }
 
+    // Worker thread main loop (0.9.5.0 round 19: split into the wait, admission,
+    // per-kind execution, publication and accounting stages with no behaviour
+    // change; the loop keeps every continue/break of the original).
     void Worker::Run(bool allowIdle, size_t threadIndex, bool metadataOnly, bool viewLane) {
         gThreadWorkerOwner = this;
         gThreadWorkerIndex = threadIndex;
@@ -2329,130 +2489,11 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
         if (FAILED(hr)) CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
 
+        std::chrono::steady_clock::time_point metadataLaneWaitStart{};
         for (;;) {
             WorkJob job;
-            {
-                std::unique_lock lock(mutex_);
-                for (;;) {
-                    if (stopping_) break;
-                    if (metadataOnly) {
-                        // Metadata is strictly background work. Do not begin an
-                        // Exiv2/XMP read while any visual decode is active or queued.
-                        // A separate thread is not sufficient: both lanes still hit
-                        // the same storage device, and RAW metadata can hold Exiv2's
-                        // process-wide guard for a long time.
-                        if (activeVisualJobs_.load(std::memory_order_acquire) != 0 ||
-                            !interactiveQueue_.empty() || !visibleQueue_.empty() || !viewQueue_.empty() ||
-                            exclusivePathWrites_.load(std::memory_order_acquire) != 0 ||
-                            quicksift::EmbeddedMetadataWritePreferred()) {
-                            // Viewing and culling writes outrank metadata reads.
-                            // Do not start another Exiv2 call while a rating/pick
-                            // batch is waiting or while a visible decode is active.
-                            cv_.wait_for(lock, std::chrono::milliseconds(8));
-                            continue;
-                        }
-                        if (!metadataQueue_.empty()) {
-                            job = std::move(metadataQueue_.front());
-                            metadataQueue_.pop_front();
-                            break;
-                        }
-                        cv_.wait(lock);
-                        continue;
-                    }
-                    const std::uint64_t requestedTrim = decoderSessionTrimEpoch_.load(std::memory_order_acquire);
-                    if (requestedTrim != observedDecoderSessionTrim) {
-                        lock.unlock();
-                        if (exclusivePathWrites_.load(std::memory_order_acquire) != 0)
-                            ReleaseBlockedThreadWicDecoderSessions();
-                        else
-                            ReleaseThreadWicDecoderSessions();
-                        quicksift::ReleaseThreadFaceDetector();
-                        observedDecoderSessionTrim = requestedTrim;
-                        lock.lock();
-                        continue;
-                    }
-                    if (viewLane) {
-                        // Dedicated Single/Compare lane: services only the view queues.
-                        if (!viewQueue_.empty() || !viewPrefetchQueue_.empty()) {
-                            job = PopViewWork();
-                            break;
-                        }
-                        cv_.wait(lock);
-                        continue;
-                    }
-                    if (ViewForegroundActiveLocked()) {
-                        // Single/Compare is decoding the image on screen (P2): keep
-                        // the disk and decoder for it. Interactive work and at most
-                        // one thumbnail decode proceed; everything else waits. The
-                        // view lane notifies cv_ when it finishes; the bounded wait
-                        // covers a missed notification.
-                        namespace prio = quicksift::core::priority;
-                        const bool admitted = !interactiveQueue_.empty() ||
-                            (!visibleQueue_.empty() && prio::PoolLaneAdmitted(prio::PoolLane::Visible, true,
-                                activeThumbnailJobs_.load(std::memory_order_acquire)));
-                        if (admitted) {
-                            job = PopWork(false, true);
-                            const bool emptySentinel = job.path.empty() &&
-                                job.kind == JobKind::DecodeFull && job.targetSize == 0;
-                            if (!emptySentinel) break;
-                        }
-                        if (quicksift::diagnostics::VerboseLogging()) {
-                            // Hot path: verbose-only and rate-limited.
-                            static quicksift::core::LogRateLimiter viewHoldLimiter(4, std::chrono::seconds(5));
-                            std::uint64_t suppressed = 0;
-                            if (viewHoldLimiter.Allow(&suppressed)) {
-                                QS_LOG_EVENT(quicksift::diagnostics::Level::Trace,
-                                    quicksift::diagnostics::category::kViewLane, L"background_held_for_view",
-                                    { L"face_queued", std::to_wstring(faceQueue_.size()) },
-                                    { L"predictive_queued", std::to_wstring(predictiveQueue_.size()) },
-                                    { L"idle_queued", std::to_wstring(idleQueue_.size()) },
-                                    { L"suppressed", std::to_wstring(suppressed) });
-                            }
-                        }
-                        cv_.wait_for(lock, std::chrono::milliseconds(8));
-                        continue;
-                    }
-                    const auto now = std::chrono::steady_clock::now();
-                    if (!interactiveQueue_.empty() || !visibleQueue_.empty()) {
-                        job = PopWork(false);
-                        break;
-                    }
-                    // One idle-capable lane receives a guarded metadata turn after
-                    // a bounded predictive/face burst. Interactive and visible work
-                    // remain absolute priority, while folder metadata cannot starve
-                    // forever during sustained scrolling or prefetch replenishment.
-                    if (allowIdle && ShouldServiceIdleAfterForegroundBurst(
-                        !interactiveQueue_.empty(), !visibleQueue_.empty(),
-                        now >= idleNotBefore_, !idleQueue_.empty(), foregroundBurstSinceIdle_)) {
-                        job = PopWork(true);
-                        break;
-                    }
-                    // P3 search demand pauses pure P5 work (face analysis, sharpness /
-                    // analysis); prefetch and folder metadata keep running.
-                    const bool searchPausesP5 = SearchPausesBackgroundAnalysis();
-                    if (!predictiveQueue_.empty() || (!faceQueue_.empty() && !searchPausesP5)) {
-                        job = PopWork(false);
-                        const bool emptySentinel = job.path.empty() &&
-                            job.kind == JobKind::DecodeFull && job.targetSize == 0;
-                        if (!emptySentinel) break;
-                    }
-                    const bool pausedWork = searchPausesP5 &&
-                        (!faceQueue_.empty() || !analysisQueue_.empty());
-                    if (allowIdle && (!idleQueue_.empty() || (!analysisQueue_.empty() && !searchPausesP5))) {
-                        if (now >= idleNotBefore_) {
-                            job = PopWork(true);
-                            const bool emptySentinel = job.path.empty() &&
-                                job.kind == JobKind::DecodeFull && job.targetSize == 0;
-                            if (!emptySentinel) break;
-                            cv_.wait_for(lock, std::chrono::milliseconds(50));
-                        } else cv_.wait_until(lock, idleNotBefore_);
-                    } else if (pausedWork) {
-                        // Paused, not starved: re-check when search ends (no notify).
-                        cv_.wait_for(lock, std::chrono::milliseconds(250));
-                    } else cv_.wait(lock);
-                }
-                if (stopping_) break;
-            }
+            if (!WaitForNextJob(job, allowIdle, metadataOnly, viewLane, observedDecoderSessionTrim,
+                    metadataLaneWaitStart)) break;
 
             const auto dequeuedAt = std::chrono::steady_clock::now();
             const double queueWaitMs = job.enqueuedAt == std::chrono::steady_clock::time_point{} ? 0.0 :
@@ -2461,27 +2502,11 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
                 std::this_thread::yield();
                 continue;
             }
-            const bool visualJob = job.kind == JobKind::DecodePreview ||
-                job.kind == JobKind::DecodeFull || job.kind == JobKind::DecodeTile ||
-                job.kind == JobKind::Face;
-            const bool tileJob = job.kind == JobKind::DecodeTile;
-            QS_LOG_EVENT(quicksift::diagnostics::Level::Trace, L"Worker", L"job_dequeued",
-                {L"job", JobKindName(job.kind)},
-                {L"priority", JobPriorityName(job.priority)},
-                {L"file", DiagnosticFilename(job.path)},
-                {L"target", std::to_wstring(job.targetSize)},
-                {L"generation", std::to_wstring(job.generation)},
-                {L"request_epoch", std::to_wstring(job.requestEpoch)},
-                {L"viewport_epoch", std::to_wstring(job.viewportEpoch)},
-                {L"queue_ms", std::to_wstring(queueWaitMs)});
-            // Mark visual work as active immediately after dequeue, before decoded-memory
-            // admission. A visible decode can spend substantial time waiting for the
-            // shared decode budget; metadata must not start a competing disk/RAW read
-            // during that gap simply because the visual job has not reached its decoder yet.
-            if (visualJob) activeVisualJobs_.fetch_add(1, std::memory_order_acq_rel);
-            const bool thumbnailJob = job.cacheClass == CacheClass::Thumbnail &&
-                (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull);
-            if (thumbnailJob) activeThumbnailJobs_.fetch_add(1, std::memory_order_acq_rel);
+            const JobActivity activity = BeginJobActivity(job, viewLane, queueWaitMs);
+            const bool visualJob = activity.visualJob;
+            const bool tileJob = activity.tileJob;
+            const bool foregroundVisual = activity.foregroundVisual;
+            const bool thumbnailJob = activity.thumbnailJob;
             const size_t decodeReservationBytes = EstimatedDecodeReservation(job);
             const auto budgetStarted = std::chrono::steady_clock::now();
             // The view lane has its own budget so thumbnail decodes holding every
@@ -2493,79 +2518,23 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
             const double budgetWaitMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - budgetStarted).count();
             if (decodeReservationBytes != 0 && !decodeReservation) {
-                const bool cancelled = IsCancelled(job);
-                if (visualJob || viewLane) ReleaseActiveVisualFamily(job, viewLane);
-                if (visualJob) {
-                    activeVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
-                    if (thumbnailJob) activeThumbnailJobs_.fetch_sub(1, std::memory_order_acq_rel);
-                    cv_.notify_all();
-                }
-                AcknowledgeUnpostedJob(job, job.key);
-                TryPostMetadataAbort(job);
-                FinishAnalysisJob(job);
-                RecordTelemetry(job, queueWaitMs, budgetWaitMs, 0.0, cancelled, false);
-                if (tileJob) activeTileJobs_.fetch_sub(1, std::memory_order_acq_rel);
+                AbandonJobWithoutBudget(job, viewLane, activity, queueWaitMs, budgetWaitMs);
                 if (stoppingAtomic_.load(std::memory_order_acquire)) break;
                 cv_.notify_all();
                 continue;
             }
             const bool oversizedReservation = decodeReservation && decodeReservation->Oversized();
-            if (oversizedReservation) {
-                const std::size_t configuredLimit = jobBudget ? jobBudget->Limit() : 0;
-                QS_LOG_WARNING(L"Performance", L"Oversized decode admitted for " +
-                    job.path.filename().wstring() + L": reservation " +
-                    std::to_wstring(decodeReservationBytes / kMebibyte) + L" MiB exceeds the " +
-                    std::to_wstring(configuredLimit / kMebibyte) +
-                    L" MiB runtime ceiling; encoded read-ahead is paused until the exclusive decode releases.");
-                std::lock_guard readAheadLock(readAheadGateMutex_);
-                readAhead_.CancelAll();
-                ConfigureReadAheadLocked();
-            }
+            if (oversizedReservation) PauseReadAheadForOversizedDecode(job, decodeReservationBytes, jobBudget);
             const bool handleJobStarted = TryBeginHandleJob(job);
             const bool pathBlocked = IsPathBlockedForDecoder(job.path);
             if ((!handleJobStarted || IsCancelled(job)) && job.kind == JobKind::Metadata && pathBlocked &&
                 !stoppingAtomic_.load(std::memory_order_acquire)) {
-                if (handleJobStarted) EndHandleJob(job);
-
-                // Exclusive file operations intentionally block metadata reads. Keep
-                // the pending key alive and put the metadata job back after the write
-                // releases the path instead of consuming its UI in-flight slot as a
-                // permanent failure.
-                std::unique_lock blockedLock(blockedMutex_);
-                blockedCv_.wait(blockedLock, [this, &job] {
-                    return stoppingAtomic_.load(std::memory_order_acquire) ||
-                        FindBlockedPathLocked(job.path.c_str()) == blockedPaths_.end();
-                });
-                blockedLock.unlock();
-                if (stoppingAtomic_.load(std::memory_order_acquire)) {
-                    AcknowledgeUnpostedJob(job, job.key);
-                    TryPostMetadataAbort(job);
-                    cv_.notify_all();
-                    continue;
-                }
-                {
-                    std::lock_guard lock(mutex_);
-                    if (!stopping_) {
-                        job.enqueuedAt = std::chrono::steady_clock::now();
-                        metadataQueue_.push_front(std::move(job));
-                    }
-                }
-                cv_.notify_all();
+                RequeueBlockedMetadataJob(std::move(job), handleJobStarted);
                 continue;
             }
             if (!handleJobStarted || IsCancelled(job)) {
-                if (visualJob || viewLane) ReleaseActiveVisualFamily(job, viewLane);
-                if (visualJob) {
-                    activeVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
-                    if (thumbnailJob) activeThumbnailJobs_.fetch_sub(1, std::memory_order_acq_rel);
-                }
-                if (handleJobStarted) EndHandleJob(job);
-                AcknowledgeUnpostedJob(job, job.key);
-                TryPostMetadataAbort(job);
-                FinishAnalysisJob(job);
-                RecordTelemetry(job, queueWaitMs, budgetWaitMs, 0.0, true, oversizedReservation);
-                if (tileJob) activeTileJobs_.fetch_sub(1, std::memory_order_acq_rel);
-                cv_.notify_all();
+                AbandonCancelledJob(job, viewLane, activity, handleJobStarted, queueWaitMs, budgetWaitMs,
+                    oversizedReservation);
                 continue;
             }
             if (job.timeoutDeferred) {
@@ -2578,504 +2547,24 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
             const auto executionStarted = std::chrono::steady_clock::now();
             job.startedAt = executionStarted;
             double fingerprintMs = 0.0;
-            double cacheLookupMs = 0.0;
-            double decodePathMs = 0.0;
             double resultPostMs = 0.0;
             bool resultPosted = false;
             std::shared_ptr<WorkResult> result;
-            bool resultFromPersistentCache = false;
             bool resultWorkFailed = false;
+            JobRunContext run;
             try {
-                result = std::make_shared<WorkResult>();
-                result->decodeReservation = std::move(decodeReservation);
-                result->kind = job.kind;
-                result->priority = job.priority;
-                result->cacheClass = job.cacheClass;
-                result->path = job.path;
-                result->targetSize = job.targetSize;
-                result->generation = job.generation;
-                result->requestEpoch = job.requestEpoch;
-                result->viewportEpoch = job.viewportEpoch;
-                result->viewInteractionEpoch = job.viewInteractionEpoch;
-                result->metadataRevision = job.metadataRevision;
-                result->rawJpegPreviewOnly = job.rawJpegPreviewOnly;
-                result->retryAttempt = job.retryAttempt;
-                result->forceWic = job.forceWic;
-                result->viewLane = job.viewLane;
-                result->pendingKey = job.key;
-                result->tileX = job.tileX;
-                result->tileY = job.tileY;
-                result->tileWidth = job.tileWidth;
-                result->tileHeight = job.tileHeight;
-                result->tileLevel = job.tileLevel;
-
-                uint64_t fileSize = 0;
-                int64_t modifiedStamp = 0;
-                int64_t sidecarStamp = 0;
-                const auto fingerprintStarted = std::chrono::steady_clock::now();
-                const bool fingerprinted = FileFingerprint(job.path, fileSize, modifiedStamp);
-                fingerprintMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - fingerprintStarted).count();
-                if (fingerprinted &&
-                    (job.kind == JobKind::Metadata || job.kind == JobKind::Exif || job.kind == JobKind::Face)) {
-                    sidecarStamp = MetadataStampFor(job.path);
-                }
-                if (fingerprinted) {
-                    result->fileSize = fileSize;
-                    result->modifiedStamp = modifiedStamp;
-                    result->sidecarStamp = sidecarStamp;
-                }
-                bool queueBitmapCacheWrite = false;
-                if (!IsCancelled(job)) {
-                    if (job.kind == JobKind::Metadata) {
-                        if (fingerprinted && persistentCache_) {
-                            if (const auto cached = persistentCache_->LookupRecord(
-                                job.path, fileSize, modifiedStamp, sidecarStamp, false, false)) {
-                                result->rating = cached->rating;
-                                result->colorLabel = cached->colorLabel;
-                                result->pickState = cached->pickState;
-                                result->ratingKnowledge = cached->ratingKnowledge;
-                                result->colorLabelKnowledge = cached->colorLabelKnowledge;
-                                result->pickStateKnowledge = cached->pickStateKnowledge;
-                                result->rawRating = cached->rawRating;
-                                result->rawColorLabel = cached->rawColorLabel;
-                                result->rawPickState = cached->rawPickState;
-                            } else {
-                                const PhotoMetadataValues metadata = ReadPhotoMetadata(job.path);
-                                result->rating = metadata.rating.value;
-                                result->colorLabel = metadata.colorLabel.value;
-                                result->pickState = metadata.pickState.value;
-                                result->ratingKnowledge = metadata.rating.knowledge;
-                                result->colorLabelKnowledge = metadata.colorLabel.knowledge;
-                                result->pickStateKnowledge = metadata.pickState.knowledge;
-                                result->rawRating = metadata.rating.rawValue;
-                                result->rawColorLabel = metadata.colorLabel.rawValue;
-                                result->rawPickState = metadata.pickState.rawValue;
-                            }
-                        } else {
-                            const PhotoMetadataValues metadata = ReadPhotoMetadata(job.path);
-                            result->rating = metadata.rating.value;
-                            result->colorLabel = metadata.colorLabel.value;
-                            result->pickState = metadata.pickState.value;
-                            result->ratingKnowledge = metadata.rating.knowledge;
-                            result->colorLabelKnowledge = metadata.colorLabel.knowledge;
-                            result->pickStateKnowledge = metadata.pickState.knowledge;
-                            result->rawRating = metadata.rating.rawValue;
-                            result->rawColorLabel = metadata.colorLabel.rawValue;
-                            result->rawPickState = metadata.pickState.rawValue;
-                        }
-                    } else if (job.kind == JobKind::Exif) {
-                        if (fingerprinted && persistentCache_) {
-                            if (auto cached = persistentCache_->LookupRecord(
-                                job.path, fileSize, modifiedStamp, sidecarStamp, true, false);
-                                cached && !cached->exifText.empty()) {
-                                result->exifText = std::move(cached->exifText);
-                            } else {
-                                result->exifText = BuildExifText(job.path);
-                            }
-                        } else {
-                            result->exifText = BuildExifText(job.path);
-                        }
-                    } else if (job.kind == JobKind::Face) {
-                        if (fingerprinted && persistentCache_) {
-                            if (auto cached = persistentCache_->LookupRecord(
-                                job.path, fileSize, modifiedStamp, sidecarStamp, false, true);
-                                cached) {
-                                // Persisted FaceLock selection (normalized box) travels with the
-                                // result; the UI adopts it only if the session has no choice yet.
-                                result->faceSelectionKnown = cached->faceSelectionKnown;
-                                if (cached->hasFaceSelection) result->faceSelection = cached->faceSelection;
-                                if (cached->facesScanned) {
-                                    result->faces = std::move(cached->faces);
-                                    result->facesScanned = true;
-                                    // LookupRecord already downgraded quality from an older
-                                    // analysis version to "not scanned" (lazy re-analysis).
-                                    result->faceBlurScanned = cached->faceBlurScanned;
-                                    result->faceBlurry = cached->faceBlurry;
-                                    result->faceSharpness = cached->faceSharpness;
-                                    if (result->faceBlurScanned) {
-                                        result->faceQualities = std::move(cached->faceQualities);
-                                    }
-                                }
-                            }
-                        }
-                        const bool needsDetection = !result->facesScanned;
-                        const bool needsSharpness = result->facesScanned &&
-                            !result->faces.empty() && !result->faceBlurScanned;
-                        if (!needsDetection && !needsSharpness) {
-                            result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Completed;
-                        } else if (needsDetection) {
-                            const auto capability = quicksift::QueryFaceDetectorCapability();
-                            if (capability == quicksift::core::FaceDetectorCapability::Unavailable) {
-                                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Unavailable;
-                            } else if (capability != quicksift::core::FaceDetectorCapability::Available) {
-                                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::TransientFailure;
-                            }
-                        }
-
-                        WorkResult preview;
-                        bool decodedPreview = false;
-                        const auto cancelled = [this, job] { return IsCancelled(job); };
-                        const int faceTarget = std::max(kFaceDecodeSize, job.targetSize);
-                        if (result->faceAnalysisOutcome == quicksift::core::FaceAnalysisOutcome::None &&
-                            factory && !IsCancelled(job) && (needsDetection || needsSharpness)) {
-                            preview.path = job.path;
-                            WorkJob faceDecodeJob{ JobKind::Face, job.priority, CacheClass::Preview,
-                                job.path, faceTarget, job.generation, job.requestEpoch };
-                            faceDecodeJob.rawJpegPreviewOnly = job.rawJpegPreviewOnly;
-                            const bool rawJpegOnly = job.rawJpegPreviewOnly &&
-                                IsRawExtension(ExtensionLower(job.path));
-                            decodedPreview = DecodeWithBundledGuarded(faceDecodeJob, preview, true);
-                            if (!decodedPreview && !rawJpegOnly) {
-                                decodedPreview = DecodeWithWic(factory.Get(), job.path, faceTarget,
-                                    preview, true, cancelled) || DecodeWithShell(job.path, faceTarget, preview);
-                            }
-                        }
-                        if (decodedPreview && !IsCancelled(job)) {
-                            if (needsDetection) {
-                                result->faceAnalysisOutcome = quicksift::DetectFacesFastBgra(
-                                    preview.pixels.data(), preview.width, preview.height, result->faces);
-                                result->facesScanned = result->faceAnalysisOutcome ==
-                                    quicksift::core::FaceAnalysisOutcome::Completed;
-                            }
-                            if (!needsDetection && !result->faces.empty()) {
-                                // Faces cached by an older build were ordered largest-first;
-                                // re-rank so faces[0] is the centre-closest default target.
-                                result->faces.erase(std::remove_if(result->faces.begin(), result->faces.end(),
-                                    [&](const quicksift::NormalizedFaceRect& face) {
-                                        return quicksift::core::IsNoiseFace(face, preview.width, preview.height);
-                                    }), result->faces.end());
-                                quicksift::core::RankFacesForAnchor(result->faces,
-                                    static_cast<float>(static_cast<double>(preview.width) /
-                                        static_cast<double>(std::max(1, preview.height))));
-                            }
-                            if (result->facesScanned && !result->faces.empty()) {
-                                // Per-face quality: every face is judged (defocus, motion blur,
-                                // closed eyes). Faces too small in this decode are re-judged
-                                // once on a larger decode (kFaceSharpnessDecodeSize up to
-                                // kFaceQualityMaxDecodeSize); faces still too small after that
-                                // stay TooSmall and are never flagged.
-                                std::vector<quicksift::FaceQualityRecord> qualities;
-                                const int requiredEdge = AnalyzeFaceQualitiesBgra(preview.pixels.data(),
-                                    preview.width, preview.height, result->faces, qualities);
-                                const int previewEdge = std::max(preview.width, preview.height);
-                                const int sourceEdge = std::max(preview.sourceWidth, preview.sourceHeight);
-                                const int largerTarget = std::min(quicksift::core::kFaceQualityMaxDecodeSize,
-                                    std::max(kFaceSharpnessDecodeSize, requiredEdge));
-                                const bool largerHelps = requiredEdge > 0 &&
-                                    largerTarget > previewEdge + previewEdge / 8 &&
-                                    (sourceEdge <= 0 || sourceEdge > previewEdge + previewEdge / 8);
-                                FaceSharpnessResult sharpness;
-                                if (!largerHelps) {
-                                    sharpness = SummarizeFaceQualities(qualities);
-                                } else if (!IsCancelled(job)) {
-                                    std::vector<std::size_t> smallFaces;
-                                    for (std::size_t index = 0; index < qualities.size(); ++index) {
-                                        if ((qualities[index].flags & quicksift::FaceQualityFlag::TooSmall) != 0)
-                                            smallFaces.push_back(index);
-                                    }
-                                    // The detection preview is no longer needed; release it
-                                    // before the larger decode so the peak stays bounded.
-                                    std::vector<std::uint8_t>().swap(preview.pixels);
-                                    WorkResult largerPreview;
-                                    WorkJob sharpnessJob{ JobKind::Face, job.priority, CacheClass::Preview,
-                                        job.path, largerTarget, job.generation, job.requestEpoch };
-                                    sharpnessJob.rawJpegPreviewOnly = job.rawJpegPreviewOnly;
-                                    const bool rawJpegOnly = job.rawJpegPreviewOnly &&
-                                        IsRawExtension(ExtensionLower(job.path));
-                                    bool decodedLarger = DecodeWithBundledGuarded(
-                                        sharpnessJob, largerPreview, true);
-                                    if (!decodedLarger && !rawJpegOnly) {
-                                        decodedLarger = DecodeWithWic(factory.Get(), job.path,
-                                            largerTarget, largerPreview, true, cancelled) ||
-                                            DecodeWithShell(job.path, largerTarget, largerPreview);
-                                    }
-                                    if (decodedLarger && !IsCancelled(job) && largerPreview.width > 0 &&
-                                        largerPreview.height > 0 && largerPreview.pixels.size() >=
-                                        static_cast<std::size_t>(largerPreview.width) *
-                                        static_cast<std::size_t>(largerPreview.height) * 4u) {
-                                        AnalyzeFaceQualitiesBgra(largerPreview.pixels.data(),
-                                            largerPreview.width, largerPreview.height, result->faces,
-                                            qualities, &smallFaces);
-                                        sharpness = SummarizeFaceQualities(qualities);
-                                    }
-                                }
-                                result->faceBlurScanned = sharpness.scanned;
-                                result->faceBlurry = sharpness.scanned && sharpness.blurry;
-                                result->faceSharpness = sharpness.scanned ? sharpness.score : 0.0f;
-                                if (sharpness.scanned) result->faceQualities = std::move(qualities);
-                                else result->faceQualities.clear();
-                                result->faceAnalysisOutcome = sharpness.scanned ?
-                                    quicksift::core::FaceAnalysisOutcome::Completed :
-                                    quicksift::core::FaceAnalysisOutcome::TransientFailure;
-                            } else if (result->facesScanned) {
-                                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Completed;
-                            }
-                        } else if (!IsCancelled(job) &&
-                            result->faceAnalysisOutcome == quicksift::core::FaceAnalysisOutcome::None &&
-                            (needsDetection || needsSharpness)) {
-                            result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::TransientFailure;
-                        }
-                    } else if (job.kind == JobKind::DecodeTile) {
-                        bool loadedTile = false;
-                        const bool rawJpegOnly = job.rawJpegPreviewOnly &&
-                            IsRawExtension(ExtensionLower(job.path));
-                        if (fingerprinted && persistentCache_ && profile_.enablePersistentPyramid &&
-                            !rawJpegOnly) {
-                            quicksift::CachedBitmapData cachedTile;
-                            if (persistentCache_->LoadPyramidTile(job.path, fileSize, modifiedStamp,
-                                sidecarStamp, job.tileLevel, job.tileX, job.tileY, kTileSourceSize, cachedTile)) {
-                                result->width = cachedTile.width;
-                                result->height = cachedTile.height;
-                                result->sourceWidth = cachedTile.sourceWidth;
-                                result->sourceHeight = cachedTile.sourceHeight;
-                                result->tileX = job.tileX;
-                                result->tileY = job.tileY;
-                                result->tileWidth = job.tileWidth;
-                                result->tileHeight = job.tileHeight;
-                                result->tileLevel = job.tileLevel;
-                                result->pixels = std::move(cachedTile.pixels);
-                                result->fromPersistentCache = true;
-                                resultFromPersistentCache = true;
-                                loadedTile = true;
-                            }
-                        }
-                        if (!loadedTile && factory && !rawJpegOnly && !IsCancelled(job)) {
-                            const auto cancelled = [this, job] { return IsCancelled(job); };
-                            loadedTile = DecodeTileWithWic(factory.Get(), job.path, job, *result, cancelled);
-                            queueBitmapCacheWrite = loadedTile && fingerprinted && persistentCache_ &&
-                                profile_.enablePersistentPyramid && !IsCancelled(job);
-                        }
-                    } else if (factory) {
-                        bool loaded = false;
-                        const bool rawJpegOnly = job.rawJpegPreviewOnly &&
-                            IsRawExtension(ExtensionLower(job.path));
-                        if (fingerprinted && persistentCache_ && !rawJpegOnly) {
-                            quicksift::CachedBitmapData cached;
-                            const auto cacheLookupStarted = std::chrono::steady_clock::now();
-                            const bool cacheHit = persistentCache_->LoadCachedBitmap(
-                                job.path, fileSize, modifiedStamp, sidecarStamp, job.targetSize,
-                                static_cast<int>(job.cacheClass), cached);
-                            cacheLookupMs = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - cacheLookupStarted).count();
-                            if (cacheHit) {
-                                persistentCacheHits_.fetch_add(1, std::memory_order_relaxed);
-                                result->width = cached.width;
-                                result->height = cached.height;
-                                result->sourceWidth = cached.sourceWidth;
-                                result->sourceHeight = cached.sourceHeight;
-                                result->previewOnly = cached.previewOnly;
-                                result->pixels = std::move(cached.pixels);
-                                result->fromPersistentCache = true;
-                                loaded = true;
-                            } else {
-                                persistentCacheMisses_.fetch_add(1, std::memory_order_relaxed);
-                            }
-                        }
-                        if (!loaded && !IsCancelled(job)) {
-                            const auto decodeStarted = std::chrono::steady_clock::now();
-                            const bool raw = IsRawExtension(ExtensionLower(job.path));
-                            if (job.kind == JobKind::DecodePreview) {
-                                result->previewOnly = raw;
-                                const auto cancelled = [this, job] { return IsCancelled(job); };
-                                if (job.cacheClass == CacheClass::Thumbnail && job.forceWic) {
-                                    // Final fallback attempt of the retry policy: WIC
-                                    // (embedded preview / system codec), then the Shell
-                                    // thumbnail provider before the image is marked failed.
-                                    loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
-                                    if (!loaded && !IsCancelled(job))
-                                        loaded = DecodeWithShell(job.path, job.targetSize, *result);
-                                } else if (raw) {
-                                    loaded = DecodeWithBundledGuarded(job, *result, true);
-                                    if (!loaded && !rawJpegOnly && !IsCancelled(job)) {
-                                        loaded = DecodeWithShell(job.path, job.targetSize, *result) ||
-                                            DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
-                                    }
-                                } else {
-                                    const std::wstring extension = ExtensionLower(job.path);
-                                    const bool jpeg = extension == L".jpg" || extension == L".jpeg" || extension == L".jpe";
-                                    if (jpeg) {
-                                        loaded = DecodeWithBundledGuarded(job, *result, true);
-                                        if (!loaded && !IsCancelled(job)) {
-                                            loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
-                                        }
-                                        if (!loaded && !IsCancelled(job)) {
-                                            loaded = DecodeWithShell(job.path, job.targetSize, *result);
-                                        }
-                                    } else {
-                                        loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
-                                        if (!loaded && !IsCancelled(job)) {
-                                            loaded = DecodeWithBundledGuarded(job, *result, true);
-                                        }
-                                        if (!loaded && !IsCancelled(job)) {
-                                            loaded = DecodeWithShell(job.path, job.targetSize, *result);
-                                        }
-                                    }
-                                }
-                            } else {
-                                const auto cancelled = [this, job] { return IsCancelled(job); };
-                                if (rawJpegOnly) {
-                                    loaded = DecodeWithBundledGuarded(job, *result, true);
-                                } else {
-                                    const std::wstring extension = ExtensionLower(job.path);
-                                    const bool jpeg = extension == L".jpg" || extension == L".jpeg" || extension == L".jpe";
-                                    if (jpeg) {
-                                        loaded = DecodeWithBundledGuarded(job, *result, false) ||
-                                            DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, false, cancelled);
-                                    } else {
-                                        loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, false, cancelled) ||
-                                            DecodeWithBundledGuarded(job, *result, false);
-                                    }
-                                    if (!loaded && DecodeWithShell(job.path, job.targetSize, *result)) {
-                                        loaded = true;
-                                        result->previewOnly = true;
-                                    }
-                                }
-                            }
-                            decodePathMs = std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - decodeStarted).count();
-                            // Persist only thumbnails and screen-resolution previews. Full-size/tile
-                            // data is intentionally memory-only: duplicating 40–100 MP buffers during
-                            // cache writes would create RAM spikes and steal responsiveness.
-                            const int sourceEdge = std::max(result->sourceWidth, result->sourceHeight);
-                            const int requestedEdge = sourceEdge > 0 ? std::min(job.targetSize, sourceEdge) : job.targetSize;
-                            const bool adequateThumbnail = job.cacheClass != CacheClass::Thumbnail ||
-                                std::max(result->width, result->height) * 10 >= std::max(1, requestedEdge) * 9;
-                            const bool persistBitmap = adequateThumbnail &&
-                                (job.cacheClass == CacheClass::Thumbnail ||
-                                 (job.cacheClass == CacheClass::Preview && job.targetSize <= 2048));
-                            // Never write the disk cache before posting a visible result.
-                            // Slow storage, antivirus hooks, or a damaged old cache must not
-                            // keep the UI on “loading…”. The shared pixel buffer is handed to
-                            // a bounded background writer after the UI notification is queued.
-                            queueBitmapCacheWrite = loaded && persistBitmap && fingerprinted &&
-                                persistentCache_ && !rawJpegOnly && !IsCancelled(job);
-                        }
-                    }
-                }
-
-                // Normalize RAW source geometry before either the UI or persistent
-                // bitmap writer observes it. This self-heals stale landscape geometry
-                // and prevents portrait previews from being written back incorrectly.
-                if (!result->pixels.empty() && result->kind != JobKind::DecodeTile &&
-                    IsRawExtension(ExtensionLower(result->path))) {
-                    NormalizeSourceGeometryToPixelOrientation(result->width, result->height,
-                        result->sourceWidth, result->sourceHeight);
-                }
-
-                // Empty/metadata results no longer retain a decode buffer. Pixel-bearing
-                // results keep their reservation until every posted/cache-writer owner is
-                // finished, closing the previously unaccounted UI-message-queue loophole.
-                if (result->pixels.empty()) result->decodeReservation.reset();
-                else if (result->decodeReservation) result->decodeReservation->ShrinkTo(result->pixels.size());
-
-                const bool timedOut = JobTimedOut(job);
-                result->timedOut = timedOut;
-                const bool cancellationOnly = IsCancelled(job) && !timedOut;
-                // A visual decoder that returns no pixels without a genuine cancellation
-                // is a transient decode failure. Mark it explicitly so the UI can clear
-                // the loading state, release coalescing ownership, and retry later instead
-                // of silently blacklisting or leaving the thumbnail permanently pending.
-                const bool visualDecodeNoPixels =
-                    (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull ||
-                     job.kind == JobKind::DecodeTile) && result->pixels.empty();
-                if (visualDecodeNoPixels && !cancellationOnly) {
-                    result->workFailed = true;
-                    resultWorkFailed = true;
-                    // Classify for the UI retry policy (transient vs deterministic).
-                    result->failureKind = timedOut ? DecodeFailureKind::Timeout :
-                        ClassifyDecodeFailure(job.path);
-                }
-                result->cancelled = IsCancelled(job);
-                const auto resultPostStarted = std::chrono::steady_clock::now();
-                resultPosted = TryPostResult(job, result);
-                resultPostMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - resultPostStarted).count();
-                if (queueBitmapCacheWrite && !IsCancelled(job)) {
-                    QueueBitmapCacheWrite(job, fileSize, modifiedStamp, sidecarStamp, result);
-                }
-                // Derivative pyramid generation is intentionally deferred out of
-                // interactive/visible decode jobs. CreateWicDerivative() can be expensive
-                // and used to be included in the foreground "decode" telemetry, making a
-                // successful image load appear to take tens of seconds. Foreground work
-                // should hand pixels to the UI first; derivative maintenance can run only
-                // from predictive/idle lanes.
-                const bool derivativeSafePriority =
-                    job.priority == JobPriority::Predictive ||
-                    job.priority == JobPriority::Idle ||
-                    job.priority == JobPriority::Analysis;
-                if (resultPosted && derivativeSafePriority && fingerprinted &&
-                    !result->fromPersistentCache &&
-                    (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull)) {
-                    QueueDerivedCacheLevels(factory.Get(), job, fileSize, modifiedStamp, sidecarStamp, result);
-                }
-                if (!resultPosted) {
-                    // Release coalescing ownership before telling the UI to pump
-                    // another metadata job; the UI may process this message immediately.
-                    AcknowledgeUnpostedJob(job, result->pendingKey);
-                    TryPostMetadataAbort(job);
-                }
+                result = CreateJobResult(job, std::move(decodeReservation));
+                FingerprintJobSource(job, result, run, fingerprintMs);
+                if (!IsCancelled(job)) ExecuteJobKind(job, result, factory, run);
+                resultPosted = PublishJobResult(job, result, factory, run, resultWorkFailed, resultPostMs);
             } catch (...) {
-                try {
-                    QS_LOG_EVENT(quicksift::diagnostics::Level::Error, L"Worker", L"worker_exception",
-                        { L"error_code", L"worker.exception" },
-                        { L"file", quicksift::diagnostics::LogFileName(job.path) },
-                        { L"path_id", quicksift::diagnostics::LogPathId(job.path) },
-                        { L"kind", std::to_wstring(static_cast<int>(job.kind)) });
-                } catch (...) {
-                    QS_LOG_ERROR(L"Worker", L"Unhandled worker exception; detailed context was unavailable");
-                }
-                // Decoder, filesystem, and allocation failures must not escape a
-                // std::thread entry point. Post a lightweight failed completion so
-                // metadata/EXIF pipelines release their in-flight counters instead
-                // of surviving the exception in a permanently stalled state.
-                if (!resultPosted) {
-                    try {
-                        auto failure = std::make_shared<WorkResult>();
-                        failure->kind = job.kind;
-                        failure->priority = job.priority;
-                        failure->cacheClass = job.cacheClass;
-                        failure->path = job.path;
-                        failure->targetSize = job.targetSize;
-                        failure->generation = job.generation;
-                        failure->requestEpoch = job.requestEpoch;
-                        failure->viewportEpoch = job.viewportEpoch;
-                        failure->rawJpegPreviewOnly = job.rawJpegPreviewOnly;
-                        failure->retryAttempt = job.retryAttempt;
-                        failure->forceWic = job.forceWic;
-                        failure->viewLane = job.viewLane;
-                        failure->timedOut = JobTimedOut(job);
-                        failure->failureKind = failure->timedOut ? DecodeFailureKind::Timeout :
-                            DecodeFailureKind::Transient;
-                        failure->pendingKey = job.key;
-                        failure->tileX = job.tileX;
-                        failure->tileY = job.tileY;
-                        failure->tileWidth = job.tileWidth;
-                        failure->tileHeight = job.tileHeight;
-                        failure->tileLevel = job.tileLevel;
-                        failure->workFailed = true;
-                        failure->cancelled = IsCancelled(job);
-                        resultWorkFailed = true;
-                        if (job.kind == JobKind::Face) {
-                            failure->faceAnalysisOutcome =
-                                quicksift::core::FaceAnalysisOutcome::TransientFailure;
-                        }
-                        resultPosted = TryPostResult(job, failure);
-                    } catch (...) {
-                        // At extreme allocation pressure even the small failure
-                        // envelope may be unavailable. Releasing the key still lets
-                        // a later UI request retry once memory becomes available.
-                    }
-                    if (!resultPosted) {
-                        AcknowledgeUnpostedJob(job, job.key);
-                        TryPostMetadataAbort(job);
-                    }
-                }
+                PostWorkerExceptionFailure(job, resultPosted, resultWorkFailed);
             }
             EndHandleJob(job);
             if (visualJob || viewLane) ReleaseActiveVisualFamily(job, viewLane);
             if (visualJob) {
                 activeVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
+                if (foregroundVisual) activeForegroundVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
                 if (thumbnailJob) activeThumbnailJobs_.fetch_sub(1, std::memory_order_acq_rel);
                 cv_.notify_all();
                 RefreshReadAheadGate();
@@ -3083,45 +2572,16 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
             FinishAnalysisJob(job);
             const double executionMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - executionStarted).count();
-            if (quicksift::diagnostics::VerboseLogging()) {
-                QS_LOG_EVENT(resultPosted ? quicksift::diagnostics::Level::Trace : quicksift::diagnostics::Level::Warning,
-                    L"Worker", L"job_complete",
-                    {L"file", DiagnosticFilename(job.path)},
-                    {L"kind", JobKindName(job.kind)},
-                    {L"priority", JobPriorityName(job.priority)},
-                    {L"result", resultPosted ? L"posted" : (resultWorkFailed ? L"failed" : L"not_posted")},
-                    {L"cancelled", (IsCancelled(job) || (result && result->cancelled)) ? L"1" : L"0"});
-            }
-            if (executionMs >= 2000.0) {
-                const bool timedOutForLog = JobTimedOut(job);
-                const std::wstring slowJobMessage =
-                    std::wstring(L"Slow visual job: ") + job.path.filename().wstring() +
-                    L" kind=" + std::to_wstring(static_cast<int>(job.kind)) +
-                    L" target=" + std::to_wstring(job.targetSize) +
-                    L" total=" + std::to_wstring(static_cast<long long>(executionMs)) + L" ms" +
-                    L" fingerprint=" + std::to_wstring(static_cast<long long>(fingerprintMs)) + L" ms" +
-                    L" cache=" + std::to_wstring(static_cast<long long>(cacheLookupMs)) + L" ms" +
-                    L" decode=" + std::to_wstring(static_cast<long long>(decodePathMs)) + L" ms" +
-                    L" post=" + std::to_wstring(static_cast<long long>(resultPostMs)) + L" ms" +
-                    L" loaded=" + (resultPosted ? L"yes" : L"no") +
-                    L" timed_out=" + (timedOutForLog ? L"1" : L"0");
-                QS_LOG_WARNING(L"Performance", slowJobMessage);
-            }
+            if (quicksift::diagnostics::VerboseLogging() || executionMs >= 2000.0)
+                LogCompletedJob(job, result, run, executionMs, fingerprintMs, resultPostMs,
+                    resultPosted, resultWorkFailed);
             RecordTelemetry(job, queueWaitMs, budgetWaitMs, executionMs,
                 IsCancelled(job) && !resultPosted, oversizedReservation);
             if (tileJob) {
                 activeTileJobs_.fetch_sub(1, std::memory_order_acq_rel);
                 cv_.notify_all();
             }
-            if (gThreadWorkerIndex == 0) {
-                static thread_local std::uint64_t lastSnapshot = 0;
-                const std::uint64_t nowMs = quicksift::diagnostics::SessionId() == 0 ? 0 :
-                    static_cast<std::uint64_t>(GetTickCount64());
-                if (nowMs != 0 && (lastSnapshot == 0 || nowMs - lastSnapshot >= 10000)) {
-                    lastSnapshot = nowMs;
-                    quicksift::diagnostics::WriteSystemSnapshot(L"worker_periodic");
-                }
-            }
+            if (gThreadWorkerIndex == 0) WritePeriodicWorkerSnapshot();
         }
         // COM/WinRT objects must release while the apartment is still initialized.
         // Function-local and thread-local destructors otherwise run only after this
@@ -3133,6 +2593,900 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         if (SUCCEEDED(runtime)) RoUninitialize();
         gThreadWorkerOwner = nullptr;
         gThreadWorkerIndex = 0;
+    }
+
+    // Blocks until this lane has a job (mutex_ held while choosing). Returns false
+    // when the engine is stopping.
+    bool Worker::WaitForNextJob(WorkJob& job, bool allowIdle, bool metadataOnly, bool viewLane,
+        std::uint64_t& observedDecoderSessionTrim,
+        std::chrono::steady_clock::time_point& metadataLaneWaitStart) {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+            if (stopping_) break;
+            if (metadataOnly) {
+                // Metadata reads stay below foreground decode and writes but
+                // always make progress (core/metadata_lane_policy.h). Before
+                // 0.9.5.0 any active/queued visual job - including Idle
+                // prefetch and face analysis - blocked this lane indefinitely.
+                if (metadataQueue_.empty()) {
+                    metadataLaneWaitStart = {};
+                    metadataLaneState_.store(0, std::memory_order_relaxed);
+                    cv_.wait(lock);
+                    continue;
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (metadataLaneWaitStart == std::chrono::steady_clock::time_point{})
+                    metadataLaneWaitStart = now;
+                namespace ml = quicksift::core::metadata_lane;
+                ml::LaneInputs lane;
+                lane.foregroundVisualActive = activeForegroundVisualJobs_.load(std::memory_order_acquire) != 0;
+                lane.foregroundVisualQueued = !interactiveQueue_.empty() || !visibleQueue_.empty() || !viewQueue_.empty();
+                lane.writePending = exclusivePathWrites_.load(std::memory_order_acquire) != 0 ||
+                    quicksift::EmbeddedMetadataWritePreferred();
+                lane.waited = std::chrono::duration_cast<std::chrono::milliseconds>(now - metadataLaneWaitStart);
+                if (!ml::ShouldStartRead(lane)) {
+                    metadataLaneState_.store(1, std::memory_order_relaxed);
+                    cv_.wait_for(lock, std::chrono::milliseconds(8));
+                    continue;
+                }
+                metadataLaneWaitStart = {};
+                metadataLaneState_.store(2, std::memory_order_relaxed);
+                job = std::move(metadataQueue_.front());
+                metadataQueue_.pop_front();
+                break;
+            }
+            const std::uint64_t requestedTrim = decoderSessionTrimEpoch_.load(std::memory_order_acquire);
+            if (requestedTrim != observedDecoderSessionTrim) {
+                lock.unlock();
+                if (exclusivePathWrites_.load(std::memory_order_acquire) != 0)
+                    ReleaseBlockedThreadWicDecoderSessions();
+                else
+                    ReleaseThreadWicDecoderSessions();
+                quicksift::ReleaseThreadFaceDetector();
+                observedDecoderSessionTrim = requestedTrim;
+                lock.lock();
+                continue;
+            }
+            if (viewLane) {
+                // Dedicated Single/Compare lane: services only the view queues.
+                if (!viewQueue_.empty() || !viewPrefetchQueue_.empty()) {
+                    job = PopViewWork();
+                    break;
+                }
+                cv_.wait(lock);
+                continue;
+            }
+            if (ViewForegroundActiveLocked()) {
+                // Single/Compare is decoding the image on screen (P2): keep
+                // the disk and decoder for it. Interactive work and at most
+                // one thumbnail decode proceed; everything else waits. The
+                // view lane notifies cv_ when it finishes; the bounded wait
+                // covers a missed notification.
+                namespace prio = quicksift::core::priority;
+                const bool admitted = !interactiveQueue_.empty() ||
+                    (!visibleQueue_.empty() && prio::PoolLaneAdmitted(prio::PoolLane::Visible, true,
+                        activeThumbnailJobs_.load(std::memory_order_acquire)));
+                if (admitted) {
+                    job = PopWork(false, true);
+                    const bool emptySentinel = job.path.empty() &&
+                        job.kind == JobKind::DecodeFull && job.targetSize == 0;
+                    if (!emptySentinel) break;
+                }
+                if (quicksift::diagnostics::VerboseLogging()) {
+                    // Hot path: verbose-only and rate-limited.
+                    static quicksift::core::LogRateLimiter viewHoldLimiter(4, std::chrono::seconds(5));
+                    std::uint64_t suppressed = 0;
+                    if (viewHoldLimiter.Allow(&suppressed)) {
+                        QS_LOG_EVENT(quicksift::diagnostics::Level::Trace,
+                            quicksift::diagnostics::category::kViewLane, L"background_held_for_view",
+                            { L"face_queued", std::to_wstring(faceQueue_.size()) },
+                            { L"predictive_queued", std::to_wstring(predictiveQueue_.size()) },
+                            { L"idle_queued", std::to_wstring(idleQueue_.size()) },
+                            { L"suppressed", std::to_wstring(suppressed) });
+                    }
+                }
+                cv_.wait_for(lock, std::chrono::milliseconds(8));
+                continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (!interactiveQueue_.empty() || !visibleQueue_.empty()) {
+                job = PopWork(false);
+                break;
+            }
+            // One idle-capable lane receives a guarded metadata turn after
+            // a bounded predictive/face burst. Interactive and visible work
+            // remain absolute priority, while folder metadata cannot starve
+            // forever during sustained scrolling or prefetch replenishment.
+            if (allowIdle && ShouldServiceIdleAfterForegroundBurst(
+                !interactiveQueue_.empty(), !visibleQueue_.empty(),
+                now >= idleNotBefore_, !idleQueue_.empty(), foregroundBurstSinceIdle_)) {
+                job = PopWork(true);
+                break;
+            }
+            // P3 search demand pauses pure P5 work (face analysis, sharpness /
+            // analysis); prefetch and folder metadata keep running.
+            const bool searchPausesP5 = SearchPausesBackgroundAnalysis();
+            if (!predictiveQueue_.empty() || (!faceQueue_.empty() && !searchPausesP5)) {
+                job = PopWork(false);
+                const bool emptySentinel = job.path.empty() &&
+                    job.kind == JobKind::DecodeFull && job.targetSize == 0;
+                if (!emptySentinel) break;
+            }
+            const bool pausedWork = searchPausesP5 &&
+                (!faceQueue_.empty() || !analysisQueue_.empty());
+            if (allowIdle && (!idleQueue_.empty() || (!analysisQueue_.empty() && !searchPausesP5))) {
+                if (now >= idleNotBefore_) {
+                    job = PopWork(true);
+                    const bool emptySentinel = job.path.empty() &&
+                        job.kind == JobKind::DecodeFull && job.targetSize == 0;
+                    if (!emptySentinel) break;
+                    cv_.wait_for(lock, std::chrono::milliseconds(50));
+                } else cv_.wait_until(lock, idleNotBefore_);
+            } else if (pausedWork) {
+                // Paused, not starved: re-check when search ends (no notify).
+                cv_.wait_for(lock, std::chrono::milliseconds(250));
+            } else cv_.wait(lock);
+        }
+        return !stopping_;
+    }
+
+    // Classify the job and mark visual work active immediately after dequeue,
+    // before decoded-memory admission.
+    Worker::JobActivity Worker::BeginJobActivity(const WorkJob& job, bool viewLane, double queueWaitMs) {
+        JobActivity activity;
+        const bool visualJob = job.kind == JobKind::DecodePreview ||
+            job.kind == JobKind::DecodeFull || job.kind == JobKind::DecodeTile ||
+            job.kind == JobKind::Face;
+        const bool tileJob = job.kind == JobKind::DecodeTile;
+        QS_LOG_EVENT(quicksift::diagnostics::Level::Trace, L"Worker", L"job_dequeued",
+            {L"job", JobKindName(job.kind)},
+            {L"priority", JobPriorityName(job.priority)},
+            {L"file", DiagnosticFilename(job.path)},
+            {L"target", std::to_wstring(job.targetSize)},
+            {L"generation", std::to_wstring(job.generation)},
+            {L"request_epoch", std::to_wstring(job.requestEpoch)},
+            {L"viewport_epoch", std::to_wstring(job.viewportEpoch)},
+            {L"queue_ms", std::to_wstring(queueWaitMs)});
+        // Mark visual work as active immediately after dequeue, before decoded-memory
+        // admission. A visible decode can spend substantial time waiting for the
+        // shared decode budget; metadata must not start a competing disk/RAW read
+        // during that gap simply because the visual job has not reached its decoder yet.
+        if (visualJob) activeVisualJobs_.fetch_add(1, std::memory_order_acq_rel);
+        const bool foregroundVisual = visualJob && quicksift::core::metadata_lane::IsForegroundVisual(
+            job.kind == JobKind::Face, viewLane, job.viewPrefetch,
+            job.priority == JobPriority::Interactive || job.priority == JobPriority::Visible);
+        if (foregroundVisual) activeForegroundVisualJobs_.fetch_add(1, std::memory_order_acq_rel);
+        const bool thumbnailJob = job.cacheClass == CacheClass::Thumbnail &&
+            (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull);
+        if (thumbnailJob) activeThumbnailJobs_.fetch_add(1, std::memory_order_acq_rel);
+        activity.visualJob = visualJob;
+        activity.tileJob = tileJob;
+        activity.foregroundVisual = foregroundVisual;
+        activity.thumbnailJob = thumbnailJob;
+        return activity;
+    }
+
+    // The decode budget refused the reservation (cancelled while waiting).
+    void Worker::AbandonJobWithoutBudget(const WorkJob& job, bool viewLane, const JobActivity& activity,
+        double queueWaitMs, double budgetWaitMs) {
+        const bool visualJob = activity.visualJob;
+        const bool foregroundVisual = activity.foregroundVisual;
+        const bool thumbnailJob = activity.thumbnailJob;
+        const bool tileJob = activity.tileJob;
+        const bool cancelled = IsCancelled(job);
+        if (visualJob || viewLane) ReleaseActiveVisualFamily(job, viewLane);
+        if (visualJob) {
+            activeVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
+            if (foregroundVisual) activeForegroundVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
+            if (thumbnailJob) activeThumbnailJobs_.fetch_sub(1, std::memory_order_acq_rel);
+            cv_.notify_all();
+        }
+        AcknowledgeUnpostedJob(job, job.key);
+        TryPostMetadataAbort(job);
+        FinishAnalysisJob(job);
+        RecordTelemetry(job, queueWaitMs, budgetWaitMs, 0.0, cancelled, false);
+        if (tileJob) activeTileJobs_.fetch_sub(1, std::memory_order_acq_rel);
+        // Round 21 (t29u): like the completed-job path, re-evaluate the read-ahead
+        // gate; a burst of cancelled foreground jobs (fast stepping) left it paused.
+        if (visualJob) RefreshReadAheadGate();
+    }
+
+    void Worker::PauseReadAheadForOversizedDecode(const WorkJob& job, size_t decodeReservationBytes,
+        const std::shared_ptr<DecodeBudget>& jobBudget) {
+        const std::size_t configuredLimit = jobBudget ? jobBudget->Limit() : 0;
+        QS_LOG_WARNING(L"Performance", L"Oversized decode admitted for " +
+            job.path.filename().wstring() + L": reservation " +
+            std::to_wstring(decodeReservationBytes / kMebibyte) + L" MiB exceeds the " +
+            std::to_wstring(configuredLimit / kMebibyte) +
+            L" MiB runtime ceiling; encoded read-ahead is paused until the exclusive decode releases.");
+        std::lock_guard readAheadLock(readAheadGateMutex_);
+        readAhead_.CancelAll();
+        ConfigureReadAheadLocked();
+    }
+
+    // Exclusive file operations intentionally block metadata reads. Keep the pending
+    // key alive and put the metadata job back after the write releases the path
+    // instead of consuming its UI in-flight slot as a permanent failure.
+    void Worker::RequeueBlockedMetadataJob(WorkJob&& job, bool handleJobStarted) {
+        if (handleJobStarted) EndHandleJob(job);
+
+        std::unique_lock blockedLock(blockedMutex_);
+        blockedCv_.wait(blockedLock, [this, &job] {
+            return stoppingAtomic_.load(std::memory_order_acquire) ||
+                FindBlockedPathLocked(job.path.c_str()) == blockedPaths_.end();
+        });
+        blockedLock.unlock();
+        if (stoppingAtomic_.load(std::memory_order_acquire)) {
+            AcknowledgeUnpostedJob(job, job.key);
+            TryPostMetadataAbort(job);
+            cv_.notify_all();
+            return;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            if (!stopping_) {
+                job.enqueuedAt = std::chrono::steady_clock::now();
+                metadataQueue_.push_front(std::move(job));
+            }
+        }
+        cv_.notify_all();
+    }
+
+    void Worker::AbandonCancelledJob(const WorkJob& job, bool viewLane, const JobActivity& activity,
+        bool handleJobStarted, double queueWaitMs, double budgetWaitMs, bool oversizedReservation) {
+        const bool visualJob = activity.visualJob;
+        const bool foregroundVisual = activity.foregroundVisual;
+        const bool thumbnailJob = activity.thumbnailJob;
+        const bool tileJob = activity.tileJob;
+        if (visualJob || viewLane) ReleaseActiveVisualFamily(job, viewLane);
+        if (visualJob) {
+            activeVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
+            if (foregroundVisual) activeForegroundVisualJobs_.fetch_sub(1, std::memory_order_acq_rel);
+            if (thumbnailJob) activeThumbnailJobs_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (handleJobStarted) EndHandleJob(job);
+        AcknowledgeUnpostedJob(job, job.key);
+        TryPostMetadataAbort(job);
+        FinishAnalysisJob(job);
+        RecordTelemetry(job, queueWaitMs, budgetWaitMs, 0.0, true, oversizedReservation);
+        if (tileJob) activeTileJobs_.fetch_sub(1, std::memory_order_acq_rel);
+        cv_.notify_all();
+        // Round 21 (t29u): see AbandonJobWithoutBudget.
+        if (visualJob) RefreshReadAheadGate();
+    }
+
+    std::shared_ptr<WorkResult> Worker::CreateJobResult(const WorkJob& job,
+        std::shared_ptr<DecodeReservation> decodeReservation) {
+        std::shared_ptr<WorkResult> result;
+        result = std::make_shared<WorkResult>();
+        result->decodeReservation = std::move(decodeReservation);
+        result->kind = job.kind;
+        result->priority = job.priority;
+        result->cacheClass = job.cacheClass;
+        result->path = job.path;
+        result->targetSize = job.targetSize;
+        result->generation = job.generation;
+        result->requestEpoch = job.requestEpoch;
+        result->viewportEpoch = job.viewportEpoch;
+        result->viewInteractionEpoch = job.viewInteractionEpoch;
+        result->metadataRevision = job.metadataRevision;
+        result->rawJpegPreviewOnly = job.rawJpegPreviewOnly;
+        result->retryAttempt = job.retryAttempt;
+        result->forceWic = job.forceWic;
+        result->viewLane = job.viewLane;
+        result->pendingKey = job.key;
+        result->tileX = job.tileX;
+        result->tileY = job.tileY;
+        result->tileWidth = job.tileWidth;
+        result->tileHeight = job.tileHeight;
+        result->tileLevel = job.tileLevel;
+        return result;
+    }
+
+    void Worker::FingerprintJobSource(const WorkJob& job, const std::shared_ptr<WorkResult>& result, JobRunContext& run,
+        double& fingerprintMs) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const auto fingerprintStarted = std::chrono::steady_clock::now();
+        const bool fingerprinted = FileFingerprint(job.path, fileSize, modifiedStamp);
+        run.fingerprinted = fingerprinted;
+        fingerprintMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - fingerprintStarted).count();
+        if (fingerprinted &&
+            (job.kind == JobKind::Metadata || job.kind == JobKind::Exif || job.kind == JobKind::Face)) {
+            sidecarStamp = MetadataStampFor(job.path);
+        }
+        if (fingerprinted) {
+            result->fileSize = fileSize;
+            result->modifiedStamp = modifiedStamp;
+            result->sidecarStamp = sidecarStamp;
+        }
+    }
+
+    void Worker::ExecuteJobKind(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        JobRunContext& run) {
+        if (job.kind == JobKind::Metadata) ExecuteMetadataReadJob(job, result, run);
+        else if (job.kind == JobKind::Exif) ExecuteExifJob(job, result, run);
+        else if (job.kind == JobKind::Face) ExecuteFaceJob(job, result, factory, run);
+        else if (job.kind == JobKind::DecodeTile) ExecuteTileJob(job, result, factory, run);
+        else if (factory) ExecuteDecodeJob(job, result, factory, run);
+    }
+
+    void Worker::ExecuteMetadataReadJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, JobRunContext& run) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        if (fingerprinted && persistentCache_) {
+            // A record cached as Unknown (written before 0.9.5.0 resolved
+            // "no source has a value" to unset) is re-read once, so
+            // already-indexed folders also match "0 stars"/"unrated".
+            const auto cached = persistentCache_->LookupRecord(
+                job.path, fileSize, modifiedStamp, sidecarStamp, false, false);
+            if (cached && cached->ratingKnowledge != MetadataKnowledge::Unknown &&
+                cached->colorLabelKnowledge != MetadataKnowledge::Unknown &&
+                cached->pickStateKnowledge != MetadataKnowledge::Unknown) {
+                result->rating = cached->rating;
+                result->colorLabel = cached->colorLabel;
+                result->pickState = cached->pickState;
+                result->ratingKnowledge = cached->ratingKnowledge;
+                result->colorLabelKnowledge = cached->colorLabelKnowledge;
+                result->pickStateKnowledge = cached->pickStateKnowledge;
+                result->rawRating = cached->rawRating;
+                result->rawColorLabel = cached->rawColorLabel;
+                result->rawPickState = cached->rawPickState;
+            } else {
+                const PhotoMetadataValues metadata = ReadPhotoMetadata(job.path);
+                result->rating = metadata.rating.value;
+                result->colorLabel = metadata.colorLabel.value;
+                result->pickState = metadata.pickState.value;
+                result->ratingKnowledge = metadata.rating.knowledge;
+                result->colorLabelKnowledge = metadata.colorLabel.knowledge;
+                result->pickStateKnowledge = metadata.pickState.knowledge;
+                result->rawRating = metadata.rating.rawValue;
+                result->rawColorLabel = metadata.colorLabel.rawValue;
+                result->rawPickState = metadata.pickState.rawValue;
+            }
+        } else {
+            const PhotoMetadataValues metadata = ReadPhotoMetadata(job.path);
+            result->rating = metadata.rating.value;
+            result->colorLabel = metadata.colorLabel.value;
+            result->pickState = metadata.pickState.value;
+            result->ratingKnowledge = metadata.rating.knowledge;
+            result->colorLabelKnowledge = metadata.colorLabel.knowledge;
+            result->pickStateKnowledge = metadata.pickState.knowledge;
+            result->rawRating = metadata.rating.rawValue;
+            result->rawColorLabel = metadata.colorLabel.rawValue;
+            result->rawPickState = metadata.pickState.rawValue;
+        }
+    }
+
+    void Worker::ExecuteExifJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, JobRunContext& run) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        if (fingerprinted && persistentCache_) {
+            if (auto cached = persistentCache_->LookupRecord(
+                job.path, fileSize, modifiedStamp, sidecarStamp, true, false);
+                cached && !cached->exifText.empty()) {
+                result->exifText = std::move(cached->exifText);
+            } else {
+                result->exifText = BuildExifText(job.path);
+            }
+        } else {
+            result->exifText = BuildExifText(job.path);
+        }
+    }
+
+    // Faces: cached record, then detection on a preview decode and per-face quality.
+    void Worker::ExecuteFaceJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        JobRunContext& run) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        if (fingerprinted && persistentCache_) {
+            if (auto cached = persistentCache_->LookupRecord(
+                job.path, fileSize, modifiedStamp, sidecarStamp, false, true);
+                cached) {
+                // Persisted FaceLock selection (normalized box) travels with the
+                // result; the UI adopts it only if the session has no choice yet.
+                result->faceSelectionKnown = cached->faceSelectionKnown;
+                if (cached->hasFaceSelection) result->faceSelection = cached->faceSelection;
+                if (cached->facesScanned) {
+                    result->faces = std::move(cached->faces);
+                    result->facesScanned = true;
+                    // LookupRecord already downgraded quality from an older
+                    // analysis version to "not scanned" (lazy re-analysis).
+                    result->faceBlurScanned = cached->faceBlurScanned;
+                    result->faceBlurry = cached->faceBlurry;
+                    result->faceSharpness = cached->faceSharpness;
+                    if (result->faceBlurScanned) {
+                        result->faceQualities = std::move(cached->faceQualities);
+                    }
+                }
+            }
+        }
+        const bool needsDetection = !result->facesScanned;
+        const bool needsSharpness = result->facesScanned &&
+            !result->faces.empty() && !result->faceBlurScanned;
+        if (!needsDetection && !needsSharpness) {
+            result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Completed;
+        } else if (needsDetection) {
+            const auto capability = quicksift::QueryFaceDetectorCapability();
+            if (capability == quicksift::core::FaceDetectorCapability::Unavailable) {
+                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Unavailable;
+            } else if (capability != quicksift::core::FaceDetectorCapability::Available) {
+                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::TransientFailure;
+            }
+        }
+
+        WorkResult preview;
+        bool decodedPreview = false;
+        const auto cancelled = [this, job] { return IsCancelled(job); };
+        const int faceTarget = std::max(kFaceDecodeSize, job.targetSize);
+        if (result->faceAnalysisOutcome == quicksift::core::FaceAnalysisOutcome::None &&
+            factory && !IsCancelled(job) && (needsDetection || needsSharpness)) {
+            preview.path = job.path;
+            WorkJob faceDecodeJob{ JobKind::Face, job.priority, CacheClass::Preview,
+                job.path, faceTarget, job.generation, job.requestEpoch };
+            faceDecodeJob.rawJpegPreviewOnly = job.rawJpegPreviewOnly;
+            const bool rawJpegOnly = job.rawJpegPreviewOnly &&
+                IsRawExtension(ExtensionLower(job.path));
+            decodedPreview = DecodeWithBundledGuarded(faceDecodeJob, preview, true);
+            if (!decodedPreview && !rawJpegOnly) {
+                decodedPreview = DecodeWithWic(factory.Get(), job.path, faceTarget,
+                    preview, true, cancelled) || DecodeWithShell(job.path, faceTarget, preview);
+            }
+        }
+        if (decodedPreview && !IsCancelled(job)) {
+            if (needsDetection) {
+                result->faceAnalysisOutcome = quicksift::DetectFacesFastBgra(
+                    preview.pixels.data(), preview.width, preview.height, result->faces);
+                result->facesScanned = result->faceAnalysisOutcome ==
+                    quicksift::core::FaceAnalysisOutcome::Completed;
+            }
+            if (!needsDetection && !result->faces.empty()) {
+                // Faces cached by an older build were ordered largest-first;
+                // re-rank so faces[0] is the centre-closest default target.
+                result->faces.erase(std::remove_if(result->faces.begin(), result->faces.end(),
+                    [&](const quicksift::NormalizedFaceRect& face) {
+                        return quicksift::core::IsNoiseFace(face, preview.width, preview.height);
+                    }), result->faces.end());
+                quicksift::core::RankFacesForAnchor(result->faces,
+                    static_cast<float>(static_cast<double>(preview.width) /
+                        static_cast<double>(std::max(1, preview.height))));
+            }
+            if (result->facesScanned && !result->faces.empty()) {
+                ScoreFaceQualities(job, result, factory, preview);
+            } else if (result->facesScanned) {
+                result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::Completed;
+            }
+        } else if (!IsCancelled(job) &&
+            result->faceAnalysisOutcome == quicksift::core::FaceAnalysisOutcome::None &&
+            (needsDetection || needsSharpness)) {
+            result->faceAnalysisOutcome = quicksift::core::FaceAnalysisOutcome::TransientFailure;
+        }
+    }
+
+    // Per-face quality: every face is judged (defocus, motion blur, closed eyes).
+    // Faces too small in this decode are re-judged once on a larger decode
+    // (kFaceSharpnessDecodeSize up to kFaceQualityMaxDecodeSize); faces still too
+    // small after that stay TooSmall and are never flagged.
+    void Worker::ScoreFaceQualities(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        WorkResult& preview) {
+        const auto cancelled = [this, job] { return IsCancelled(job); };
+        std::vector<quicksift::FaceQualityRecord> qualities;
+        const int requiredEdge = AnalyzeFaceQualitiesBgra(preview.pixels.data(),
+            preview.width, preview.height, result->faces, qualities);
+        const int previewEdge = std::max(preview.width, preview.height);
+        const int sourceEdge = std::max(preview.sourceWidth, preview.sourceHeight);
+        const int largerTarget = std::min(quicksift::core::kFaceQualityMaxDecodeSize,
+            std::max(kFaceSharpnessDecodeSize, requiredEdge));
+        const bool largerHelps = requiredEdge > 0 &&
+            largerTarget > previewEdge + previewEdge / 8 &&
+            (sourceEdge <= 0 || sourceEdge > previewEdge + previewEdge / 8);
+        FaceSharpnessResult sharpness;
+        if (!largerHelps) {
+            sharpness = SummarizeFaceQualities(qualities);
+        } else if (!IsCancelled(job)) {
+            std::vector<std::size_t> smallFaces;
+            for (std::size_t index = 0; index < qualities.size(); ++index) {
+                if ((qualities[index].flags & quicksift::FaceQualityFlag::TooSmall) != 0)
+                    smallFaces.push_back(index);
+            }
+            // The detection preview is no longer needed; release it
+            // before the larger decode so the peak stays bounded.
+            std::vector<std::uint8_t>().swap(preview.pixels);
+            WorkResult largerPreview;
+            WorkJob sharpnessJob{ JobKind::Face, job.priority, CacheClass::Preview,
+                job.path, largerTarget, job.generation, job.requestEpoch };
+            sharpnessJob.rawJpegPreviewOnly = job.rawJpegPreviewOnly;
+            const bool rawJpegOnly = job.rawJpegPreviewOnly &&
+                IsRawExtension(ExtensionLower(job.path));
+            bool decodedLarger = DecodeWithBundledGuarded(
+                sharpnessJob, largerPreview, true);
+            if (!decodedLarger && !rawJpegOnly) {
+                decodedLarger = DecodeWithWic(factory.Get(), job.path,
+                    largerTarget, largerPreview, true, cancelled) ||
+                    DecodeWithShell(job.path, largerTarget, largerPreview);
+            }
+            if (decodedLarger && !IsCancelled(job) && largerPreview.width > 0 &&
+                largerPreview.height > 0 && largerPreview.pixels.size() >=
+                static_cast<std::size_t>(largerPreview.width) *
+                static_cast<std::size_t>(largerPreview.height) * 4u) {
+                AnalyzeFaceQualitiesBgra(largerPreview.pixels.data(),
+                    largerPreview.width, largerPreview.height, result->faces,
+                    qualities, &smallFaces);
+                sharpness = SummarizeFaceQualities(qualities);
+            }
+        }
+        result->faceBlurScanned = sharpness.scanned;
+        result->faceBlurry = sharpness.scanned && sharpness.blurry;
+        result->faceSharpness = sharpness.scanned ? sharpness.score : 0.0f;
+        if (sharpness.scanned) result->faceQualities = std::move(qualities);
+        else result->faceQualities.clear();
+        result->faceAnalysisOutcome = sharpness.scanned ?
+            quicksift::core::FaceAnalysisOutcome::Completed :
+            quicksift::core::FaceAnalysisOutcome::TransientFailure;
+    }
+
+    void Worker::ExecuteTileJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        JobRunContext& run) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        bool& queueBitmapCacheWrite = run.queueBitmapCacheWrite;
+        bool loadedTile = false;
+        const bool rawJpegOnly = job.rawJpegPreviewOnly &&
+            IsRawExtension(ExtensionLower(job.path));
+        if (fingerprinted && persistentCache_ && profile_.enablePersistentPyramid &&
+            !rawJpegOnly) {
+            quicksift::CachedBitmapData cachedTile;
+            if (persistentCache_->LoadPyramidTile(job.path, fileSize, modifiedStamp,
+                sidecarStamp, job.tileLevel, job.tileX, job.tileY, kTileSourceSize, cachedTile)) {
+                result->width = cachedTile.width;
+                result->height = cachedTile.height;
+                result->sourceWidth = cachedTile.sourceWidth;
+                result->sourceHeight = cachedTile.sourceHeight;
+                result->tileX = job.tileX;
+                result->tileY = job.tileY;
+                result->tileWidth = job.tileWidth;
+                result->tileHeight = job.tileHeight;
+                result->tileLevel = job.tileLevel;
+                result->pixels = std::move(cachedTile.pixels);
+                result->fromPersistentCache = true;
+                loadedTile = true;
+            }
+        }
+        if (!loadedTile && factory && !rawJpegOnly && !IsCancelled(job)) {
+            const auto cancelled = [this, job] { return IsCancelled(job); };
+            loadedTile = DecodeTileWithWic(factory.Get(), job.path, job, *result, cancelled);
+            queueBitmapCacheWrite = loadedTile && fingerprinted && persistentCache_ &&
+                profile_.enablePersistentPyramid && !IsCancelled(job);
+        }
+    }
+
+    // Thumbnail / preview / full decodes: persistent cache first, then the decoders.
+    void Worker::ExecuteDecodeJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        JobRunContext& run) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        bool& queueBitmapCacheWrite = run.queueBitmapCacheWrite;
+        double& cacheLookupMs = run.cacheLookupMs;
+        double& decodePathMs = run.decodePathMs;
+        bool loaded = false;
+        const bool rawJpegOnly = job.rawJpegPreviewOnly &&
+            IsRawExtension(ExtensionLower(job.path));
+        if (fingerprinted && persistentCache_ && !rawJpegOnly) {
+            quicksift::CachedBitmapData cached;
+            const auto cacheLookupStarted = std::chrono::steady_clock::now();
+            const bool cacheHit = persistentCache_->LoadCachedBitmap(
+                job.path, fileSize, modifiedStamp, sidecarStamp, job.targetSize,
+                static_cast<int>(job.cacheClass), cached);
+            cacheLookupMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - cacheLookupStarted).count();
+            if (cacheHit) {
+                persistentCacheHits_.fetch_add(1, std::memory_order_relaxed);
+                result->width = cached.width;
+                result->height = cached.height;
+                result->sourceWidth = cached.sourceWidth;
+                result->sourceHeight = cached.sourceHeight;
+                result->previewOnly = cached.previewOnly;
+                result->pixels = std::move(cached.pixels);
+                result->fromPersistentCache = true;
+                loaded = true;
+            } else {
+                persistentCacheMisses_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (!loaded && !IsCancelled(job)) {
+            const auto decodeStarted = std::chrono::steady_clock::now();
+            const bool raw = IsRawExtension(ExtensionLower(job.path));
+            if (job.kind == JobKind::DecodePreview) {
+                loaded = DecodePreviewJob(job, result, factory, rawJpegOnly, raw);
+            } else {
+                loaded = DecodeFullJob(job, result, factory, rawJpegOnly);
+            }
+            decodePathMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - decodeStarted).count();
+            // Persist only thumbnails and screen-resolution previews. Full-size/tile
+            // data is intentionally memory-only: duplicating 40–100 MP buffers during
+            // cache writes would create RAM spikes and steal responsiveness.
+            const int sourceEdge = std::max(result->sourceWidth, result->sourceHeight);
+            const int requestedEdge = sourceEdge > 0 ? std::min(job.targetSize, sourceEdge) : job.targetSize;
+            const bool adequateThumbnail = job.cacheClass != CacheClass::Thumbnail ||
+                std::max(result->width, result->height) * 10 >= std::max(1, requestedEdge) * 9;
+            const bool persistBitmap = adequateThumbnail &&
+                (job.cacheClass == CacheClass::Thumbnail ||
+                 (job.cacheClass == CacheClass::Preview && job.targetSize <= 2048));
+            // Never write the disk cache before posting a visible result.
+            // Slow storage, antivirus hooks, or a damaged old cache must not
+            // keep the UI on “loading…”. The shared pixel buffer is handed to
+            // a bounded background writer after the UI notification is queued.
+            queueBitmapCacheWrite = loaded && persistBitmap && fingerprinted &&
+                persistentCache_ && !rawJpegOnly && !IsCancelled(job);
+        }
+    }
+
+    bool Worker::DecodePreviewJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        bool rawJpegOnly, bool raw) {
+        bool loaded = false;
+        result->previewOnly = raw;
+        const auto cancelled = [this, job] { return IsCancelled(job); };
+        if (job.cacheClass == CacheClass::Thumbnail && job.forceWic) {
+            // Final fallback attempt of the retry policy: WIC
+            // (embedded preview / system codec), then the Shell
+            // thumbnail provider before the image is marked failed.
+            loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
+            if (!loaded && !IsCancelled(job))
+                loaded = DecodeWithShell(job.path, job.targetSize, *result);
+        } else if (raw) {
+            loaded = DecodeWithBundledGuarded(job, *result, true);
+            if (!loaded && !rawJpegOnly && !IsCancelled(job)) {
+                loaded = DecodeWithShell(job.path, job.targetSize, *result) ||
+                    (!IsCancelled(job) &&
+                     DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled));
+            }
+        } else {
+            const std::wstring extension = ExtensionLower(job.path);
+            const bool jpeg = extension == L".jpg" || extension == L".jpeg" || extension == L".jpe";
+            if (jpeg) {
+                loaded = DecodeWithBundledGuarded(job, *result, true);
+                if (!loaded && !IsCancelled(job)) {
+                    loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
+                }
+                if (!loaded && !IsCancelled(job)) {
+                    loaded = DecodeWithShell(job.path, job.targetSize, *result);
+                }
+            } else {
+                loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, true, cancelled);
+                if (!loaded && !IsCancelled(job)) {
+                    loaded = DecodeWithBundledGuarded(job, *result, true);
+                }
+                if (!loaded && !IsCancelled(job)) {
+                    loaded = DecodeWithShell(job.path, job.targetSize, *result);
+                }
+            }
+        }
+        return loaded;
+    }
+
+    bool Worker::DecodeFullJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        bool rawJpegOnly) {
+        bool loaded = false;
+        const auto cancelled = [this, job] { return IsCancelled(job); };
+        if (rawJpegOnly) {
+            loaded = DecodeWithBundledGuarded(job, *result, true);
+        } else {
+            const std::wstring extension = ExtensionLower(job.path);
+            const bool jpeg = extension == L".jpg" || extension == L".jpeg" || extension == L".jpe";
+            // Round 21 (t29u): every fallback stage checks cancellation first, like
+            // DecodePreviewJob. Previously a timed-out / navigated-away / write-gated
+            // full decode still ran the WIC and the uncancellable Shell provider on
+            // the single view lane: the next image waited behind it, a metadata
+            // write waited for its file handle, and a timed-out decode whose Shell
+            // fallback succeeded was dropped as "cancelled" (pixels present, no
+            // failure flag), so the UI never escalated the timeout and the
+            // backstop re-ran the same attempt forever.
+            if (jpeg) {
+                loaded = DecodeWithBundledGuarded(job, *result, false) ||
+                    (!IsCancelled(job) &&
+                     DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, false, cancelled));
+            } else {
+                loaded = DecodeWithWic(factory.Get(), job.path, job.targetSize, *result, false, cancelled) ||
+                    (!IsCancelled(job) && DecodeWithBundledGuarded(job, *result, false));
+            }
+            if (!loaded && !IsCancelled(job) && DecodeWithShell(job.path, job.targetSize, *result)) {
+                loaded = true;
+                result->previewOnly = true;
+            }
+        }
+        return loaded;
+    }
+
+    // Normalize, classify and post the result, then hand pixels to the cache writer
+    // and (from predictive/idle lanes only) the derivative pyramid. Returns whether
+    // the result was posted.
+    bool Worker::PublishJobResult(const WorkJob& job, const std::shared_ptr<WorkResult>& result, ComPtr<IWICImagingFactory>& factory,
+        JobRunContext& run, bool& resultWorkFailed, double& resultPostMs) {
+        uint64_t& fileSize = run.fileSize;
+        int64_t& modifiedStamp = run.modifiedStamp;
+        int64_t& sidecarStamp = run.sidecarStamp;
+        const bool fingerprinted = run.fingerprinted;
+        const bool queueBitmapCacheWrite = run.queueBitmapCacheWrite;
+        bool resultPosted = false;
+        // Normalize RAW source geometry before either the UI or persistent
+        // bitmap writer observes it. This self-heals stale landscape geometry
+        // and prevents portrait previews from being written back incorrectly.
+        if (!result->pixels.empty() && result->kind != JobKind::DecodeTile &&
+            IsRawExtension(ExtensionLower(result->path))) {
+            NormalizeSourceGeometryToPixelOrientation(result->width, result->height,
+                result->sourceWidth, result->sourceHeight);
+        }
+
+        // Empty/metadata results no longer retain a decode buffer. Pixel-bearing
+        // results keep their reservation until every posted/cache-writer owner is
+        // finished, closing the previously unaccounted UI-message-queue loophole.
+        if (result->pixels.empty()) result->decodeReservation.reset();
+        else if (result->decodeReservation) result->decodeReservation->ShrinkTo(result->pixels.size());
+
+        const bool timedOut = JobTimedOut(job);
+        result->timedOut = timedOut;
+        const bool cancellationOnly = IsCancelled(job) && !timedOut;
+        // A visual decoder that returns no pixels without a genuine cancellation
+        // is a transient decode failure. Mark it explicitly so the UI can clear
+        // the loading state, release coalescing ownership, and retry later instead
+        // of silently blacklisting or leaving the thumbnail permanently pending.
+        const bool visualDecodeNoPixels =
+            (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull ||
+             job.kind == JobKind::DecodeTile) && result->pixels.empty();
+        if (visualDecodeNoPixels && !cancellationOnly) {
+            result->workFailed = true;
+            resultWorkFailed = true;
+            // Classify for the UI retry policy (transient vs deterministic).
+            result->failureKind = timedOut ? DecodeFailureKind::Timeout :
+                ClassifyDecodeFailure(job.path);
+        }
+        result->cancelled = IsCancelled(job);
+        const auto resultPostStarted = std::chrono::steady_clock::now();
+        resultPosted = TryPostResult(job, result);
+        resultPostMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - resultPostStarted).count();
+        if (queueBitmapCacheWrite && !IsCancelled(job)) {
+            QueueBitmapCacheWrite(job, fileSize, modifiedStamp, sidecarStamp, result);
+        }
+        // Derivative pyramid generation is intentionally deferred out of
+        // interactive/visible decode jobs. CreateWicDerivative() can be expensive
+        // and used to be included in the foreground "decode" telemetry, making a
+        // successful image load appear to take tens of seconds. Foreground work
+        // should hand pixels to the UI first; derivative maintenance can run only
+        // from predictive/idle lanes.
+        const bool derivativeSafePriority =
+            job.priority == JobPriority::Predictive ||
+            job.priority == JobPriority::Idle ||
+            job.priority == JobPriority::Analysis;
+        if (resultPosted && derivativeSafePriority && fingerprinted &&
+            !result->fromPersistentCache &&
+            (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull)) {
+            QueueDerivedCacheLevels(factory.Get(), job, fileSize, modifiedStamp, sidecarStamp, result);
+        }
+        if (!resultPosted) {
+            // Release coalescing ownership before telling the UI to pump
+            // another metadata job; the UI may process this message immediately.
+            AcknowledgeUnpostedJob(job, result->pendingKey);
+            TryPostMetadataAbort(job);
+        }
+        return resultPosted;
+    }
+
+    // Decoder, filesystem, and allocation failures must not escape a std::thread
+    // entry point. Called from the job's catch (...): log it and post a lightweight
+    // failed completion so metadata/EXIF pipelines release their in-flight counters
+    // instead of surviving the exception in a permanently stalled state.
+    void Worker::PostWorkerExceptionFailure(const WorkJob& job, bool& resultPosted, bool& resultWorkFailed) {
+        try {
+            QS_LOG_EVENT(quicksift::diagnostics::Level::Error, L"Worker", L"worker_exception",
+                { L"error_code", L"worker.exception" },
+                { L"file", quicksift::diagnostics::LogFileName(job.path) },
+                { L"path_id", quicksift::diagnostics::LogPathId(job.path) },
+                { L"kind", std::to_wstring(static_cast<int>(job.kind)) });
+        } catch (...) {
+            QS_LOG_ERROR(L"Worker", L"Unhandled worker exception; detailed context was unavailable");
+        }
+        // Decoder, filesystem, and allocation failures must not escape a
+        // std::thread entry point. Post a lightweight failed completion so
+        // metadata/EXIF pipelines release their in-flight counters instead
+        // of surviving the exception in a permanently stalled state.
+        if (!resultPosted) {
+            try {
+                auto failure = std::make_shared<WorkResult>();
+                failure->kind = job.kind;
+                failure->priority = job.priority;
+                failure->cacheClass = job.cacheClass;
+                failure->path = job.path;
+                failure->targetSize = job.targetSize;
+                failure->generation = job.generation;
+                failure->requestEpoch = job.requestEpoch;
+                failure->viewportEpoch = job.viewportEpoch;
+                failure->rawJpegPreviewOnly = job.rawJpegPreviewOnly;
+                failure->retryAttempt = job.retryAttempt;
+                failure->forceWic = job.forceWic;
+                failure->viewLane = job.viewLane;
+                failure->timedOut = JobTimedOut(job);
+                failure->failureKind = failure->timedOut ? DecodeFailureKind::Timeout :
+                    DecodeFailureKind::Transient;
+                failure->pendingKey = job.key;
+                failure->tileX = job.tileX;
+                failure->tileY = job.tileY;
+                failure->tileWidth = job.tileWidth;
+                failure->tileHeight = job.tileHeight;
+                failure->tileLevel = job.tileLevel;
+                failure->workFailed = true;
+                failure->cancelled = IsCancelled(job);
+                resultWorkFailed = true;
+                if (job.kind == JobKind::Face) {
+                    failure->faceAnalysisOutcome =
+                        quicksift::core::FaceAnalysisOutcome::TransientFailure;
+                }
+                resultPosted = TryPostResult(job, failure);
+            } catch (...) {
+                QS_LOG_AND_CONTINUE(L"Worker", L"Worker::PostWorkerExceptionFailure");
+                // At extreme allocation pressure even the small failure
+                // envelope may be unavailable. Releasing the key still lets
+                // a later UI request retry once memory becomes available.
+            }
+            if (!resultPosted) {
+                AcknowledgeUnpostedJob(job, job.key);
+                TryPostMetadataAbort(job);
+            }
+        }
+    }
+
+    void Worker::LogCompletedJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, const JobRunContext& run,
+        double executionMs, double fingerprintMs, double resultPostMs, bool resultPosted,
+        bool resultWorkFailed) {
+        const double cacheLookupMs = run.cacheLookupMs;
+        const double decodePathMs = run.decodePathMs;
+        if (quicksift::diagnostics::VerboseLogging()) {
+            QS_LOG_EVENT(resultPosted ? quicksift::diagnostics::Level::Trace : quicksift::diagnostics::Level::Warning,
+                L"Worker", L"job_complete",
+                {L"file", DiagnosticFilename(job.path)},
+                {L"kind", JobKindName(job.kind)},
+                {L"priority", JobPriorityName(job.priority)},
+                {L"result", resultPosted ? L"posted" : (resultWorkFailed ? L"failed" : L"not_posted")},
+                {L"cancelled", (IsCancelled(job) || (result && result->cancelled)) ? L"1" : L"0"});
+        }
+        if (executionMs >= 2000.0) {
+            const bool timedOutForLog = JobTimedOut(job);
+            const std::wstring slowJobMessage =
+                std::wstring(L"Slow visual job: ") + job.path.filename().wstring() +
+                L" kind=" + std::to_wstring(static_cast<int>(job.kind)) +
+                L" target=" + std::to_wstring(job.targetSize) +
+                L" total=" + std::to_wstring(static_cast<long long>(executionMs)) + L" ms" +
+                L" fingerprint=" + std::to_wstring(static_cast<long long>(fingerprintMs)) + L" ms" +
+                L" cache=" + std::to_wstring(static_cast<long long>(cacheLookupMs)) + L" ms" +
+                L" decode=" + std::to_wstring(static_cast<long long>(decodePathMs)) + L" ms" +
+                L" post=" + std::to_wstring(static_cast<long long>(resultPostMs)) + L" ms" +
+                L" loaded=" + (resultPosted ? L"yes" : L"no") +
+                L" timed_out=" + (timedOutForLog ? L"1" : L"0");
+            QS_LOG_WARNING(L"Performance", slowJobMessage);
+        }
+    }
+
+    void Worker::WritePeriodicWorkerSnapshot() {
+        static thread_local std::uint64_t lastSnapshot = 0;
+        const std::uint64_t nowMs = quicksift::diagnostics::SessionId() == 0 ? 0 :
+            static_cast<std::uint64_t>(GetTickCount64());
+        if (nowMs != 0 && (lastSnapshot == 0 || nowMs - lastSnapshot >= 10000)) {
+            lastSnapshot = nowMs;
+            quicksift::diagnostics::WriteSystemSnapshot(L"worker_periodic");
+        }
     }
 
     void Worker::QueueBitmapCacheWrite(const WorkJob& job, uint64_t fileSize, int64_t modifiedStamp,

@@ -206,9 +206,25 @@ set QS_SOURCE_URL=https://<exact source release URL>
 package-msix.bat
 ```
 
-The script performs a clean verified Release build, stages `QuickSift.exe`, GPL/source notices and MSIX assets, renders `AppxManifest.xml`, and creates `QuickSift-0.9.4.0-RC-x64.msix` with `makeappx.exe`. If `QS_SIGN_CERT_SHA1` is set it can sign for sideload testing. For Microsoft Store submission, the package may be left unsigned because the Store signs/re-signs certified MSIX packages.
+The script performs a clean verified Release build, stages `QuickSift.exe`, GPL/source notices and MSIX assets, renders `AppxManifest.xml`, and creates `QuickSift-0.9.6.0-RC-x64.msix` with `makeappx.exe`. If `QS_SIGN_CERT_SHA1` is set it can sign for sideload testing. For Microsoft Store submission, the package may be left unsigned because the Store signs/re-signs certified MSIX packages.
 
 When installed as MSIX, QuickSift detects package identity with the native Windows package API and stores QuickSift-owned state under the package `LocalState`; it never attempts to write into the package installation directory. User-requested photo metadata/copy/move/delete operations continue to target the user's selected photo locations.
+
+### When a build fails
+
+Every entry point ends a failure with three plain lines, for example:
+
+```text
+Build failed: The Windows SDK (part of the Visual Studio C++ tools) is missing.
+What to do:
+  1. Open the Visual Studio Installer, choose Modify, and tick "Windows 11 SDK" (or a Windows 10 SDK) under Individual components.
+  2. Close this window, open a new one, and run the build again.
+Technical detail: Command failed with exit code 1: C:\...\cmake.exe
+  CMake Error at CMakeLists.txt:3 (project): No CMAKE_CXX_COMPILER could be found.
+Build log (share it when asking for help): C:\src\QuickSift-0.9.6.0\QuickSift-BuildLog-231502.txt
+```
+
+Known causes include missing Visual Studio, Windows SDK, CMake, Python or PowerShell, a signing certificate, a path that is too long, library downloads, compiler errors and source/binary verifier findings. The exit code is still non-zero, so scripts and CI see the failure as before. The explanations live in `scripts/build-failure-help.ps1`.
 
 ### Build logs
 

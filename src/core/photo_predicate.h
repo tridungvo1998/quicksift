@@ -85,6 +85,8 @@ enum class ClauseKind : std::uint8_t {
     Shutter,    // exposure time in seconds * 1000: op, a
     Camera,     // camera make/model text match
     Lens,       // lens text match
+    Format,     // file extension (text, no dot, folded): NEF, ARW, JPG
+    Age,        // relative to today: a = count, b = 0 days / 1 months; op AtMost=newer, AtLeast=older
 };
 enum class Comparison : std::uint8_t { Equal, AtLeast, AtMost, Greater, Less };
 enum class TextTarget : std::uint8_t { NameOrComment, Name, Comment };
@@ -96,7 +98,8 @@ struct Clause {
     int a = 0;
     int b = -1;
     int c = 0;
-    std::wstring text; // SearchFold()ed free text (Text clauses only)
+    bool negated = false; // "not" / "-" excludes this clause
+    std::wstring text; // SearchFold()ed free text (Text / Format clauses)
     friend bool operator==(const Clause&, const Clause&) = default;
 };
 
@@ -109,6 +112,8 @@ struct Clause {
 [[nodiscard]] bool NeedsCaptureTime(std::span<const Clause> clauses) noexcept;
 [[nodiscard]] bool NeedsComments(std::span<const Clause> clauses) noexcept;
 [[nodiscard]] bool NeedsCameraSettings(std::span<const Clause> clauses) noexcept;
+// True when any clause tests rating / pick / colour label (metadata-index priority hint).
+[[nodiscard]] bool NeedsRatingFacts(std::span<const Clause> clauses) noexcept;
 
 // Free-text rules (shared with Batch Processing's partial matching):
 //  name:    folded substring, OR batch_match::PartialMatches on the name's runs

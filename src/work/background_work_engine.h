@@ -29,6 +29,16 @@ struct WorkerTelemetrySnapshot {
     std::size_t inFlightVisualFamilies = 0;
     std::uint64_t persistentCacheHits = 0;
     std::uint64_t persistentCacheMisses = 0;
+    // 0.9.5.0 HUD: per-lane depths, last decode times, oldest waiting job, lane states.
+    std::array<double, 7> lastDecodeMillisecondsByFormat{};
+    std::size_t metadataQueued = 0;
+    std::size_t viewQueued = 0;
+    std::size_t viewPrefetchQueued = 0;
+    std::size_t cacheWritesQueued = 0;
+    std::size_t activeForegroundVisualJobs = 0;
+    std::int64_t oldestQueuedMs = 0;     // across every lane; 0 when all are empty
+    int metadataLaneState = 0;          // 0 idle, 1 yielding to decode/writes, 2 reading
+    bool stopping = false;
 };
 
 class Worker {
@@ -65,6 +75,12 @@ public:
         const std::vector<std::wstring>& desiredPaths,
         const std::vector<std::wstring>& visiblePaths);
     [[nodiscard]] bool IsThumbnailJobPendingOrActive(const fs::path& path) const;
+    // Round 23: the Single View filmstrip's decode window (visible cells plus a
+    // margin). Empty = strip not shown. Queued filmstrip-owned thumbnail decodes
+    // outside it are dropped now (pending keys released); in-flight ones are
+    // cancelled at their next IsCancelled poll. Grid-desired and view-lane work is
+    // never affected (filmstrip::DecodeDropped).
+    void SetFilmstripDecodeWindow(const std::vector<std::wstring>& paths);
     // One lock acquisition for a whole viewport plan; returns path.wstring() values.
     [[nodiscard]] std::unordered_set<std::wstring> PendingOrActiveThumbnailPaths() const;
     void DiscardQueuedTiles();
@@ -129,6 +145,9 @@ public:
     void PublishDecoderSessionPaths(size_t threadIndex,
         const std::vector<std::filesystem::path>& paths) noexcept;
     [[nodiscard]] bool IsPathBlockedForDecoder(const fs::path& path) const noexcept;
+    // Round 21 (t29u): one-line view-lane snapshot for the Single View stall
+    // watchdog (UI thread; takes mutex_, then the budget, then blockedMutex_ - never nested).
+    [[nodiscard]] std::wstring DescribeViewLoadState(const fs::path& path) const;
     // True while a foreground Single/Compare decode is queued or running (lock-free).
     [[nodiscard]] bool ViewForegroundBusy() const noexcept {
         return viewForegroundQueued_.load(std::memory_order_acquire) != 0 ||
@@ -149,6 +168,8 @@ private:
     std::unordered_map<std::wstring, unsigned>::iterator
         FindBlockedPathLocked(const wchar_t* path);
     bool IsCancelled(const WorkJob& job) const;
+    bool FilmstripDecodeDropped(const WorkJob& job) const; // takes thumbnailViewportMutex_
+    void MergeFilmstripOwnership(WorkJob& queued, const WorkJob& incoming) const noexcept;
     bool JobTimedOut(const WorkJob& job) const noexcept;
     size_t EstimatedDecodeReservation(const WorkJob& job) const;
     bool DecodeWithBundledGuarded(const WorkJob& job, WorkResult& result,
@@ -156,6 +177,16 @@ private:
     static bool IsCoalescibleVisualJob(const WorkJob& job);
     static bool SameDecodeFamily(const WorkJob& a, const WorkJob& b);
     bool Enqueue(WorkJob job);
+    // Enqueue stages (0.9.5.0 round 19 split; no behaviour change). *Locked: mutex_ held.
+    bool ThumbnailDragAdmits(const WorkJob& job);
+    bool PassesEnqueueGates(WorkJob& job);
+    bool ReconcileViewLaneJobLocked(WorkJob& job);
+    bool RunningViewJobIsStaleForLocked(const WorkJob& job) const;
+    void RaiseDesiredVisualTargetLocked(const WorkJob& job);
+    std::deque<WorkJob>& QueueForPriorityLocked(JobPriority priority);
+    bool CoalesceQueuedVisualJobLocked(const WorkJob& job);
+    bool AbsorbPendingDuplicateLocked(const WorkJob& job);
+    bool PushNewJobLocked(WorkJob&& job);
     // viewForeground: Single/Compare is decoding the image on screen (P2). Only
     // interactive work and at most priority::kPoolCapDuringViewLoad thumbnail decodes
     // are admitted; prefetch / face / idle / analysis wait (core/priority_policy.h).
@@ -181,6 +212,60 @@ private:
     bool TryPostMetadataAbort(const WorkJob& job);
     bool TryPostResult(const WorkJob& job, const std::shared_ptr<WorkResult>& result);
     void Run(bool allowIdle, size_t threadIndex, bool metadataOnly = false, bool viewLane = false);
+    // Worker::Run stages (round 19 split; no behaviour change).
+    struct JobActivity {
+        bool visualJob = false;
+        bool tileJob = false;
+        bool foregroundVisual = false;
+        bool thumbnailJob = false;
+    };
+    // Per-job fingerprint and timing state shared by the execution stages.
+    struct JobRunContext {
+        uint64_t fileSize = 0;
+        int64_t modifiedStamp = 0;
+        int64_t sidecarStamp = 0;
+        bool fingerprinted = false;
+        bool queueBitmapCacheWrite = false;
+        double cacheLookupMs = 0.0;
+        double decodePathMs = 0.0;
+    };
+    bool WaitForNextJob(WorkJob& job, bool allowIdle, bool metadataOnly, bool viewLane,
+        std::uint64_t& observedDecoderSessionTrim,
+        std::chrono::steady_clock::time_point& metadataLaneWaitStart);
+    JobActivity BeginJobActivity(const WorkJob& job, bool viewLane, double queueWaitMs);
+    void AbandonJobWithoutBudget(const WorkJob& job, bool viewLane, const JobActivity& activity,
+        double queueWaitMs, double budgetWaitMs);
+    void PauseReadAheadForOversizedDecode(const WorkJob& job, size_t decodeReservationBytes,
+        const std::shared_ptr<DecodeBudget>& jobBudget);
+    void RequeueBlockedMetadataJob(WorkJob&& job, bool handleJobStarted);
+    void AbandonCancelledJob(const WorkJob& job, bool viewLane, const JobActivity& activity,
+        bool handleJobStarted, double queueWaitMs, double budgetWaitMs, bool oversizedReservation);
+    std::shared_ptr<WorkResult> CreateJobResult(const WorkJob& job,
+        std::shared_ptr<DecodeReservation> decodeReservation);
+    void FingerprintJobSource(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        JobRunContext& run, double& fingerprintMs);
+    void ExecuteJobKind(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, JobRunContext& run);
+    void ExecuteMetadataReadJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, JobRunContext& run);
+    void ExecuteExifJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, JobRunContext& run);
+    void ExecuteFaceJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, JobRunContext& run);
+    void ScoreFaceQualities(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, WorkResult& preview);
+    void ExecuteTileJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, JobRunContext& run);
+    void ExecuteDecodeJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, JobRunContext& run);
+    bool DecodePreviewJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, bool rawJpegOnly, bool raw);
+    bool DecodeFullJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, bool rawJpegOnly);
+    bool PublishJobResult(const WorkJob& job, const std::shared_ptr<WorkResult>& result,
+        ComPtr<IWICImagingFactory>& factory, JobRunContext& run, bool& resultWorkFailed, double& resultPostMs);
+    void PostWorkerExceptionFailure(const WorkJob& job, bool& resultPosted, bool& resultWorkFailed);
+    void LogCompletedJob(const WorkJob& job, const std::shared_ptr<WorkResult>& result, const JobRunContext& run,
+        double executionMs, double fingerprintMs, double resultPostMs, bool resultPosted, bool resultWorkFailed);
+    void WritePeriodicWorkerSnapshot();
     void QueueBitmapCacheWrite(const WorkJob& job, uint64_t fileSize, int64_t modifiedStamp,
         int64_t sidecarStamp, const std::shared_ptr<const WorkResult>& result);
     void RunCacheWriter();
@@ -253,6 +338,9 @@ private:
         int targetSize = 0;
         bool rawJpegPreviewOnly = false;
         std::wstring path;
+        // Round 21: identity used to detect a stale running job (fast A -> B -> A).
+        std::uint64_t requestEpoch = 0;
+        std::uint64_t generation = 0;
     } activeViewJob_;
     std::shared_ptr<DecodeBudget> viewDecodeBudget_;
     std::atomic<unsigned> viewForegroundQueued_{ 0 };
@@ -280,6 +368,9 @@ private:
     std::chrono::steady_clock::time_point idleNotBefore_ = std::chrono::steady_clock::now();
     std::atomic<uint64_t> activeGeneration_{ 0 };
     std::atomic<unsigned> activeVisualJobs_{ 0 };
+    // Subset of activeVisualJobs_ the metadata lane yields to (core/metadata_lane_policy.h).
+    std::atomic<unsigned> activeForegroundVisualJobs_{ 0 };
+    std::atomic<int> metadataLaneState_{ 0 }; // HUD: see WorkerTelemetrySnapshot
     std::atomic<unsigned> activeTileJobs_{ 0 };
     std::atomic<uint64_t> navigationEpoch_{ 0 };
     std::atomic<uint64_t> currentViewInteractionEpoch_{ 1 };
@@ -288,6 +379,9 @@ private:
     mutable std::mutex thumbnailViewportMutex_;
     std::unordered_set<std::wstring> desiredThumbnailPaths_;
     std::unordered_set<std::wstring> visibleThumbnailPaths_;
+    // Round 23 (guarded by thumbnailViewportMutex_): filmstrip decode window.
+    std::unordered_set<std::wstring> filmstripWindowPaths_;
+    bool filmstripWindowActive_ = false;
     std::atomic<int> activeThumbnailTarget_{ 0 };
     std::atomic<bool> rawJpegPreviewOnly_{ false };
     std::atomic<uint64_t> cacheEpoch_{ 1 };

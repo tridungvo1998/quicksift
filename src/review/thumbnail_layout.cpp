@@ -62,6 +62,20 @@ std::optional<std::size_t> HitTestThumbnail(const ThumbnailLayoutMetrics& metric
     return index;
 }
 
+ThumbnailRowRange VisibleThumbnailRows(const ThumbnailLayoutMetrics& metrics,
+    float scrollOffset, float viewportHeight) noexcept {
+    ThumbnailRowRange range{};
+    if (metrics.rows <= 0 || !(metrics.cellHeight > 0.0f) || !std::isfinite(scrollOffset) ||
+        !(viewportHeight > 0.0f)) return range;
+    const float top = (scrollOffset - metrics.topInset) / metrics.cellHeight;
+    const float bottom = (scrollOffset + viewportHeight - metrics.topInset) / metrics.cellHeight;
+    if (!std::isfinite(top) || !std::isfinite(bottom) || bottom < 0.0f) return range;
+    const float maxRow = static_cast<float>(metrics.rows - 1);
+    range.first = static_cast<int>(std::floor(std::clamp(top, 0.0f, maxRow + 1.0f)));
+    range.last = static_cast<int>(std::floor(std::clamp(bottom, 0.0f, maxRow)));
+    return range;
+}
+
 float ScrollToRevealThumbnail(const ThumbnailLayoutMetrics& metrics, std::size_t index,
     float currentScroll) noexcept {
     const std::size_t row = index / static_cast<std::size_t>(std::max(1, metrics.columns));

@@ -576,10 +576,10 @@ void MacOsUiFramework::PaintMediaCard(ID2D1RenderTarget* target,
     const float radius = std::clamp(presentation.radius, 0.0f,
         std::min(rect.right - rect.left, rect.bottom - rect.top) * 0.5f);
     const float pixel = DevicePixelDip(target);
-    const auto stroke = [&](ID2D1Brush* brush, float width, float inset) {
+    const auto stroke = [&](ID2D1Brush* brush, float width, float inset, ID2D1StrokeStyle* style = nullptr) {
         const float offset = inset + width * 0.5f;
         target->DrawRoundedRectangle(D2D1::RoundedRect(Inset(rect, offset),
-            std::max(0.0f, radius - offset), std::max(0.0f, radius - offset)), brush, width);
+            std::max(0.0f, radius - offset), std::max(0.0f, radius - offset)), brush, width, style);
     };
     if (presentation.paintSurface) {
         target->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brushes.panel);
@@ -587,7 +587,7 @@ void MacOsUiFramework::PaintMediaCard(ID2D1RenderTarget* target,
     }
     const float selection = presentation.focused ? tokens::kSelectionStrokeFocused : tokens::kSelectionStroke;
     if (presentation.warning && brushes.danger) {
-        stroke(brushes.danger, tokens::kSelectionStrokeFocused, 0.0f);
+        stroke(brushes.danger, tokens::kSelectionStrokeFocused, 0.0f, brushes.warningStroke);
         if (presentation.selected && brushes.accent)
             stroke(brushes.accent, selection * 0.75f, tokens::kSelectionStrokeFocused + 1.0f);
     } else if (presentation.selected && brushes.accent) {

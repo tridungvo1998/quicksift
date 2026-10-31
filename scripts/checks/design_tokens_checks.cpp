@@ -108,7 +108,8 @@ void CheckGlass() {
     for (const bool dark : { false, true }) {
         const tokens::GlassMaterial glass = tokens::Glass(dark, normal);
         Check(glass.fillAlpha > 0.9f && glass.fillAlpha < 1.0f, "glass body is translucent but legible");
-        Check(glass.highlightAlpha > 0.0f && glass.sheenAlpha > 0.0f, "glass has a specular edge and sheen");
+        Check(glass.highlightAlpha > 0.0f && (dark ? glass.sheenAlpha == 0.0f : glass.sheenAlpha > 0.0f),
+            "glass has a specular edge; sheen in light mode only (dark sheen read as a split)");
         for (const tokens::VisualEffects& effects : { highContrast, opaque }) {
             const tokens::GlassMaterial flat = tokens::Glass(dark, effects);
             Check(flat.fillAlpha == 1.0f, "reduced transparency / HC: opaque body");

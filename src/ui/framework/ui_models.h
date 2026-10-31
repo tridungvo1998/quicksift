@@ -172,6 +172,8 @@ class AlertPresenter {
 public:
     void Show(AlertRequest request);
     void Clear() noexcept;
+    // Live text update for a visible alert (blocking-wait dialog); keeps buttons/focus.
+    void UpdateMessage(std::wstring message) { if (visible_) request_.message = std::move(message); }
 
     bool Visible() const noexcept { return visible_; }
     const AlertRequest& Request() const noexcept { return request_; }

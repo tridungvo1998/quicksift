@@ -1,5 +1,6 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "diagnostics/log_and_continue.h"
 
 #include <unordered_set>
 
@@ -38,6 +39,7 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
                 std::max(1.0f, layout.canvasHeight) / std::max(1.0f, layout.cellHeight))) + 1);
             visibleEstimate = std::max(1, rows * std::max(1, layout.columns));
         } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Prefetch", L"CurrentThumbnailScrollLoadBudget");
             visibleEstimate = 0;
         }
         return quicksift::review::prefetch::ComputeScrollLoadBudget(velocity, sizeDip, visibleEstimate);
@@ -400,8 +402,11 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
                 const auto activeView = ResolveViewForPath(
                     activePath, activeArea, BaseViewForPath(activePath),
                     activePhoto.sourceWidth, activePhoto.sourceHeight);
+                // Unreserved width (filmstrip band added back) = RenderSingle's decode size.
+                const D2D1_SIZE_F canvasDip = CanvasSizeInDips();
+                const float reservedDip = FilmstripReservedDip(D2D1::RectF(0, 0, canvasDip.width, canvasDip.height));
                 const float baseEdge = std::max(
-                    1.0f, std::max(activeArea.right - activeArea.left,
+                    1.0f, std::max(activeArea.right - activeArea.left + reservedDip,
                                    activeArea.bottom - activeArea.top) * CanvasPixelScale() * 1.25f);
                 const float zoomFactor = std::max(1.0f, activeView.relativeZoom);
                 zoomMatchedTarget = std::max(
@@ -446,7 +451,11 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
                 // embedded preview so switching stays instant without spending
                 // CPU and hundreds of MiB on speculative full RAW conversions.
                 if (order == 0) {
-                    worker_.EnqueueFull(photo.path, target, generation_, priority, CacheClass::Preview, reviewState_.Epochs().navigation);
+                    // The active RAW's demosaic is foreground work: without the
+                    // view budget it was cancelled at 1.5 s and retried (choppy/stuck).
+                    worker_.EnqueueFull(photo.path, target, generation_, priority, CacheClass::Preview,
+                        reviewState_.Epochs().navigation, /*viewportEpoch*/ 0, /*retryAttempt*/ 0,
+                        /*forceWic*/ false, /*isSingleView*/ true);
                 }
             } else {
                 worker_.EnqueueFull(photo.path, target, generation_, priority, CacheClass::Preview, reviewState_.Epochs().navigation);
@@ -490,7 +499,9 @@ std::uint64_t ThumbnailViewportSignature(std::uint64_t generation, int target,
             const D2D1_RECT_F activeArea = ViewAreaForPath(base);
             const auto activeView = ResolveViewForPath(base, activeArea, BaseViewForPath(base),
                 activePhoto.sourceWidth, activePhoto.sourceHeight);
-            const float baseEdge = std::max(1.0f, std::max(activeArea.right - activeArea.left,
+            const D2D1_SIZE_F canvasDip = CanvasSizeInDips();
+            const float reservedDip = FilmstripReservedDip(D2D1::RectF(0, 0, canvasDip.width, canvasDip.height));
+            const float baseEdge = std::max(1.0f, std::max(activeArea.right - activeArea.left + reservedDip,
                 activeArea.bottom - activeArea.top) * CanvasPixelScale() * 1.25f);
             const float zoomFactor = std::max(1.0f, activeView.relativeZoom);
             zoomMatchedTarget = std::max(policy.prefetchTarget,

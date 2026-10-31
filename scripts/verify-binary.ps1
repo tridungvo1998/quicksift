@@ -8,6 +8,18 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Plain-language failure message (scripts\build-failure-help.ps1): every error that
+# stops this script prints "Build failed / What to do / Technical detail" and exits 1.
+. (Join-Path $PSScriptRoot 'build-failure-help.ps1')
+trap {
+    if (Get-Command Write-QuickSiftFailure -ErrorAction SilentlyContinue) {
+        Write-QuickSiftFailure $_ 'Binary' ''
+    } else {
+        Write-Host "Build failed: $_" -ForegroundColor Red
+    }
+    exit 1
+}
 $Path = (Resolve-Path $Path).Path
 if ([IO.Path]::GetExtension($Path) -ne '.exe') { throw 'Binary verification expects an .exe file.' }
 

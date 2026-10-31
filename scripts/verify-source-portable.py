@@ -181,6 +181,15 @@ def check_balanced(path: Path) -> None:
         fail(f"{path}: unmatched {char} opened near line {opening}")
 
 
+def app_internal_text(root: Path) -> str:
+    """The QuickSiftApplicationImpl declaration: the internal header plus the plain
+    state structs it inherits (src/app/state/*.h, 0.9.5.0 round 19)."""
+    text = read(root, "src/app/quicksift_application_internal.h")
+    for path in sorted((root / "src" / "app" / "state").glob("*.h")):
+        text += "\n" + path.read_text(encoding="utf-8-sig")
+    return text
+
+
 def function_body(text: str, signature: str) -> str:
     start = text.find(signature)
     if start < 0: fail(f"missing function: {signature}")
@@ -203,6 +212,7 @@ def verify(root: Path) -> None:
                      "build.cmd", "build-release.cmd", "build.bat", "package-msix.bat",
                      "open-in-visual-studio.cmd", "LICENSE", "SOURCE_CODE.txt",
                      "scripts/verify-source.ps1", "scripts/build.ps1", "scripts/package-msix.ps1",
+                     "scripts/build-failure-help.ps1",
                      "packaging/msix/AppxManifest.xml.in",
                      "packaging/msix/Assets/StoreLogo.png",
                      "packaging/msix/Assets/Square44x44Logo.png",
@@ -267,6 +277,34 @@ def verify(root: Path) -> None:
     if "const uint64_t viewportEpoch = PublishThumbnailViewport(0, {});" in viewport_controller_native:
         fail("predictive prefetch retains an unused viewport epoch under MSVC warnings-as-errors")
 
+    # 0.9.5.0 round 11: early theme, central relocalize pass, shared checkboxes.
+    run_body = function_body(read(root, "src/app/quicksift_application.cpp"), "int QuickSiftApplicationImpl::Run(")
+    early = run_body.find("LoadEarlyPresentationSettings()")
+    if early < 0 or not (early < run_body.find("RegisterClasses()") < run_body.find("CreateMainWindow(")):
+        fail("theme/language must be loaded (LoadEarlyPresentationSettings) before any window class or window is created")
+    ui_sources = {path: path.read_text(encoding="utf-8", errors="replace") for path in (root / "src").rglob("*.cpp")}
+    all_ui = "\n".join(ui_sources.values())
+    if "controlTextKeys_[id]" not in function_body(read(root, "src/ui/main_window_controls_layout_and_painting.cpp"),
+            "bool QuickSiftApplicationImpl::CreateMainWindowButton("):
+        fail("CreateMainWindowButton must register every caption for the relocalize pass")
+    relocalize = function_body(read(root, "src/ui/app_theme_documents_and_localization.cpp"),
+        "void QuickSiftApplicationImpl::RefreshLocalizedText(")
+    for token in ("controlTextKeys_", "LayoutControls(", "RefreshOpenDocumentWindows()", "UpdateBlockingWaitDialog()",
+            "userCommentLabel_", "settingsSectionLabels_", "InvalidateCanvas()"):
+        if token not in relocalize:
+            fail(f"central relocalize pass does not cover {token}")
+    for name in sorted(set(re.findall(r"void QuickSiftApplicationImpl::(Update\w+Button)\(\)", all_ui))):
+        if name + "()" not in relocalize:
+            fail(f"central relocalize pass does not refresh {name}")
+    for path, text in ui_sources.items():
+        if re.search(r"\bBS_(AUTO)?CHECKBOX\b", strip_cpp(text)):
+            fail(f"{path}: native Win32 checkbox; use the shared custom-drawn PaintCheckbox style")
+    apply_theme = function_body(read(root, "src/ui/app_theme_documents_and_localization.cpp"),
+        "void QuickSiftApplicationImpl::ApplyTheme(")
+    for token in ("flyoutBackdrop_", "RDW_ALLCHILDREN"):
+        if token not in apply_theme:
+            fail(f"ApplyTheme does not redraw {token}")
+
     main = read(root, "src/main.cpp")
     if "class QuickSiftApplication" in main or '#include "ui/' in main:
         fail("src/main.cpp is not a thin process entry point")
@@ -280,7 +318,7 @@ def verify(root: Path) -> None:
             "std::unique_ptr<QuickSiftApplicationImpl>" not in app_header:
         fail("QuickSiftApplication does not use the stable PIMPL boundary")
     if not app_internal_header.startswith("// OWNER:") or \
-            app_internal_header.count("class QuickSiftApplicationImpl {") != 1:
+            len(re.findall(r"class QuickSiftApplicationImpl\s*(?::[^{]*)?\{", app_internal_header)) != 1:
         fail("the private application implementation boundary is missing")
     if "src/app/quicksift_application_internal.h" not in read(root, "CMakeLists.txt"):
         fail("the private application implementation header is not registered in CMake")
@@ -454,8 +492,8 @@ def verify(root: Path) -> None:
                   "Never fall back to the executable directory for a packaged process"):
         if token not in data_paths:
             fail(f"portable/MSIX data-root contract is missing: {token}")
-    for token in ("kRetainedSessionLogs = 20", "ProbeDirectoryWriteAccess",
-                  "PruneSessionLogs", "platform::DataRootPath()", "platform::CacheDirectoryPath()"):
+    for token in ("CleanupOldDiagnosticFiles", "core/log_retention.h", "ProbeDirectoryWriteAccess",
+                  "platform::DataRootPath()", "platform::CacheDirectoryPath()"):
         if token not in diagnostics:
             fail(f"diagnostic retention/data-root contract is missing: {token}")
     if ("platform::CacheDirectoryPath()" not in persistent_cache or
@@ -473,10 +511,11 @@ def verify(root: Path) -> None:
     outside_migration = persistent_cache[:migrate_start] + persistent_cache[migrate_end:]
     if "ALTER TABLE image_records" in outside_migration:
         fail("unversioned cache/database compatibility remains: ALTER TABLE image_records outside MigrateSchema")
-    for token in ("kDatabaseSchemaVersion = 2", 'PRAGMA user_version;',
+    for token in ("kDatabaseSchemaVersion = 3", 'PRAGMA user_version;',
                   '"PRAGMA user_version=" + std::to_string(kDatabaseSchemaVersion)',
-                  "error != SQLITE_SCHEMA", "fromVersion != 1", "MigrateSchema(storedVersion)",
-                  "face_quality_version", "face_selection", "core::kFaceQualityAnalysisVersion"):
+                  "error != SQLITE_SCHEMA", "fromVersion < 1", "MigrateSchema(storedVersion)",
+                  "face_quality_version", "face_selection", "core::kFaceQualityAnalysisVersion",
+                  "camera_settings_known", "LookupCameraSettings", "UpdateCameraSettings"):
         if token not in persistent_cache:
             fail(f"versioned database schema contract is missing: {token}")
     if "platform::SessionFilePath()" not in session_controller:
@@ -546,10 +585,11 @@ def verify(root: Path) -> None:
     graphics_cache = read(root, "src/ui/graphics_resources_and_image_cache.cpp")
     canvas_rendering = read(root, "src/ui/canvas_rendering_and_overlays.cpp")
     result_integration = read(root, "src/ui/catalog_loading_and_result_integration.cpp")
-    app_internal_release = read(root, "src/app/quicksift_application_internal.h")
+    app_internal_release = app_internal_text(root)
     for token in ("Load only JPG previews for RAW", "ID_SETTING_RAW_JPEG_PREVIEWS_ONLY",
                   "SetRawJpegPreviewOnly", "LoadOnlyRawJpegPreviews"):
-        if token not in settings + session_controller + worker_header:
+        # The caption lives in the pane control catalog (the old Settings popup menu was dead code).
+        if token not in settings + session_controller + worker_header + read(root, "src/ui/ui_control_catalog.h"):
             fail(f"RAW JPG-preview-only setting contract is missing: {token}")
     for token in ("rawJpegPreviewOnly", "thumbnail->type != LIBRAW_IMAGE_JPEG",
                   "options.rawJpegPreviewOnly || Cancelled(options)"):
@@ -683,17 +723,25 @@ def verify(root: Path) -> None:
     for token in ("SetCompletionSinks", "WM_APP_FILE_TRANSACTION_COMPLETION"):
         if token not in application + chrome: fail(f"file completion delivery is missing {token}")
     close_alerts = read(root, "src/ui/canvas_rendering_and_overlays.cpp")
-    shutdown_ui = chrome + close_alerts
+    # Force quit (blocking-wait controller) is the close-with-pending-work path.
+    shutdown_ui = chrome + close_alerts + read(root, "src/ui/blocking_wait_controller.cpp")
     for token in ("transactions_.RequestCloseAtSafeBoundary", "transactions_.CancelAll",
                   "transactions_.Stop", "WM_QUERYENDSESSION", "WM_ENDSESSION",
                   "transactions_.CancelCloseRequest"):
         if token not in shutdown_ui: fail(f"shutdown does not contain transaction coordinator action: {token}")
-    for token in ("File operations are still running", "Close anyway", 'L"Wait"',
-                  "CloseWithPendingOperations", "closingAfterTransactionCancellation_"):
-        if token not in chrome + close_alerts + app_internal_release:
+    # 0.9.5.0: close goes through the live blocking-wait dialog (Force quit / Wait).
+    blocking_ui = read(root, "src/ui/blocking_wait_controller.cpp")
+    for token in ("ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::Close)", "Force quit", 'L"Wait"',
+                  "BlockingWaitPrimary", "closingAfterTransactionCancellation_", "force_quit_abandoned"):
+        if token not in chrome + close_alerts + app_internal_release + blocking_ui:
             fail(f"pending-file-operation close confirmation is missing: {token}")
-    if "transactions_.RequestCloseAtSafeBoundary()" not in close_alerts:
-        fail("Close anyway does not cancel transactions at a safe boundary")
+    # Force quit (the only close-with-pending-work path) stops transactions at a safe
+    # boundary; the never-raised CloseWithPendingOperations alert was removed in round 18.
+    if "transactions_.RequestCloseAtSafeBoundary()" not in strip_cpp(function_body(blocking_ui,
+            "void QuickSiftApplicationImpl::OnBlockingWaitPrimary(")):
+        fail("Force quit does not cancel transactions at a safe boundary")
+    if "CloseWithPendingOperations" in close_alerts + app_support_header:
+        fail("the dead CloseWithPendingOperations alert action must not come back (close goes through the blocking-wait dialog)")
     history_reconcile = history_ui + close_alerts + app_support_header + settings
     for token in ("RelinquishUndoHistory", "RelinquishRedoHistory",
                   "RelinquishGuardedHistory", "OfferExternalChangeHistoryReconcile",
@@ -861,7 +909,7 @@ def verify(root: Path) -> None:
     view_policy = read(root, "src/review/view_transform_policy.cpp")
     view_state = read(root, "src/ui/view_state_controller.cpp")
     navigation = read(root, "src/ui/navigation_input_and_session.cpp")
-    app_internal = read(root, "src/app/quicksift_application_internal.h")
+    app_internal = app_internal_text(root)
     worker = read(root, "src/work/background_work_engine.cpp")
     face_policy = read(root, "src/core/face_policy.cpp")
     for token in ("ZoomViewAt", "PanView", "physicalScale", "visibleSourceWidth",
@@ -947,6 +995,19 @@ def verify(root: Path) -> None:
     verify_ui_polish_contracts(root)
     verify_animation_contracts(root)
     verify_pane_frost_and_overlay_contracts(root)
+    verify_pane_scroll_paint_contracts(root)
+    verify_first_pane_paint_contracts(root)
+    verify_worker_lifetime_contracts(root)
+    verify_diagnostic_retention_contracts(root)
+    verify_dead_image_source_cache_removed(root)
+    verify_title_layout_contracts(root)
+    verify_app_state_split_contracts(root)
+    verify_session_log_browser_contracts(root)
+    verify_build_failure_help_contracts(root)
+    verify_log_and_continue_contracts(root)
+    verify_layout_constants_contracts(root)
+    verify_view_load_contracts(root)
+    verify_filmstrip_contracts(root)
 
 
 def verify_localization(root: Path) -> None:
@@ -993,7 +1054,10 @@ def verify_polish_contracts(root: Path) -> None:
     if "std::stable_sort(built.fragments.begin()" not in localization:
         fail("Localizer fragments are not applied longest-first")
     for check in ("write_lane_checks.cpp", "priority_policy_checks.cpp", "lock_order_checks.cpp",
-                  "localization_checks.cpp"):
+                  "localization_checks.cpp", "metadata_progress_checks.cpp", "ui_state_checks.cpp",
+                  "raw_preview_checks.cpp", "search_query_checks.cpp", "jpeg_xmp_checks.cpp",
+                  "sidecar_write_checks.cpp", "lifecycle_checks.cpp", "view_load_checks.cpp",
+                  "filmstrip_checks.cpp"):
         if not (root / "scripts" / "checks" / check).exists():
             fail(f"portable check program is missing: scripts/checks/{check}")
 
@@ -1058,7 +1122,9 @@ def verify_pane_frost_and_overlay_contracts(root: Path) -> None:
         fail("left-pane backdrop must be inserted ABOVE the canvas (LeftPaneBackdropInsertAfter), not after it")
     if "LeftPaneBackdropInsertAfter()" not in pane:
         fail("left-pane backdrop placement must use LeftPaneBackdropInsertAfter")
-    layout = pane[pane.find("void QuickSiftApplicationImpl::LayoutControls("):]
+    # Round 19: LayoutControls' section helpers sit directly above it, starting
+    # at PlacePaneChild; the pre-scroll window covers them and LayoutControls.
+    layout = pane[pane.find("void QuickSiftApplicationImpl::PlacePaneChild("):]
     layout = layout[:layout.find("closeFlyoutLayout();")]
     if "HideAllLeftPaneSectionContent()" in layout or "HideLeftPaneSectionContentExcept(" not in layout:
         fail("LayoutControls must hide only the inactive pane sections (no hide-all/re-show churn)")
@@ -1101,6 +1167,30 @@ def verify_animation_contracts(root: Path) -> None:
     for token in ("src/ui/framework/ui_animation.cpp", "src/ui/framework/ui_animation.h"):
         if token not in cmake:
             fail(f"{token} is not registered in CMake")
+    # Every dropdown anchor draws the popup chevron (single registry).
+    ids_header = read(root, "src/ui/ui_command_ids.h")
+    registry = re.search(r"kPopupMenuButtonIds\{(.*?)\};", ids_header, re.S)
+    registered = set(re.findall(r"ID_[A-Z0-9_]+", registry.group(1))) if registry else set()
+    for path in (root / "src" / "ui").rglob("*.cpp"):
+        for anchor_id in re.findall(r"TrackDropdownMenu\(controls_\[(ID_[A-Z0-9_]+)\]", strip_cpp(path.read_text(encoding="utf-8", errors="replace"))):
+            if anchor_id not in registered:
+                fail(f"{anchor_id} opens a dropdown but is missing from kPopupMenuButtonIds (no chevron)")
+    # Filter menus must not read files or the cache on the UI thread (0.9.5.0).
+    filters = strip_cpp(read(root, "src/ui/settings_filters_and_file_commands.cpp"))
+    hydrate = re.search(r"HydrateMetadataForFilters\(\)\s*\{(.*?)\n    \}", filters, re.S)
+    if not hydrate:
+        fail("HydrateMetadataForFilters is missing")
+    elif re.search(r"CreateFileW|ReadFile|ReadExifHeaderFacts|LookupCameraSettings|UpdateCameraSettings", hydrate.group(1)):
+        fail("HydrateMetadataForFilters performs I/O on the UI thread; queue it with QueueFactHydration")
+    for token in ("FilterValues().", ):
+        if token not in filters:
+            fail("filter menus must read the incremental CatalogStore::FilterValues() index")
+    if re.search(r"Show(Iso|Aperture|Focal|Shutter|Camera|Hour|Date)FilterMenu\(\)\s*\{[^}]*?PhotoCount\(\)", filters, re.S):
+        fail("a filter menu scans the whole catalog; use CatalogStore::FilterValues()")
+    if not (root / "scripts" / "checks" / "filter_index_and_queue_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/filter_index_and_queue_checks.cpp")
+    if not (root / "scripts" / "checks" / "hydrated_facts_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/hydrated_facts_checks.cpp")
     if not (root / "scripts" / "checks" / "animation_checks.cpp").exists():
         fail("portable check program is missing: scripts/checks/animation_checks.cpp")
     framework = read(root, "src/ui/framework/macos_ui_framework.cpp")
@@ -1137,6 +1227,505 @@ def verify_animation_contracts(root: Path) -> None:
     app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
     if "TickAnimations" not in app or "SetActivationHook" not in app or "UpdateAnimationCadence" not in app:
         fail("UpdateAnimations must drive the central Animator on the shared animation timer")
+
+
+def verify_pane_scroll_paint_contracts(root: Path) -> None:
+    """0.9.5.0 round 16: no paint at unscrolled layout rects; vacated rects repainted;
+    overflow tooltip is a self-painted, mouse-transparent framework popup."""
+    pane_raw = read(root, "src/ui/main_window_controls_layout_and_painting.cpp")
+    pane = strip_cpp(pane_raw)
+    # Round 19: LayoutControls' section helpers sit directly above it, starting
+    # at PlacePaneChild; the pre-scroll window covers them and LayoutControls.
+    layout = pane[pane.find("void QuickSiftApplicationImpl::PlacePaneChild("):]
+    layout_body = layout[:layout.find("closeFlyoutLayout();")]
+    # A synchronous repaint inside layout paints a pane child at its natural
+    # (unscrolled) rect before ApplyPaneScroll moves it with SWP_NOREDRAW.
+    if "UpdateLanguageSelectorButton(" in layout_body or \
+            re.search(r"\bSetWindowTextW\s*\(\s*(?!filmstripToggle_\b)", layout_body) or \
+            re.search(r"\b(?:UpdateWindow|RDW_UPDATENOW)\b", layout_body):
+        fail("LayoutControls must not repaint pane children at their unscrolled layout rects (no SetWindowTextW/UpdateWindow/RDW_UPDATENOW before ApplyPaneScroll)")
+    after = layout[layout.find("closeFlyoutLayout();"):]
+    if "ApplyPaneScroll(flyout)" not in after[:400]:
+        fail("LayoutControls must apply the pane scroll right after the section layout")
+    reposition = strip_cpp(function_body(pane_raw, "void QuickSiftApplicationImpl::RepositionPaneScroll("))
+    if reposition.count("InvalidateUnderHiddenPaneChild(") < 2:
+        fail("RepositionPaneScroll must invalidate the vacated rect on every move and hide")
+    hide = strip_cpp(function_body(pane_raw, "void QuickSiftApplicationImpl::HideLeftPaneSectionContentExcept("))
+    if "InvalidateUnderHiddenPaneChild(" not in hide:
+        fail("hiding a pane child must repaint what was under it")
+    apply_scroll = strip_cpp(function_body(pane_raw, "void QuickSiftApplicationImpl::ApplyPaneScroll("))
+    if "InvalidateUnderHiddenPaneChild(" not in apply_scroll:
+        fail("ApplyPaneScroll must repaint the area under children laid out outside the viewport")
+    selector = strip_cpp(function_body(read(root, "src/ui/popup_menus_commands_and_folder_tree.cpp"),
+        "void QuickSiftApplicationImpl::UpdateLanguageSelectorButton("))
+    if "wcscmp" not in selector:
+        fail("UpdateLanguageSelectorButton must only set the caption when it changes")
+    gdi = read(root, "src/ui/framework/macos_ui_framework_gdi.cpp")
+    create = strip_cpp(function_body(gdi, "HWND MacOsUiFramework::CreateOverflowTooltip("))
+    if "TOOLTIPS_CLASS" in create or "WS_EX_TRANSPARENT" not in create:
+        fail("the overflow tooltip must be the framework's own mouse-transparent popup")
+    if "HTTRANSPARENT" not in strip_cpp(gdi):
+        fail("the overflow tooltip window must be hit-test transparent")
+    for event in ("hover-enter", "armed", "timer-fired", "shown", "hidden", "marked-truncated", "show-skipped"):
+        if f'L"{event}"' not in gdi and f'L"{event}"' not in read(root, "src/ui/framework/macos_ui_framework.cpp"):
+            fail(f"overflow tooltip trace event is missing: {event}")
+
+
+def verify_first_pane_paint_contracts(root: Path) -> None:
+    """0.9.5.0 round 18: the first pane paint froze for seconds because the sidebar
+    tab label was GDI+ text; Gdiplus::Font from a family name loads GDI+'s whole
+    installed-font collection on first use. No GDI+ text anywhere; [Pane] timing stays."""
+    for path in sorted((root / "src").rglob("*.cpp")) + sorted((root / "src").rglob("*.h")):
+        text = strip_cpp(path.read_text(encoding="utf-8-sig", errors="replace"))
+        if re.search(r"\bGdiplus::(?:Font|FontFamily|InstalledFontCollection|PrivateFontCollection)\b", text) or \
+                re.search(r"\.\s*(?:DrawString|MeasureString)\s*\(", text):
+            fail(f"GDI+ text is not allowed (first use loads every installed font on the UI thread): {path.relative_to(root)}")
+    gdi = strip_cpp(function_body(read(root, "src/ui/framework/macos_ui_framework_gdi.cpp"),
+        "void MacOsUiFramework::PaintSidebarTab("))
+    if "SidebarTabFont(" not in gdi or "DrawTextW(" not in gdi:
+        fail("PaintSidebarTab must draw its label with GDI and the cached SidebarTabFont")
+    pane = read(root, "src/ui/main_window_controls_layout_and_painting.cpp")
+    for event in ("pane_open", "pane_reveal", "pane_first_paint", "pane_frost_capture", "pane_slow_paint"):
+        if f'L"{event}"' not in pane:
+            fail(f"[Pane] timing event is missing: {event}")
+    if "core/pane_timing.h" not in app_internal_text(root):
+        fail("the [Pane] timing recorder (core/pane_timing.h) must stay wired in")
+
+
+def verify_worker_lifetime_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: app-owned worker threads (ratings, batch, search, deferred
+    startup) carry a shutdown token, wake the UI only through PostFromWorker, and are
+    all joined by StopAllWorkersForTeardown before the persistent cache closes."""
+    for folder in ("src/app", "src/ui"):
+        for path in sorted((root / folder).rglob("*.cpp")):
+            text = strip_cpp(path.read_text(encoding="utf-8-sig", errors="replace"))
+            for match in re.finditer(r"std::thread\s*\(\s*\[([^\]]*)\]", text):
+                captures = match.group(1)
+                if re.search(r"(?<![\w.])this\b", captures) and "token = workerLifetime_.Issue()" not in captures:
+                    fail(f"worker thread captures this without a shutdown token: {path.relative_to(root)}")
+            if re.search(r"PostMessageW\s*\([^;]*WM_APP_(?:RATINGS_WORKER_DONE|BATCH_WORKER_DONE|SEARCH_WORKER|STARTUP_READY)\b", text):
+                fail(f"worker completion must be posted through PostFromWorker: {path.relative_to(root)}")
+    app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
+    stop = function_body(app, "void QuickSiftApplicationImpl::StopAllWorkersForTeardown(")
+    for token in ("workerLifetime_.Revoke()", "deferredStartupThread_.join()", "StopRatingsWorker()",
+                  "StopBatchWorker()", "StopSearchWorker()"):
+        if token not in stop:
+            fail(f"StopAllWorkersForTeardown is missing: {token}")
+    if stop.find("workerLifetime_.Revoke()") > stop.find("deferredStartupThread_.join()"):
+        fail("StopAllWorkersForTeardown must revoke the worker token before joining")
+    if "StopAllWorkersForTeardown()" not in function_body(app, "QuickSiftApplicationImpl::~QuickSiftApplicationImpl("):
+        fail("the application destructor must stop all workers")
+    post = function_body(app, "bool QuickSiftApplicationImpl::PostFromWorker(")
+    if "RunIfAlive" not in post:
+        fail("PostFromWorker must post only while the worker token is alive")
+    chrome = strip_cpp(read(root, "src/ui/main_window_chrome_and_messages.cpp"))
+    # Round 19: WM_DESTROY delegates to OnMainWindowDestroyed, which joins every app
+    # worker before StopServicesForShutdown closes the persistent cache.
+    destroy_case = chrome[chrome.find("case WM_DESTROY: {"):]
+    destroyed = function_body(chrome, "void QuickSiftApplicationImpl::OnMainWindowDestroyed(")
+    services = function_body(chrome, "void QuickSiftApplicationImpl::StopServicesForShutdown(")
+    stop_at = destroyed.find("StopAllWorkersForTeardown()")
+    services_at = destroyed.find("StopServicesForShutdown()")
+    if "case WM_DESTROY: {" not in chrome or "OnMainWindowDestroyed()" not in destroy_case[:120] or \
+            stop_at < 0 or services_at < 0 or stop_at > services_at or \
+            "persistentCache_.CloseForShutdown()" not in services or \
+            "persistentCache_.CloseForShutdown()" in destroyed:
+        fail("WM_DESTROY (normal close and Force quit) must stop all workers before the cache closes")
+    search = strip_cpp(read(root, "src/ui/thumbnail_search_controller.cpp"))
+    if re.search(r"\bhwnd_\b", function_body(search, "void QuickSiftApplicationImpl::SearchWorkerLoop(")):
+        fail("SearchWorkerLoop runs on the worker thread and must not read hwnd_")
+    deferred = function_body(app, "void QuickSiftApplicationImpl::StartDeferredStartup(")
+    lambda_body = deferred[deferred.find("std::thread"):]
+    if re.search(r"\bhwnd_\b", lambda_body[lambda_body.find("]"):]):
+        fail("the deferred startup worker must not read hwnd_")
+    if not (root / "scripts" / "checks" / "lifecycle_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/lifecycle_checks.cpp")
+
+
+def verify_diagnostic_retention_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: diagnostic files older than 7 days are deleted on a
+    background-priority thread; only QuickSift's own names in its own two folders,
+    never the current session log, never a reparse point, never recursive, logged."""
+    policy = read(root, "src/core/log_retention.h")
+    for token in ("kMaxAge{ 24 * 7 }", "Skip::CurrentSession", "Skip::ReparsePoint", "Skip::NotOurs",
+                  "Skip::WrongFolder"):
+        if token not in policy:
+            fail(f"diagnostic retention policy is missing: {token}")
+    log = strip_cpp(read(root, "src/diagnostics/diagnostic_log.cpp"))
+    cleanup = function_body(read(root, "src/diagnostics/diagnostic_log.cpp"), "CleanupSummary CleanupOldDiagnosticFiles(")
+    for token in ("lr::Plan(", "SessionLogPath()", "DeleteOwnDiagnosticFile(", "L\"old_file_deleted\"",
+                  "L\"cleanup_complete\"", "cancelled()"):
+        if token not in cleanup:
+            fail(f"diagnostic cleanup is missing: {token}")
+    if "DeleteFileW" in cleanup or "fs::remove" in cleanup:
+        fail("diagnostic cleanup must delete only through DeleteOwnDiagnosticFile (handle re-check, no link following)")
+    deleter = function_body(log, "DeleteOutcome DeleteOwnDiagnosticFile(")
+    for token in ("FILE_FLAG_OPEN_REPARSE_POINT", "FILE_ATTRIBUTE_REPARSE_POINT", "kMaxAge", "FileDispositionInfo"):
+        if token not in deleter:
+            fail(f"DeleteOwnDiagnosticFile is missing: {token}")
+    lister = function_body(log, "bool ListRetentionCandidates(")
+    if "FILE_ATTRIBUTE_REPARSE_POINT" not in lister:
+        fail("diagnostic cleanup must skip a Logs/CrashReports folder that is a reparse point")
+    for forbidden in ("recursive_directory_iterator", "remove_all", "SHFileOperation"):
+        if forbidden in log:
+            fail(f"diagnostic cleanup must never recurse or bulk-delete: {forbidden}")
+    app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
+    start = function_body(app, "void QuickSiftApplicationImpl::StartDiagnosticsCleanup(")
+    for token in ("THREAD_MODE_BACKGROUND_BEGIN", "CleanupOldDiagnosticFiles", "token.StopRequested()"):
+        if token not in start:
+            fail(f"diagnostic cleanup must run on a cancellable background-priority thread: {token}")
+    if "StartDiagnosticsCleanup()" not in function_body(app, "void QuickSiftApplicationImpl::StartDeferredStartup("):
+        fail("diagnostic cleanup must start after the first frame (StartDeferredStartup)")
+    if "diagnosticsCleanupThread_.join()" not in function_body(app, "void QuickSiftApplicationImpl::StopAllWorkersForTeardown("):
+        fail("teardown must join the diagnostic cleanup thread")
+    help_text = read(root, "src/localization.cpp")
+    if "older than 7 days" not in help_text or "cũ hơn 7 ngày" not in help_text:
+        fail("Help (EN and VI) must describe the 7-day diagnostic cleanup")
+    if "older than 7 days" not in read(root, "USER_GUIDE.md"):
+        fail("USER_GUIDE.md must describe the 7-day diagnostic cleanup")
+
+
+def verify_dead_image_source_cache_removed(root: Path) -> None:
+    """0.9.5.0 round 19: the Direct2D image-source cache (wicImageSources_) was never
+    drawn from (the UI thread never decodes); it stays gone. The Shell fallback owns
+    its WIC factory creation."""
+    for path in sorted((root / "src").rglob("*.cpp")) + sorted((root / "src").rglob("*.h")):
+        text = strip_cpp(path.read_text(encoding="utf-8-sig", errors="replace"))
+        for token in ("wicImageSources_", "WicImageSourceEntry", "GetOrCreateWicImageSource",
+                      "DrawWicImageSourceFit", "ClearWicImageSources", "CreateImageSourceFromWic",
+                      "ID2D1ImageSourceFromWic"):
+            if re.search(rf"\b{token}\b", text):
+                fail(f"the removed Direct2D image-source cache is back ({token}): {path.relative_to(root)}")
+    fallback = strip_cpp(function_body(read(root, "src/ui/graphics_resources_and_image_cache.cpp"),
+        "ComPtr<ID2D1Bitmap> QuickSiftApplicationImpl::GetOrCreateShellFallback("))
+    create = fallback.find("CoCreateInstance(CLSID_WICImagingFactory")
+    if create < 0 or create > fallback.find("GetImage("):
+        fail("the Shell fallback must create its WIC factory before calling GetImage")
+
+
+def verify_title_layout_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: LayoutControls re-lays the title bar only when one of its
+    inputs changed (TitleLayoutKey) or it was marked dirty (DPI, fonts, language, theme)."""
+    header = read(root, "src/app/quicksift_application_internal.h")
+    key = header[header.find("struct TitleLayoutKey {"):]
+    key = key[:key.find("\n    };")]
+    for token in ("int width", "UINT dpi", "bool fullscreen", "bool fullscreenTitleVisible", "bool singleOrCompare",
+                  "AppTheme theme", "widths", "operator=="):
+        if token not in key:
+            fail(f"TitleLayoutKey is missing an input: {token}")
+    layout = read(root, "src/ui/main_window_controls_layout_and_painting.cpp")
+    title = strip_cpp(function_body(layout, "void QuickSiftApplicationImpl::LayoutTitleControls("))
+    for token in ("CurrentTitleLayoutKey(width)", "titleLayoutApplied_ == key", "titleLayoutDirty_", "key.fullscreen",
+                  "key.widths"):
+        if token not in title:
+            fail(f"LayoutTitleControls skip guard is missing: {token}")
+    if "MeasuredTitleButtonWidthsPx()" in title:
+        fail("LayoutTitleControls must use the widths measured into its TitleLayoutKey")
+    if "MeasuredTitleButtonWidthsPx()" not in function_body(layout, "QuickSiftApplicationImpl::CurrentTitleLayoutKey("):
+        fail("TitleLayoutKey must include the measured caption widths")
+    controls = strip_cpp(function_body(layout, "void QuickSiftApplicationImpl::LayoutControls("))
+    if not re.search(r"LayoutTitleControls\(width,\s*false\)", controls):
+        fail("LayoutControls must call the guarded LayoutTitleControls(width, false)")
+    for relative, signature in (("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::OnDpiChanged("),
+                                ("src/ui/app_theme_documents_and_localization.cpp", "void QuickSiftApplicationImpl::RefreshLocalizedText("),
+                                ("src/ui/app_theme_documents_and_localization.cpp", "void QuickSiftApplicationImpl::ApplyTheme("),
+                                ("src/ui/main_window_chrome_and_messages.cpp", "void QuickSiftApplicationImpl::RecreateUiFonts(")):
+        if "MarkTitleLayoutDirty()" not in function_body(read(root, relative), signature):
+            fail(f"{signature.split('::')[-1]} must mark the title layout dirty")
+
+
+APP_STATE_STRUCTS = ("ChromeState", "PaneState", "ViewerState", "BrowseState", "MetadataState",
+                     "RatingsExchangeState", "BatchState", "SearchState", "HudState", "SessionLogBrowserState")
+
+
+LOG_AND_CONTINUE_EXEMPT = ("src/diagnostics/diagnostic_log.cpp", "src/main.cpp")
+LOG_AND_CONTINUE_EXEMPT_DIRS = ("src/ui/framework/", "src/platform/")
+
+
+def verify_log_and_continue_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: catch (...) boundaries in the Windows app layer log through
+    QS_LOG_AND_CONTINUE (noexcept, per-site rate limit) or say why they are silent
+    with QS_CATCH_SILENT_BY_DESIGN. The logger itself, the crash path, the portable
+    core library (no diagnostics dependency) and the UI framework (errorSink) are
+    exempt."""
+    core_header = strip_cpp(read(root, "src/core/log_and_continue.h"))
+    for token in ("bool Report(LogRateLimiter& limiter", ") noexcept {", "DescribeCurrentException() noexcept",
+                  "#define QS_CATCH_SILENT_BY_DESIGN(reason)"):
+        if token not in core_header:
+            fail(f"log-and-continue core contract is missing: {token}")
+    glue = strip_cpp(read(root, "src/diagnostics/log_and_continue.h"))
+    for token in ("inline void LogAndContinue(core::LogRateLimiter& limiter", "std::wstring_view site) noexcept {",
+                  "#define QS_LOG_AND_CONTINUE(category, site)", "static ::quicksift::core::LogRateLimiter",
+                  "kBurstPerSite"):
+        if token not in glue:
+            fail(f"QS_LOG_AND_CONTINUE contract is missing: {token}")
+    cmake = read(root, "CMakeLists.txt")
+    for header in ("src/core/log_and_continue.h", "src/diagnostics/log_and_continue.h"):
+        if header not in cmake:
+            fail(f"log-and-continue header is not registered in CMake: {header}")
+    core_block = re.search(r"add_library\(QuickSiftCore STATIC(.*?)\)", cmake, re.S)
+    core_files = set(core_block.group(1).split()) if core_block else set()
+    empty_catch = re.compile(r"catch\s*\(\s*\.\.\.\s*\)\s*\{\s*\}")
+    for path in sorted((root / "src").rglob("*.cpp")):
+        relative = path.relative_to(root).as_posix()
+        if relative in core_files or relative in LOG_AND_CONTINUE_EXEMPT or relative.startswith("src/core/") \
+                or any(relative.startswith(d) for d in LOG_AND_CONTINUE_EXEMPT_DIRS):
+            continue
+        if relative not in cmake:
+            continue
+        raw = path.read_text(encoding="utf-8-sig")
+        # Comments only (the pattern cannot appear inside the string literals used here).
+        text = re.sub(r"//[^\n]*", "", re.sub(r"/\*.*?\*/", lambda m: "\n" * m.group(0).count("\n"), raw, flags=re.S))
+        found = empty_catch.search(text)
+        if found:
+            line = text[:found.start()].count("\n") + 1
+            fail(f"empty catch (...) in {relative}:{line}; use QS_LOG_AND_CONTINUE or QS_CATCH_SILENT_BY_DESIGN")
+        if "QS_LOG_AND_CONTINUE(" in text and '#include "diagnostics/log_and_continue.h"' not in raw:
+            fail(f"{relative} uses QS_LOG_AND_CONTINUE without including diagnostics/log_and_continue.h")
+    checks = read(root, "scripts/checks/lifecycle_checks.cpp")
+    if "LogAndContinueChecks();" not in checks or '#include "core/log_and_continue.h"' not in checks:
+        fail("lifecycle_checks must exercise the log-and-continue helper")
+
+
+LAYOUT_CONSTANT_FUNCTIONS = (
+    ("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::LayoutFoldersSection("),
+    ("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::LayoutInfoSection("),
+    ("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::LayoutButtonFlowSection("),
+    ("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::LayoutSettingsSection("),
+    ("src/ui/main_window_controls_layout_and_painting.cpp", "void QuickSiftApplicationImpl::LayoutStatusBar("),
+    ("src/ui/main_window_chrome_and_messages.cpp", "LRESULT QuickSiftApplicationImpl::OnGetMinMaxInfo("),
+    ("src/ui/document_and_menu_models.cpp", "void PaintDocumentChrome("),
+    ("src/ui/document_and_menu_models.cpp", "RECT DocumentTitleCloseRect("),
+    ("src/ui/document_and_menu_models.cpp", "std::optional<LRESULT> DocumentHitTest("),
+    ("src/ui/document_and_menu_models.cpp", "void LayoutDocumentWindow("),
+)
+
+
+def verify_layout_constants_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: layout DIP values live in src/ui/ui_layout_constants.h (and
+    the shared ui_layout_metrics.h); the layout helpers pass named constants, never
+    integer literals, to DipToPx / px / Px or as a button fallback width."""
+    header = strip_cpp(read(root, "src/ui/ui_layout_constants.h"))
+    for token in ("namespace main_window", "namespace left_pane", "namespace status_bar", "namespace document",
+                  "kMinTrackWidthDip", "kInfoCommentHeightDip", "kSettingsRowHeightDip", "kCloseLightDiameterDip",
+                  "kButtonWidthDip"):
+        if token not in header:
+            fail(f"layout constants header is missing: {token}")
+    if "src/ui/ui_layout_constants.h" not in read(root, "CMakeLists.txt"):
+        fail("src/ui/ui_layout_constants.h is not registered in CMake")
+    literal = re.compile(r"\b(?:DipToPx|px|Px)\(\s*(?:\w+\s*\?\s*)?\d|\?\s*\d+\s*:\s*\d+\s*\)|FlyoutButtonWidthPx\([^;]*,\s*\d+\s*\)")
+    for relative, signature in LAYOUT_CONSTANT_FUNCTIONS:
+        source = read(root, relative)
+        if '#include "ui/ui_layout_constants.h"' not in source:
+            fail(f"{relative} must include ui/ui_layout_constants.h")
+        body = strip_cpp(function_body(source, signature))
+        found = literal.search(body)
+        if found:
+            fail(f"magic layout number in {signature} ({relative}): {found.group(0)}; use ui_layout_constants.h")
+
+
+def verify_app_state_split_contracts(root: Path) -> None:
+    """0.9.5.0 round 19: QuickSiftApplicationImpl's plain state lives in cohesive
+    structs (src/app/state/*.h) inherited privately; they hold data only (no methods,
+    no COM objects, whose release order stays in the main class)."""
+    header = read(root, "src/app/quicksift_application_internal.h")
+    for name in APP_STATE_STRUCTS:
+        if f"private state::{name}" not in header:
+            fail(f"QuickSiftApplicationImpl must inherit state::{name} privately")
+    state_dir = root / "src" / "app" / "state"
+    found = set()
+    for path in sorted(state_dir.glob("*.h")):
+        text = strip_cpp(path.read_text(encoding="utf-8-sig"))
+        found.update(re.findall(r"^struct (\w+State) \{", text, re.M))
+        if "ComPtr<" in text:
+            fail(f"COM objects stay in QuickSiftApplicationImpl (release order): {path.relative_to(root)}")
+        for line in text.splitlines():
+            if re.match(r"^\s+(?:static\s+)?[\w:<>,\s*&]+\s+[A-Z]\w*\([^)]*\)\s*(?:const)?\s*(?:noexcept)?\s*;\s*$", line):
+                fail(f"state structs hold data only (method declared): {path.relative_to(root)}: {line.strip()}")
+        if "src/app/state/" + path.name not in read(root, "CMakeLists.txt"):
+            fail(f"state header is not registered in CMake: {path.name}")
+    missing = set(APP_STATE_STRUCTS) - found
+    if missing:
+        fail("state structs are missing: " + ", ".join(sorted(missing)))
+
+
+def verify_session_log_browser_contracts(root: Path) -> None:
+    """0.9.5.0 round 20: the diagnostic log window can open previous session logs.
+    Read-only (never deletes or writes), only QuickSift's own session-log names in the
+    one Logs folder, reparse points skipped, bounded read, worker off the UI thread."""
+    policy = read(root, "src/core/session_log_browser.h")
+    for token in ("kMaxDisplayBytes", "kMaxListed", "candidate.reparsePoint", "currentSessionName",
+                  "Kind::SessionLog"):
+        if token not in policy:
+            fail(f"session log browser policy is missing: {token}")
+    log = strip_cpp(read(root, "src/diagnostics/diagnostic_log.cpp"))
+    if 'root / L"Logs"' not in function_body(read(root, "src/diagnostics/diagnostic_log.cpp"), "fs::path SessionLogDirectory("):
+        fail("SessionLogDirectory must be the one Logs folder under DataRootPath")
+    reader = function_body(log, "SessionLogText ReadSessionLogTail(")
+    for token in ("sl::IsBrowsableName(", "BrowsableLogsFolder()", "GENERIC_READ", "FILE_FLAG_OPEN_REPARSE_POINT",
+                  "FILE_ATTRIBUTE_REPARSE_POINT", "sl::PlanTail("):
+        if token not in reader:
+            fail(f"ReadSessionLogTail is missing: {token}")
+    if "GENERIC_WRITE" in reader or "DELETE" in reader.replace("FILE_SHARE_DELETE", ""):
+        fail("ReadSessionLogTail must open logs read-only")
+    if "FILE_ATTRIBUTE_REPARSE_POINT" not in function_body(log, "fs::path BrowsableLogsFolder("):
+        fail("the session log browser must not follow a Logs folder that is a reparse point")
+    controller = strip_cpp(read(root, "src/ui/session_log_browser_controller.cpp"))
+    for forbidden in ("DeleteFile", "fs::remove", "std::filesystem::remove", "MoveFile", "CreateFileW", "GENERIC_WRITE"):
+        if forbidden in controller:
+            fail(f"the session log browser is read-only and goes through diagnostic_log: {forbidden}")
+    for token in ("token = workerLifetime_.Issue()", "WM_APP_SESSION_LOG_WORKER_DONE", "ListPreviousSessionLogs()",
+                  "ReadSessionLogTail(", "TrackDropdownMenuVerbatim(", "DocumentKind::SessionLog"):
+        if token not in controller:
+            fail(f"session log browser controller is missing: {token}")
+    if "src/ui/session_log_browser_controller.cpp" not in read(root, "CMakeLists.txt") or \
+            "src/core/session_log_browser.h" not in read(root, "CMakeLists.txt"):
+        fail("session log browser files are not registered in CMake")
+    app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
+    if "StopSessionLogWorker()" not in function_body(app, "void QuickSiftApplicationImpl::StopAllWorkersForTeardown("):
+        fail("teardown must join the session log worker")
+    ids = read(root, "src/ui/ui_command_ids.h")
+    for token in ("ID_DOCUMENT_PREVIOUS_SESSIONS", "ID_DOCUMENT_SESSION_LOG_FIRST", "ID_DOCUMENT_SESSION_LOG_LAST"):
+        if token not in ids:
+            fail(f"session log browser command id is missing from ui_command_ids.h: {token}")
+    if "SessionLogBrowserChecks()" not in read(root, "scripts/checks/lifecycle_checks.cpp"):
+        fail("lifecycle_checks must exercise the session log browser policy")
+
+
+def verify_build_failure_help_contracts(root: Path) -> None:
+    """0.9.5.0 round 20: a build failure prints a plain-language explanation
+    (Build failed / What to do / Technical detail) and keeps a non-zero exit code."""
+    helper = read(root, "scripts/build-failure-help.ps1")
+    for token in ("function Write-QuickSiftFailure", "function Add-QuickSiftFailureHint", '"Build failed: "',
+                  "'What to do:'", '"Technical detail: "'):
+        if token not in helper:
+            fail(f"build failure helper is missing: {token}")
+    if any(ord(ch) > 127 for ch in helper):
+        fail("scripts/build-failure-help.ps1 must stay ASCII (Windows PowerShell 5.1 reads it as ANSI)")
+    for script in ("scripts/build.ps1", "scripts/verify-source.ps1", "scripts/verify-binary.ps1", "scripts/package-msix.ps1"):
+        text = read(root, script)
+        for token in (". (Join-Path $PSScriptRoot 'build-failure-help.ps1')", "Write-QuickSiftFailure $_", "exit 1"):
+            if token not in text:
+                fail(f"{script} must explain failures through build-failure-help.ps1: {token}")
+    if "Add-QuickSiftFailureHint $Line" not in read(root, "scripts/build.ps1"):
+        fail("build.ps1 must remember diagnostic lines for the failure explanation")
+    for wrapper in ("build.cmd", "build-release.cmd", "open-in-visual-studio.cmd", "package-msix.bat"):
+        text = read(root, wrapper)
+        for token in ('set "QS_EXIT=%ERRORLEVEL%"', "exit /b %QS_EXIT%", ":no_powershell", "exit /b 9009"):
+            if token not in text:
+                fail(f"{wrapper} must keep the exit code and explain a missing PowerShell: {token}")
+
+
+def verify_view_load_contracts(root: Path) -> None:
+    """0.9.5.0 round 21 (t29u): Single View load-stall fixes stay in place."""
+    if "src/core/view_load_policy.h" not in read(root, "CMakeLists.txt"):
+        fail("CMake does not list src/core/view_load_policy.h")
+    engine = strip_cpp(read(root, "src/work/background_work_engine.cpp"))
+    full = function_body(engine, "bool Worker::DecodeFullJob(")
+    if "!IsCancelled(job) && DecodeWithShell(" not in full:
+        fail("DecodeFullJob must not run the uncancellable Shell fallback after cancellation/timeout")
+    if "ViewDecodeInteractionEpoch(" not in function_body(engine, "void Worker::EnqueueViewDecode("):
+        fail("view-lane decodes must not be cancelled by the pan/zoom interaction epoch")
+    if "RunningViewJobIsStaleForLocked(job)" not in function_body(engine, "bool Worker::Enqueue("):
+        fail("a stale running view job must not absorb a new foreground request")
+    for signature in ("void Worker::AbandonJobWithoutBudget(", "void Worker::AbandonCancelledJob("):
+        if "RefreshReadAheadGate()" not in function_body(engine, signature):
+            fail(f"{signature} must re-evaluate the read-ahead gate")
+    cache = strip_cpp(read(root, "src/ui/graphics_resources_and_image_cache.cpp"))
+    if "ShouldRequestFullViewDecode(" not in function_body(cache, "BitmapEntry* QuickSiftApplicationImpl::GetOrRequestBitmap("):
+        fail("the RAW full request must stop once the exact bucket holds a full-quality result")
+    if "MaximumViewDecodeEdge()" not in function_body(cache, "int QuickSiftApplicationImpl::BucketFor("):
+        fail("decode buckets must be capped by the device's maximum bitmap edge")
+    integration = strip_cpp(read(root, "src/ui/catalog_loading_and_result_integration.cpp"))
+    if function_body(integration, "void QuickSiftApplicationImpl::AdmitDecodedPixels(").count("RejectUndisplayableDecode(") < 2:
+        fail("undisplayable decoded pixels must enter the bounded retry policy, not be dropped silently")
+    canvas = strip_cpp(read(root, "src/ui/canvas_rendering_and_overlays.cpp"))
+    if "singleViewStallWatch_.Observe(" not in function_body(canvas, "void QuickSiftApplicationImpl::RenderSingle("):
+        fail("RenderSingle must feed the Single View stall watchdog")
+    if "LogRateLimiter" not in function_body(canvas, "void QuickSiftApplicationImpl::LogSingleViewStall("):
+        fail("the Single View stall log must be rate-limited")
+    checks = read(root, "scripts/checks/view_load_checks.cpp")
+    for token in ("DecodeBudgetChecks()", "StallWatchChecks()", "StaleRunningJobChecks()"):
+        if token not in checks:
+            fail(f"view_load_checks must run {token}")
+
+
+def verify_filmstrip_contracts(root: Path) -> None:
+    """Round 22: Single View filmstrip audit guards."""
+    app = strip_cpp(read(root, "src/app/quicksift_application.cpp"))
+    canvas = strip_cpp(read(root, "src/ui/canvas_rendering_and_overlays.cpp"))
+    target = "filmstrip::ThumbnailTarget(ThumbnailDecodeTarget())"
+    if target not in function_body(app, "void QuickSiftApplicationImpl::PrefetchFilmstrip("):
+        fail("PrefetchFilmstrip must request the grid thumbnail target (shared cache)")
+    render = function_body(canvas, "void QuickSiftApplicationImpl::RenderFilmstrip(")
+    if target not in render:
+        fail("RenderFilmstrip must look up the grid thumbnail target")
+    if "ComPtr<ID2D1SolidColorBrush>" in render.replace("ComPtr<ID2D1SolidColorBrush>& brush", ""):
+        fail("RenderFilmstrip must reuse cached brushes, not create them per frame")
+    if "palette.accent" not in render or "palette.border" not in render:
+        fail("RenderFilmstrip borders must follow the theme palette")
+    if "SingleImageArea(" not in function_body(canvas, "void QuickSiftApplicationImpl::RenderSingle("):
+        fail("RenderSingle must use the shared (filmstrip-aware) image area")
+    view = strip_cpp(read(root, "src/ui/view_state_controller.cpp"))
+    if "SingleImageArea(" not in function_body(view, "D2D1_RECT_F QuickSiftApplicationImpl::ViewAreaForPath("):
+        fail("ViewAreaForPath must reserve the open filmstrip band")
+    cache = strip_cpp(read(root, "src/ui/graphics_resources_and_image_cache.cpp"))
+    discard = function_body(cache, "void QuickSiftApplicationImpl::DiscardDeviceResources(")
+    for token in ("shellFallbackCache_.clear()", "filmstripBackgroundBrush_.Reset()",
+                  "filmstripActiveBrush_.Reset()", "filmstripInactiveBrush_.Reset()"):
+        if token not in discard:
+            fail(f"DiscardDeviceResources must run {token}")
+    nav = strip_cpp(read(root, "src/ui/navigation_input_and_session.cpp"))
+    if "TakeWheelSteps(" not in function_body(nav, "void QuickSiftApplicationImpl::OnCanvasWheel("):
+        fail("wheel over the filmstrip must step images")
+    if "FilmstripContains(" not in function_body(nav, "void QuickSiftApplicationImpl::OnCanvasDoubleClick("):
+        fail("a double-click on the filmstrip must not toggle zoom")
+    if 'L"Filmstrip"' not in read(root, "src/ui/navigation_input_and_session.cpp"):
+        fail("the filmstrip preference must be saved in the session")
+    engine = strip_cpp(read(root, "src/work/background_work_engine.cpp"))
+    if "ThumbnailDecodeAdmitted(" not in function_body(engine, "WorkJob Worker::PopWork("):
+        fail("filmstrip thumbnail decodes must share the one-thumbnail cap during view load")
+    # Round 23: fade, decode window, badges, dashed blur outline.
+    if "SyncFilmstripMotion(" not in function_body(app, "void QuickSiftApplicationImpl::UpdateAnimations("):
+        fail("the animation tick must drive the filmstrip fade through SyncFilmstripMotion")
+    if "SyncFilmstripMotion(" not in function_body(app, "void QuickSiftApplicationImpl::ToggleFilmstrip("):
+        fail("ToggleFilmstrip must start the fade at once")
+    set_mode = function_body(nav, "void QuickSiftApplicationImpl::SetMode(")
+    if "SyncFilmstripMotion(" not in set_mode or "PublishFilmstripDecodeWindow(" not in set_mode:
+        fail("SetMode must sync the filmstrip fade and drop strip decodes outside Single View")
+    if "filmstripOpacity_" in function_body(app, "bool QuickSiftApplicationImpl::FilmstripContains("):
+        fail("filmstrip hit-testing must follow the logical state, not the animated opacity")
+    prefetch = function_body(app, "void QuickSiftApplicationImpl::PrefetchFilmstrip(")
+    publish_at = prefetch.find("PublishFilmstripDecodeWindow(")
+    request_at = prefetch.find("GetOrRequestBitmap(")
+    if publish_at < 0 or request_at < 0 or publish_at > request_at:
+        fail("PrefetchFilmstrip must publish the decode window before requesting cells")
+    if "FilmstripDecodeDropped(" not in function_body(engine, "bool Worker::IsCancelled("):
+        fail("in-flight filmstrip decodes outside the window must be cancelled")
+    perf = strip_cpp(read(root, "src/work/background_performance_controller.cpp"))
+    window_body = function_body(perf, "void Worker::SetFilmstripDecodeWindow(")
+    if "pending_.erase(" not in window_body or "RefreshReadAheadGate()" not in window_body:
+        fail("dropped filmstrip decodes must release their pending keys and re-evaluate the read-ahead gate")
+    if "filmstrip::DecodeDropped(" not in function_body(perf, "bool Worker::FilmstripDecodeDropped("):
+        fail("the filmstrip drop rule must come from core/filmstrip_policy.h")
+    badges = function_body(canvas, "void QuickSiftApplicationImpl::DrawThumbnailBadges(const PhotoItem& photo, D2D1_RECT_F area,")
+    if "std::vector" in badges or "Tr(" in badges:
+        fail("DrawThumbnailBadges must not allocate per frame")
+    if "DrawThumbnailBadges(" not in render or "blurOutlineStrokeStyle_" not in render:
+        fail("the filmstrip must reuse the grid badges and the dashed blur outline")
+    if "blurOutlineStrokeStyle_" not in function_body(canvas, "void QuickSiftApplicationImpl::RenderThumbnails("):
+        fail("the grid's blurry-photo outline must be dashed")
+    for token in ("blurOutlineBrush_.Reset()", "blurOutlineStrokeStyle_.Reset()"):
+        if token not in discard:
+            fail(f"DiscardDeviceResources must run {token}")
+    theme = strip_cpp(read(root, "src/ui/app_theme_documents_and_localization.cpp"))
+    if "blurOutlineBrush_.Reset()" not in function_body(theme, "void QuickSiftApplicationImpl::ApplyTheme("):
+        fail("ApplyTheme must recreate the theme-dependent blur outline brush")
+    checks = read(root, "scripts/checks/filmstrip_checks.cpp")
+    for token in ("CheckWindow()", "CheckHitTesting()", "CheckGeometry()", "CheckWheel()", "CheckScheduling()",
+                  "CheckFade()", "CheckDecodeWindow()", "CheckBadges()", "CheckBlurOutline()"):
+        if token not in checks:
+            fail(f"filmstrip_checks must run {token}")
 
 
 def main() -> int:
