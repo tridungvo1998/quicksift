@@ -245,6 +245,7 @@ void QuickSiftApplicationImpl::StopAllWorkersForTeardown() noexcept {
         if (localizer_.CurrentLanguage() != languageBefore) RefreshLocalizedText();
         worker_.SetRawJpegPreviewOnly(loadOnlyRawJpegPreviews_);
         RestoreSessionAfterCreate();
+        ApplyStartupPreferences(); // pin, first-run tip, one-time RAW preview notice
         const double totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         QS_LOG_EVENT(quicksift::diagnostics::Level::Info, L"Startup", L"ui_startup_ready",
             {L"success", success ? L"1" : L"0"},

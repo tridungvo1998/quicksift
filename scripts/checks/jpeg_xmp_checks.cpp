@@ -85,6 +85,28 @@ void CheckFields() {
         "out-of-range value -> fall back to Exiv2");
     Check(!metadata::FastJpegXmpFields(Jpeg({ { 0xE1, XmpPayload(kDescription) } }, false)),
         "truncated prefix -> fall back");
+    // 0.9.6.0 Lightroom / Capture One interop (core/xmp_interop_policy.h).
+    const auto lrReject = metadata::FastJpegXmpFields(Jpeg({ { 0xE1, XmpPayload(
+        "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:Rating=\"-1\"/>") } }));
+    Check(lrReject && lrReject->pickState.value == -1 && lrReject->rating.value == 0,
+        "Lightroom xmp:Rating=-1 -> rejected, 0 stars");
+    const auto qsReject = metadata::FastJpegXmpFields(Jpeg({ { 0xE1, XmpPayload(
+        "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""
+        " xmlns:quicksift=\"https://quicksift.local/ns/1.0/\" xmp:Rating=\"-1\" quicksift:Pick=\"-1\""
+        " quicksift:Rating=\"3\"/>") } }));
+    Check(qsReject && qsReject->pickState.value == -1 && qsReject->rating.value == 3,
+        "QuickSift reject keeps its stars in quicksift:Rating");
+    const auto unrejected = metadata::FastJpegXmpFields(Jpeg({ { 0xE1, XmpPayload(
+        "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""
+        " xmlns:quicksift=\"https://quicksift.local/ns/1.0/\" xmp:Rating=\"2\" quicksift:Pick=\"-1\""
+        " quicksift:Rating=\"3\"/>") } }));
+    Check(unrejected && unrejected->pickState.value == 0 && unrejected->rating.value == 2,
+        "un-rejected in another app -> not rejected, that app's stars");
+    const auto legacy = metadata::FastJpegXmpFields(Jpeg({ { 0xE1, XmpPayload(
+        "<rdf:Description rdf:about=\"\" xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\""
+        " xmlns:quicksift=\"https://quicksift.local/ns/1.0/\" xmp:Rating=\"4\" quicksift:Pick=\"-1\"/>") } }));
+    Check(legacy && legacy->pickState.value == -1 && legacy->rating.value == 4,
+        "pre-0.9.6 QuickSift reject (no quicksift:Rating) stays rejected with its stars");
 }
 
 // Minimal little-endian TIFF with IFD0 (Make, Model, ExifIFD) + Exif IFD (ISO).

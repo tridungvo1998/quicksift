@@ -44,7 +44,21 @@ struct BrowseState {
     bool badgePick_ = true;
     bool badgePair_ = false;
     bool copyMoveRawWithJpg_ = false;
-    bool loadOnlyRawJpegPreviews_ = false;
+    // 0.9.6.0: on by default (core/settings_migration.h); a full RAW decode still
+    // runs when Single View zooms past the embedded preview (fullRawOverridePath_).
+    bool loadOnlyRawJpegPreviews_ = true;
+    // Single View photo allowed a full RAW decode in JPG-preview mode (zoomed in).
+    std::wstring fullRawOverridePath_;
+    // 0 = picks are not mirrored to a colour label; 1..5 = that label
+    // (core/xmp_interop_policy.h PickCompanionLabel).
+    int pickLabelMapping_ = 0;
+    // "Advance after rating/pick/reject" (Caps Lock toggles it live; core/auto_advance_policy.h).
+    bool autoAdvance_ = false;
+    // First-run tip (core/first_run_tip.h): dismissed once, reset from Settings.
+    bool firstRunTipDismissed_ = false;
+    bool firstRunTipVisible_ = false;
+    // One-time notice that RAW now opens with embedded previews (settings migration).
+    bool rawPreviewDefaultNoticePending_ = false;
     AppTheme theme_ = AppTheme::Dark;
 
     std::uint32_t metadataDirectMask_ = kDefaultMetadataDirectMask;

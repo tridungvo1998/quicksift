@@ -60,15 +60,20 @@ namespace quicksift::app {
                         L"No included photos in this folder"));
             DrawCenteredText(Tr(message), bounds, largeText_.Get(), mutedBrush_.Get());
         } else if (reviewState_.Mode() == ViewMode::Thumbnails) {
+            UpdateFullRawOverride({}, false);
             RenderThumbnails(bounds);
         } else if (reviewState_.Mode() == ViewMode::Single) {
-            RenderSingle(bounds);
+            RenderSingle(bounds); // sets or clears the full-RAW override itself
         } else {
+            UpdateFullRawOverride({}, false);
             RenderCompare(bounds);
         }
         RenderFilmstrip(bounds);
+        DrawCapsLockAutoAdvanceIndicator();
+        DrawFirstRunTipOverlay();
         DrawSearchFieldOverlay(); // under toasts and the glass alert veil
         DrawToastOverlay();
+        DrawShortcutSheetOverlay(); // above toasts, below the glass alert
         DrawGlassAlertOverlay();
         DrawPerformanceHudOverlay();
         DrawThumbnailScrollbarOverlay();
@@ -841,7 +846,7 @@ namespace quicksift::app {
         // 400 ms backstop repainted (and, for RAW, re-decoded) forever.
         const int readyEdge = quicksift::core::view_load::SatisfiableViewEdge(displayDesired,
             nativeEdge, MaximumViewDecodeEdge());
-        const bool previewIsFinal = loadOnlyRawJpegPreviews_ && IsRawExtension(photo.extension);
+        const bool previewIsFinal = IsRawExtension(photo.extension) && RawPreviewOnlyFor(photo.path.native());
         if (BitmapSatisfiesDisplay(bitmap, readyEdge, !previewIsFinal)) return true;
         if (previewIsFinal) return false;
         const auto exact = bitmapCache_.find(CacheKey{ photo.path.wstring(),
@@ -900,6 +905,9 @@ namespace quicksift::app {
         int fallbackHeight = bitmap ? bitmap->sourceHeight : 0;
         auto resolvedView = ResolveViewForPath(reviewState_.SinglePath(), imageArea, state,
             fallbackWidth, fallbackHeight);
+        // JPG-preview mode: zooming past Fit on a RAW decodes that one RAW in full.
+        UpdateFullRawOverride(reviewState_.SinglePath(),
+            resolvedView.relativeZoom > 1.001f && IsRawExtension(photo.extension));
         int displayDesired = baseDesired;
         if (resolvedView.relativeZoom > 1.001f) {
             // Once the user zooms past Fit, request the actual native-resolution
@@ -1479,7 +1487,7 @@ namespace quicksift::app {
     void QuickSiftApplicationImpl::RenderVisibleTiles(const PhotoItem& photo,
         const D2D1_RECT_F& area, const quicksift::review::transform::ResolvedView& view,
         const BitmapEntry* baseBitmap) {
-        if (loadOnlyRawJpegPreviews_ && IsRawExtension(photo.extension)) return;
+        if (IsRawExtension(photo.extension) && RawPreviewOnlyFor(photo.path.native())) return;
         if (!systemProfile_.enablePersistentPyramid || IsActivelyInteracting() ||
             view.state.rotation != 0 || view.relativeZoom < 1.35f ||
             photo.sourceWidth <= 0 || photo.sourceHeight <= 0 ||

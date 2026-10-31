@@ -637,6 +637,80 @@ const std::initializer_list<TranslationPair> kTranslations{
         L"Tác vụ nền đã dừng"},
     TranslationPair{L"A background task stopped unexpectedly. Details were written to the diagnostic log.",
         L"Một tác vụ nền đã dừng bất ngờ. Chi tiết đã được ghi vào nhật ký chẩn đoán."},
+    // 0.9.6.0: interop, auto-advance, shortcut sheet, first-run tip, pinned pane.
+    TranslationPair{L"Purple label", L"Nhãn tím"},
+    TranslationPair{L"Clear colour label", L"Xóa nhãn màu"},
+    TranslationPair{L"Retry images that failed to load", L"Thử tải lại ảnh bị lỗi"},
+    TranslationPair{L"Select all (Thumbnails)", L"Chọn tất cả (Ảnh thu nhỏ)"},
+    TranslationPair{L"Search thumbnails", L"Tìm trong ảnh thu nhỏ"},
+    TranslationPair{L"Set star rating", L"Đặt số sao"},
+    TranslationPair{L"Clear star rating", L"Xóa số sao"},
+    TranslationPair{L"Remove pick or reject", L"Bỏ chọn hoặc bỏ loại"},
+    TranslationPair{L"Red, yellow, green, blue label", L"Nhãn đỏ, vàng, xanh lá, xanh dương"},
+    TranslationPair{L"Caps Lock", L"Caps Lock"},
+    TranslationPair{L"Auto-advance while on", L"Tự chuyển ảnh khi bật"},
+    TranslationPair{L"Previous photo", L"Ảnh trước"},
+    TranslationPair{L"Next photo", L"Ảnh tiếp theo"},
+    TranslationPair{L"Row up (Thumbnails) / previous", L"Lên một hàng (Ảnh thu nhỏ) / ảnh trước"},
+    TranslationPair{L"Row down (Thumbnails) / next", L"Xuống một hàng (Ảnh thu nhỏ) / ảnh sau"},
+    TranslationPair{L"Home", L"Home"},
+    TranslationPair{L"First photo", L"Ảnh đầu tiên"},
+    TranslationPair{L"End", L"End"},
+    TranslationPair{L"Last photo", L"Ảnh cuối cùng"},
+    TranslationPair{L"Open selection in Single or Compare", L"Mở vùng chọn ở chế độ Một ảnh hoặc So sánh"},
+    TranslationPair{L"Switch between Thumbnails and Single", L"Chuyển giữa Ảnh thu nhỏ và Một ảnh"},
+    TranslationPair{L"Back to Thumbnails", L"Quay lại Ảnh thu nhỏ"},
+    TranslationPair{L"Fit to window", L"Vừa cửa sổ"},
+    TranslationPair{L"Zoom to 100% pixels", L"Phóng to 100% điểm ảnh"},
+    TranslationPair{L"Rotate view", L"Xoay khung xem"},
+    TranslationPair{L"Show or hide the filmstrip", L"Hiện hoặc ẩn dải ảnh"},
+    TranslationPair{L"Move selection to the Deleted folder", L"Chuyển vùng chọn vào thư mục Deleted"},
+    TranslationPair{L"Show or hide this shortcut sheet", L"Hiện hoặc ẩn bảng phím tắt này"},
+    TranslationPair{L"Last photo — auto-advance stopped here.", L"Ảnh cuối cùng — tự chuyển ảnh dừng tại đây."},
+    TranslationPair{L"Pin pane", L"Ghim ngăn"},
+    TranslationPair{L"Keep the command pane open and give it its own space", L"Giữ ngăn lệnh luôn mở và dành riêng chỗ cho nó"},
+    TranslationPair{L"Unpin pane", L"Bỏ ghim ngăn"},
+    TranslationPair{L"Let the command pane close again when the pointer leaves it", L"Cho phép ngăn lệnh tự đóng khi con trỏ rời khỏi"},
+    TranslationPair{L"Command pane pinned open.", L"Đã ghim ngăn lệnh luôn mở."},
+    TranslationPair{L"Command pane unpinned; it opens on hover.", L"Đã bỏ ghim ngăn lệnh; ngăn sẽ mở khi rê chuột."},
+    TranslationPair{L"RAW photos now open with their embedded JPG previews for speed. Zooming in loads the full RAW. Change this in Settings → RAW handling.", L"Ảnh RAW giờ mở bằng ảnh xem trước JPG nhúng để nhanh hơn. Khi phóng to, QuickSift sẽ tải toàn bộ RAW. Bạn có thể đổi trong Cài đặt → Xử lý RAW."},
+    TranslationPair{L"CULLING & METADATA", L"LỌC ẢNH & METADATA"},
+    TranslationPair{L"Culling and metadata", L"Lọc ảnh và metadata"},
+    TranslationPair{L"QuickSift will move {count} selected photo and matching XMP sidecars into:\n\n{folder}\n\nThis does not use the Recycle Bin. You can Undo while the protected file-operation history remains available.", L"QuickSift sẽ chuyển {count} ảnh đã chọn cùng các tệp XMP sidecar tương ứng vào:\n\n{folder}\n\nThao tác này không dùng Thùng rác. Bạn có thể Hoàn tác khi bản ghi lịch sử được bảo vệ vẫn còn khả dụng."},
+    TranslationPair{L"QuickSift will move {count} selected photos and matching XMP sidecars into:\n\n{folder}\n\nThis does not use the Recycle Bin. You can Undo while the protected file-operation history remains available.", L"QuickSift sẽ chuyển {count} ảnh đã chọn cùng các tệp XMP sidecar tương ứng vào:\n\n{folder}\n\nThao tác này không dùng Thùng rác. Bạn có thể Hoàn tác khi bản ghi lịch sử được bảo vệ vẫn còn khả dụng."},
+    TranslationPair{L"Picks no longer add a colour label.", L"Ảnh được chọn sẽ không còn tự gắn nhãn màu."},
+    TranslationPair{L"New picks also get this colour label, so Lightroom and Capture One can see them.", L"Ảnh được chọn mới sẽ được gắn nhãn màu này để Lightroom và Capture One nhận ra."},
+    TranslationPair{L"Mark picks with a label: {color}", L"Gắn nhãn cho ảnh được chọn: {color}"},
+    TranslationPair{L"Mark picks with a label: None", L"Gắn nhãn cho ảnh được chọn: Không"},
+    TranslationPair{L"Auto-advance on: rating, pick or reject moves to the next photo.", L"Đã bật tự chuyển ảnh: đánh giá, chọn hoặc loại sẽ chuyển sang ảnh tiếp theo."},
+    TranslationPair{L"Auto-advance off. Turn Caps Lock on to use it temporarily.", L"Đã tắt tự chuyển ảnh. Bật Caps Lock để dùng tạm thời."},
+    TranslationPair{L"Keyboard shortcuts", L"Phím tắt"},
+    TranslationPair{L"Press ? or Esc to close", L"Nhấn ? hoặc Esc để đóng"},
+    TranslationPair{L"Welcome to QuickSift", L"Chào mừng bạn đến với QuickSift"},
+    TranslationPair{L"Move the pointer to the left edge to open the command pane, or pin it open with its Pin button.", L"Đưa con trỏ tới mép trái để mở ngăn lệnh, hoặc ghim ngăn luôn mở bằng nút Ghim."},
+    TranslationPair{L"Press ? at any time for keyboard shortcuts.", L"Nhấn ? bất cứ lúc nào để xem phím tắt."},
+    TranslationPair{L"Click this tip to dismiss it.", L"Nhấp vào gợi ý này để đóng."},
+    TranslationPair{L"Auto-advance on (Caps Lock)", L"Đang tự chuyển ảnh (Caps Lock)"},
+    TranslationPair{L"Advance after rating/pick/reject", L"Tự chuyển ảnh sau khi đánh giá/chọn/loại"},
+    TranslationPair{L"Keyboard shortcuts (?)", L"Phím tắt (?)"},
+    TranslationPair{L"Show the welcome tip again", L"Hiện lại gợi ý chào mừng"},
+    TranslationPair{L"Rate and cull", L"Đánh giá và lọc ảnh"},
+    TranslationPair{L"Navigate", L"Di chuyển"},
+    TranslationPair{L"View", L"Xem"},
+    TranslationPair{L"Edit and files", L"Chỉnh sửa và tệp"},
+    TranslationPair{L"Symbolic-link image paths are not moved or deleted for safety.", L"Để an toàn, đường dẫn ảnh là liên kết tượng trưng sẽ không được di chuyển hoặc xóa."},
+    TranslationPair{L"The source file is missing or inaccessible.", L"Tệp nguồn bị thiếu hoặc không truy cập được."},
+    TranslationPair{L"QuickSift could not safely inspect the matching XMP sidecar.", L"QuickSift không thể kiểm tra an toàn tệp XMP sidecar tương ứng."},
+    TranslationPair{L"The matching XMP is a symbolic link and was left untouched for safety.", L"Tệp XMP tương ứng là liên kết tượng trưng nên được giữ nguyên để an toàn."},
+    TranslationPair{L"The matching XMP path is not a normal file.", L"Đường dẫn XMP tương ứng không phải là tệp thông thường."},
+    TranslationPair{L"QuickSift could not finish checking whether this XMP is shared.", L"QuickSift không thể hoàn tất kiểm tra xem tệp XMP này có được dùng chung hay không."},
+    TranslationPair{L"This XMP sidecar is shared by another media file, so moving it would detach metadata from that file.", L"Tệp XMP sidecar này được dùng chung với một tệp media khác, nên di chuyển nó sẽ tách metadata khỏi tệp đó."},
+    TranslationPair{L"The destination is the same as the source.", L"Đích đến trùng với nguồn."},
+    TranslationPair{L"Delete-to-folder was stopped before any files were changed.", L"Thao tác xóa vào thư mục đã dừng trước khi bất kỳ tệp nào bị thay đổi."},
+    TranslationPair{L"Move was stopped before any files were changed.", L"Thao tác di chuyển đã dừng trước khi bất kỳ tệp nào bị thay đổi."},
+    TranslationPair{L"Copy was stopped before any files were changed.", L"Thao tác sao chép đã dừng trước khi bất kỳ tệp nào bị thay đổi."},
+    TranslationPair{L"Plus {count} other conflict(s).", L"Và {count} xung đột khác."},
+    TranslationPair{L"QuickSift never overwrites or automatically renames files.", L"QuickSift không bao giờ ghi đè hoặc tự động đổi tên tệp."},
 };
 
 // Longer fragments come first. This second pass localizes generated status,
@@ -1180,6 +1254,8 @@ PHÍM TẮT
 • Nhãn màu: 6 (Đỏ), 7 (Vàng), 8 (Xanh lá), 9 (Xanh dương), Ctrl+5 (Tím), Ctrl+0 (xóa nhãn).
 • Xem ảnh: Con lăn (thu phóng), Kéo (di chuyển), F (vừa khung), Z (100%), R (xoay), F11 (toàn màn hình), F7 (thanh phim: hiện/ẩn mờ dần; nhấp hoặc lăn chuột trên thanh để chuyển ảnh; ảnh thu nhỏ có huy hiệu số sao và Chọn/Loại; trạng thái bật/tắt được ghi nhớ).
 • Lịch sử: Ctrl+Z (hoàn tác), Ctrl+Y (làm lại).
+• Trợ giúp: ? (hiện hoặc ẩn bảng phím tắt; nhấn ? hoặc Esc để đóng).
+• Tự chuyển ảnh: khi bật Caps Lock, các phím 1–5, 0, P, X và U sẽ chuyển sang ảnh tiếp theo, giống Lightroom. Một nhãn ở đầu ảnh cho biết chế độ này đang bật.
 • Tìm kiếm (chế độ Ảnh thu nhỏ): Ctrl+F (đặt con trỏ vào ô tìm kiếm), Enter/Tab/Mũi tên xuống (áp dụng và về lưới), Esc (xóa nội dung; bấm lần nữa để rời ô).
 
 BẮT ĐẦU
@@ -1194,6 +1270,8 @@ CHỌN VÀ XẾP HẠNG
 • Pick / Reject / Unmark: đánh dấu ảnh chọn, ảnh loại hoặc bỏ đánh dấu.
 • Label: gán nhãn màu. Phím 6–9 gán Đỏ, Vàng, Xanh lá và Xanh dương; Ctrl+5 gán Tím; Ctrl+0 xóa nhãn.
 • Các thao tác áp dụng cho toàn bộ ảnh đang chọn trong chế độ ảnh thu nhỏ.
+• Tự chuyển ảnh: bật Cài đặt → Lọc ảnh và metadata → “Tự chuyển ảnh sau khi đánh giá/chọn/loại”, hoặc bật Caps Lock, để chuyển sang ảnh tiếp theo sau phím đánh giá, chọn hoặc loại. Tính năng hoạt động ở chế độ Một ảnh và Ảnh thu nhỏ khi thao tác trên một ảnh (không áp dụng cho So sánh hoặc khi chọn nhiều ảnh). Nếu bộ lọc ẩn ảnh vừa đánh dấu, ảnh thế chỗ sẽ là ảnh tiếp theo. Ở ảnh cuối cùng, QuickSift giữ nguyên và thông báo.
+• Lightroom và Capture One: ảnh bị loại được lưu với xếp hạng −1, cả hai ứng dụng đều hiểu là bị loại. QuickSift lưu riêng số sao nên khi bỏ loại, số sao được khôi phục; giá trị −1 do các ứng dụng đó ghi cũng hiển thị là bị loại tại đây. Ảnh chọn là trường riêng của QuickSift; để ứng dụng khác thấy được, hãy chọn một màu trong “Gắn nhãn cho ảnh được chọn”. Khi đó, chọn ảnh sẽ gắn nhãn màu đó cho ảnh chưa có nhãn, bỏ chọn sẽ gỡ nhãn. Nhãn bạn tự đặt không bao giờ bị thay thế.
 
 XEM ẢNH
 • Con lăn chuột: phóng to/thu nhỏ.
@@ -1278,7 +1356,7 @@ GIẢI MÃ VÀ LẬP LỊCH
 • Yêu cầu lỗi thời bị hủy bằng generation/navigation epoch. Yêu cầu cùng nguồn được hợp nhất; chất lượng cao hơn có thể phục vụ các mức thấp hơn.
 • Cảnh báo khuôn mặt đánh giá từng khuôn mặt trên ảnh giải mã độ phân giải cao: độ chi tiết Laplacian chuẩn hóa theo kích thước và độ tương phản (lệch nét), độ dị hướng của chi tiết (nhòe chuyển động), và một phép kiểm tra lòng trắng mắt thận trọng (nhắm mắt). Tất cả chạy trên luồng nền và được lưu vào bộ nhớ đệm.
 • Mọi nút lọc (Stars, Pick state, Labels, Format, Date, ISO, Khẩu độ, Tiêu cự, Tốc độ màn trập, Máy ảnh, Giờ) đều có mũi tên thả xuống và cùng cách căn chỉnh.
-• Khi bật “Chỉ tải ảnh xem trước JPG cho RAW”, chế độ Một ảnh hiển thị JPG nhúng lớn nhất trong tệp RAW ở chất lượng đầy đủ.
+• Khi bật “Chỉ tải ảnh xem trước JPG cho RAW”, chế độ Một ảnh hiển thị JPG nhúng lớn nhất trong tệp RAW ở chất lượng đầy đủ. Đây là mặc định từ 0.9.6.0. Khi phóng to quá mức Vừa khung (hoặc 100%) trên ảnh RAW, QuickSift giải mã đầy đủ riêng ảnh RAW đó để bạn kiểm tra độ nét.
 • Ảnh RAW đang xem (Một ảnh hoặc So sánh) có đủ thời gian giải mã; trước đây nhiều ảnh bị hủy sau 1,5 giây và thử lại nên trông như bị khựng hoặc kẹt.
 • JPEG dùng đường TurboJPEG khi có lợi; WIC là đường tương thích. RAW ưu tiên preview nhúng trước khi demosaic. AVIF dùng libavif/dav1d với libyuv.
 • WIC native transforms, thumbnail nhúng và progressive refinement được dùng khi codec/driver hỗ trợ.
@@ -1329,6 +1407,8 @@ KEYBOARD SHORTCUTS
 • Color labels: 6 (Red), 7 (Yellow), 8 (Green), 9 (Blue), Ctrl+5 (Purple), Ctrl+0 (clear label).
 • Viewing: Mouse wheel (zoom), Drag (pan), F (fit), Z (100%), R (rotate), F11 (fullscreen), F7 (filmstrip: fades in and out; click or scroll over the strip to change images; thumbnails show star-rating and Pick/Reject badges; on/off is remembered).
 • History: Ctrl+Z (undo), Ctrl+Y (redo).
+• Help: ? (show or hide the keyboard shortcut sheet; ? or Esc closes it).
+• Auto-advance: Caps Lock on makes 1–5, 0, P, X and U move to the next photo, the way Lightroom does. A pill at the top of the photo shows when it is on.
 • Search (Thumbnail view): Ctrl+F (focus the search field), Enter/Tab/Down (apply and return to the grid), Esc (clear; press again to leave the field).
 
 GETTING STARTED
@@ -1343,6 +1423,8 @@ CULLING AND RATING
 • Pick / Reject / Unmark marks a keeper, a reject, or clears the cull mark.
 • Label assigns a color label. Keys 6–9 assign Red, Yellow, Green, and Blue; Ctrl+5 assigns Purple; Ctrl+0 clears the label.
 • In thumbnail view, these actions apply to the whole current selection.
+• Auto-advance: turn on Settings → Culling and metadata → “Advance after rating/pick/reject”, or hold Caps Lock on, to move to the next photo after a rating, pick or reject key. It works in Single and Thumbnail view for one photo at a time (not in Compare or with several selected). If a filter hides the photo you just marked, the photo that takes its place is next. At the last photo QuickSift stays put and says so.
+• Lightroom and Capture One: a reject is saved as rating −1, which both apps read as rejected. QuickSift keeps the stars separately, so un-rejecting brings them back, and a −1 written by those apps shows as a reject here. Picks are QuickSift’s own field; to make them visible elsewhere, choose a colour in “Mark picks with a label”. Picking then adds that label to unlabelled photos, and un-picking removes it again. A label you chose yourself is never replaced.
 
 VIEWING
 • Mouse wheel: zoom in or out.
@@ -1427,7 +1509,7 @@ DECODING AND SCHEDULING
 • Obsolete work is cancelled through generation/navigation epochs. Requests for the same source are coalesced; a higher-quality decode may satisfy lower levels.
 • The face warning analyzes every face on a high-resolution decode: Laplacian detail normalized by face size and contrast (defocus), directional detail anisotropy (motion blur), and a conservative sclera-visibility check (closed eyes). All analysis runs on worker threads and is cached.
 • Every filter button (Stars, Pick state, Labels, Format, Date, ISO, Aperture, Focal, Shutter, Camera, Hour) shows a dropdown arrow with the same alignment.
-• With “Load only JPG previews for RAW” on, Single view shows the largest JPEG embedded in the RAW at full quality.
+• With “Load only JPG previews for RAW” on, Single view shows the largest JPEG embedded in the RAW at full quality. This is the default from 0.9.6.0. Zooming past Fit (or to 100%) on a RAW decodes that one RAW in full, so you can check sharpness.
 • The RAW you are viewing (Single or Compare) gets a full decode budget; previously many were cancelled after 1.5 s and retried, which looked choppy or stuck.
 • JPEG uses TurboJPEG when its measured path is advantageous, with WIC as compatibility fallback. RAW prefers embedded previews before demosaic. AVIF uses libavif/dav1d with libyuv.
 • WIC native transforms, embedded thumbnails and progressive refinement are used when the codec and driver support them.

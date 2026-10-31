@@ -55,13 +55,15 @@ inline constexpr std::array<ButtonDefinition, 3> kCullButtons{{
     { command_id::ID_COLOR_LABEL, L"Label: None", 0 },
 }};
 
-inline constexpr std::array<ButtonDefinition, 17> kSettingsButtons{{
+inline constexpr std::array<ButtonDefinition, 21> kSettingsButtons{{
     { command_id::ID_SETTING_BADGE_STARS, L"Show star badges", 0 },
     { command_id::ID_SETTING_BADGE_COLOR, L"Show color-label badges", 0 },
     { command_id::ID_SETTING_BADGE_PICK, L"Show pick/reject badges", 0 },
     { command_id::ID_SETTING_BADGE_PAIR, L"Show RAW/JPG badges", 0 },
     { command_id::ID_SETTING_COPY_MOVE_RAW_WITH_JPG, L"Copy/Move RAW with JPG", 0 },
     { command_id::ID_SETTING_RAW_JPEG_PREVIEWS_ONLY, L"Load only JPG previews for RAW", 0 },
+    { command_id::ID_SETTING_AUTO_ADVANCE, L"Advance after rating/pick/reject", 0 },
+    { command_id::ID_SETTING_PICK_LABEL, L"Mark picks with a label: None", 0 },
     { command_id::ID_SETTING_SAFE_JPEG, L"Safe JPG writes", 0 },
     { command_id::ID_SETTING_METADATA_RAW, L"Write metadata into RAW files", 0 },
     { command_id::ID_SETTING_METADATA_LOSSY, L"Write metadata into JPG/PNG files", 0 },
@@ -71,6 +73,8 @@ inline constexpr std::array<ButtonDefinition, 17> kSettingsButtons{{
     { command_id::ID_SETTING_CLEAR_MEMORY_CACHE, L"Clear memory cache", 0 },
     { command_id::ID_SETTING_CLEAR_DISK_CACHE, L"Clear disk cache", 0 },
     { command_id::ID_SETTING_HELP, L"Help and documentation", 0 },
+    { command_id::ID_SETTING_SHORTCUTS, L"Keyboard shortcuts (?)", 0 },
+    { command_id::ID_SETTING_SHOW_TIP_AGAIN, L"Show the welcome tip again", 0 },
     { command_id::ID_SETTING_ABOUT, L"About this app", 0 },
     { command_id::ID_SETTING_LANGUAGE_SELECTOR, L"Language", 0 },
 }};

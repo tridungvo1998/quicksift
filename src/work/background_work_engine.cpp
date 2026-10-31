@@ -1202,7 +1202,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         // Round 23: the filmstrip is the only caller that opts out of the grid
         // viewport (PrefetchFilmstrip); its decodes follow the strip's window instead.
         job.filmstripOwned = ignoreThumbnailViewport && cacheClass == CacheClass::Thumbnail;
-        job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
+        job.rawJpegPreviewOnly = RawPreviewOnlyFor(job.path);
         Enqueue(std::move(job));
     }
 
@@ -1218,7 +1218,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         job.timeoutMs = CalculateAdaptiveTimeoutMs(path, job.retryAttempt, isSingleView, false);
         job.timeoutDeferred = true;
         job.timeoutSingleView = isSingleView;
-        job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
+        job.rawJpegPreviewOnly = RawPreviewOnlyFor(job.path);
         Enqueue(std::move(job));
     }
 
@@ -1256,7 +1256,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         job.timeoutMs = CalculateAdaptiveTimeoutMs(path, job.retryAttempt, foregroundBudget, false);
         job.timeoutDeferred = true;
         job.timeoutSingleView = foregroundBudget;
-        job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
+        job.rawJpegPreviewOnly = RawPreviewOnlyFor(job.path);
         if (job.rawJpegPreviewOnly && kind == JobKind::DecodeFull && IsRawExtension(ExtensionLower(path))) {
             // JPG-preview-only mode never demosaics RAW; route to the embedded preview.
             job.kind = JobKind::DecodePreview;
@@ -1434,7 +1434,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         job.path = path; job.targetSize = kTileSourceSize; job.generation = generation; job.requestEpoch = epoch;
         job.tileX = x; job.tileY = y; job.tileWidth = width; job.tileHeight = height;
         job.tileLevel = std::clamp(level, 0, 8);
-        job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
+        job.rawJpegPreviewOnly = RawPreviewOnlyFor(job.path);
         Enqueue(std::move(job));
     }
 
@@ -1574,7 +1574,7 @@ Worker::Worker(HWND notify, quicksift::work::BackgroundCompletionQueue* completi
         WorkJob job; job.kind = JobKind::Face; job.priority = priority; job.path = path;
         job.targetSize = std::max(kFaceDecodeSize, targetSize);
         job.generation = generation; job.requestEpoch = epoch;
-        job.rawJpegPreviewOnly = rawJpegPreviewOnly_.load(std::memory_order_acquire);
+        job.rawJpegPreviewOnly = RawPreviewOnlyFor(job.path);
         Enqueue(std::move(job));
     }
 
@@ -1700,7 +1700,7 @@ Worker::FindBlockedPathLocked(const wchar_t* path) {
         if ((job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull ||
             job.kind == JobKind::DecodeTile || job.kind == JobKind::Face) &&
             IsRawExtension(ExtensionLower(job.path)) &&
-            job.rawJpegPreviewOnly != rawJpegPreviewOnly_.load(std::memory_order_acquire)) return true;
+            job.rawJpegPreviewOnly != RawPreviewOnlyFor(job.path)) return true;
         if (interactiveVisualFocus_.load(std::memory_order_acquire) &&
             (job.kind == JobKind::DecodePreview || job.kind == JobKind::DecodeFull ||
                 job.kind == JobKind::DecodeTile || job.kind == JobKind::Face) &&

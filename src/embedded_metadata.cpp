@@ -16,6 +16,7 @@
 
 #include "core/metadata_gate_policy.h"
 #include "embedded_metadata.h"
+#include "core/xmp_interop_policy.h"
 #include "core/metadata_vocabulary.h"
 #include "metadata/jpeg_xmp_locator.h"
 #include "metadata/metadata_value_parser.h"
@@ -210,9 +211,15 @@ quicksift::core::MetadataFieldValue ReadLabelField(const Exiv2::XmpData& data) {
 
 quicksift::core::PhotoMetadataValues ReadMetadataValues(const Exiv2::XmpData& xmp) {
     quicksift::core::PhotoMetadataValues result;
-    result.rating = ReadIntegerField(xmp, "Xmp.xmp.Rating", 0, 5);
+    namespace interop = quicksift::core::xmp_interop;
+    result.rating = ReadIntegerField(xmp, "Xmp.xmp.Rating", interop::kXmpRatingMinimum,
+        interop::kXmpRatingMaximum);
     result.colorLabel = ReadLabelField(xmp);
     result.pickState = ReadIntegerField(xmp, "Xmp.quicksift.Pick", -1, 1);
+    std::optional<int> storedStars;
+    if (const auto it = xmp.findKey(Exiv2::XmpKey("Xmp.quicksift.Rating")); it != xmp.end())
+        storedStars = metadata::ParseBoundedInteger(it->toString(), 0, 5);
+    interop::DecodeRatingAndPick(result.rating, result.pickState, storedStars);
     return result;
 }
 
@@ -223,12 +230,22 @@ bool MetadataPatchValuesValid(const quicksift::core::MetadataPatch& patch) noexc
 }
 
 void ApplyMetadataPatch(Exiv2::XmpData& xmp, const quicksift::core::MetadataPatch& patch) {
-    if (patch.rating.active)
-        xmp["Xmp.xmp.Rating"].setValue(std::to_string(patch.rating.desired));
+    // Rating and pick are written together through the interop mapping
+    // (core/xmp_interop_policy.h): a reject is xmp:Rating=-1 for Lightroom and
+    // Capture One, and quicksift:Rating keeps the stars for un-rejecting.
+    if (patch.rating.active || patch.pickState.active) {
+        namespace interop = quicksift::core::xmp_interop;
+        const quicksift::core::PhotoMetadataValues after =
+            quicksift::core::ApplyMetadataPatch(ReadMetadataValues(xmp), patch);
+        const interop::EncodedRatingPick encoded = interop::EncodeRatingAndPick(
+            interop::KnownValue(after.rating), interop::KnownValue(after.pickState));
+        if (encoded.writeXmpRating) xmp["Xmp.xmp.Rating"].setValue(std::to_string(encoded.xmpRating));
+        if (encoded.writePick) xmp["Xmp.quicksift.Pick"].setValue(std::to_string(encoded.pick));
+        if (encoded.writeStoredStars)
+            xmp["Xmp.quicksift.Rating"].setValue(std::to_string(encoded.storedStars));
+    }
     if (patch.colorLabel.active)
         xmp["Xmp.xmp.Label"].setValue(LabelName(patch.colorLabel.desired));
-    if (patch.pickState.active)
-        xmp["Xmp.quicksift.Pick"].setValue(std::to_string(patch.pickState.desired));
 }
 
 bool PatchWasApplied(const quicksift::core::PhotoMetadataValues& values,

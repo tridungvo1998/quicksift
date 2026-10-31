@@ -566,6 +566,15 @@ void MacOsUiFramework::PaintImagePlaceholder(ID2D1RenderTarget* target,
     target->FillRoundedRectangle(D2D1::RoundedRect(snapped, r, r), fill);
 }
 
+void MacOsUiFramework::PaintOverlayPanel(ID2D1RenderTarget* target, const D2D1_RECT_F& rect,
+    float radius, ID2D1Brush* fill, ID2D1Brush* border, float borderWidth) const noexcept {
+    if (!target || !fill || rect.right <= rect.left || rect.bottom <= rect.top) return;
+    const float r = std::max(0.0f, radius);
+    const D2D1_ROUNDED_RECT shape{ rect, r, r };
+    target->FillRoundedRectangle(shape, fill);
+    if (border && borderWidth > 0.0f) target->DrawRoundedRectangle(shape, border, borderWidth);
+}
+
 void MacOsUiFramework::PaintMediaCard(ID2D1RenderTarget* target,
     const MediaCardPresentation& presentation, const MediaCardBrushes& brushes) const {
     if (!target || !brushes.panel || !brushes.border) return;

@@ -9,6 +9,32 @@
 - **Maintainability:** the large functions were split, data-only state structs were added, layout constants are named, and CODE_GUIDE is the documentation hub.
 - **Repository:** the stale historical notes were removed (`notes/`, `PRE_RELEASE_AUDIT.md`, `VALIDATION.md`, `MODULARIZATION_NOTES.md`), as were the generated `SOURCE_MANIFEST.sha256` and `codebase_bundle.*`. A `.gitignore` was added.
 
+### Round 24: Lightroom interop, auto-advance, shortcut sheet
+
+- **Fixed: the "Move selected photos to Deleted?" message was written inline in English and Vietnamese.** It now comes from the translation table, with separate one-photo and several-photo sentences. The file-conflict alert ("… was stopped before any files were changed") and its eight reasons were also untranslated in Vietnamese, and they are now localized too. `check-localization.py` adds an `inline-language` rule: Vietnamese text in `src/ui` or `src/app` outside `localization.cpp` fails the check, with a self-test.
+- **RAW: "Load only JPG previews for RAW" is now on by default.** A new `SettingsVersion` session key tells 0.9.5 sessions, which always stored 0, apart from a deliberate 0.9.6 "off".
+  - Existing users are switched on once, with a toast saying where to change it.
+  - Zooming past Fit (or to 100%) in Single View now decodes that one RAW in full, including deep-zoom tiles. The worker keeps a lock-free per-path override (`Worker::SetFullRawOverridePath`). Returning to Fit, changing photo or leaving Single View goes back to the preview.
+- **Lightroom Classic / Capture One compatible rejects.** A reject now writes `xmp:Rating=-1`, and the stars are kept in a new `quicksift:Rating` field so un-rejecting restores them.
+  - A `-1` written by those apps reads as a reject, and a photo they un-rejected reads as not rejected.
+  - The mapping applies to sidecar, direct Exiv2 and fast-JPEG paths (`core/xmp_interop_policy.h`). Filters, badges, export and Undo use the model values.
+  - The new setting **Mark picks with a label** (None by default) adds a chosen colour label to unlabelled photos when they are picked and removes it when they are un-picked. It is part of the same write and the same Undo step. The mapping table is in USER_GUIDE §9.
+- **Auto-advance.** The new setting **Advance after rating/pick/reject** is off by default, and **Caps Lock** turns auto-advance on live, with a pill at the top of the canvas.
+  - It applies to the keys 1–5, 0, P, X and U, in Single and Thumbnail view, for one photo at a time.
+  - A photo hidden by the filters hands over to the photo now in its place. At the last photo QuickSift stays and shows a toast.
+- **Keyboard shortcut sheet.** Press `?` to open it, and `?` or Esc to close it, or use Settings → Keyboard shortcuts (?).
+  - It is generated from the new shortcut table `core/keyboard_shortcuts.h`, which `OnKeyDown` now dispatches through (same bindings).
+  - It is theme- and DPI-aware and EN/VI, and it caches its layouts per language, so it has no per-frame allocations.
+- **First-run tip.** A welcome card explains the hover pane, the Pin button and `?`. It is shown once and stored as `FirstRunTipDismissed`, and **Settings → Show the welcome tip again** resets it.
+- **Pin the command pane.** A **Pin pane** button at the bottom of the tab column keeps the pane open and reserves its width, so the canvas moves right. It is remembered (`LeftPanePinned`), follows the theme, has a tooltip and reopens after fullscreen.
+- **Checks and verifiers.** New `xmp_interop_checks` and `keyboard_shortcut_checks`, and `jpeg_xmp_checks` covers `-1` and `quicksift:Rating`. Both verifiers guard the following:
+  - the interop policy in every reader and writer;
+  - `OnKeyDown` dispatching through the table;
+  - the sheet built from `kShortcuts` without per-frame resource creation;
+  - the full-RAW override;
+  - the settings migration.
+  The new framework primitive `PaintOverlayPanel` draws the overlays. Fixing the `WINDOWPLACEMENT` initializers also lowers the clang-cl warning count from 79 to 37.
+
 ### Round 23: filmstrip fade, decode dropping, badges and dashed blur outline
 
 - **Filmstrip fade.** The strip fades in and out when you toggle it (F7 or the button) and when you enter Single View. It uses the central animation system: the Fade preset with the standard 180 ms token, and it is instant when Windows animations are off. Leaving Single View hides the strip at once, so the next entry fades in again.

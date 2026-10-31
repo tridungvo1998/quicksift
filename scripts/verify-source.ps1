@@ -322,7 +322,7 @@ foreach ($Token in @('rawJpegPreviewOnly', 'thumbnail->type != LIBRAW_IMAGE_JPEG
     }
 }
 foreach ($Token in @('rawJpegPreviewOnly_', 'raw-jpeg-only', 'aRawJpegOnly == bRawJpegOnly',
-        'job.rawJpegPreviewOnly != rawJpegPreviewOnly_.load', 'desiredVisualTargets_.clear()')) {
+        'job.rawJpegPreviewOnly != RawPreviewOnlyFor(job.path)', 'desiredVisualTargets_.clear()')) {
     if (-not (($ReleaseWorkerHeaderText + $ReleaseWorkerText).Contains($Token))) {
         throw "RAW decode-policy queue/coalescing guard is missing: $Token"
     }
@@ -331,7 +331,7 @@ if (-not (($ReleaseWorkerText.Contains('persistentCache_ && !rawJpegOnly')) -or
         ($ReleaseWorkerText.Contains('persistentCache_') -and $ReleaseWorkerText.Contains('sourceJob.rawJpegPreviewOnly')))) {
     throw 'RAW JPG-preview-only mode can consume or persist ambiguous bitmap/tile cache pixels.'
 }
-if (-not $CanvasRenderingText.Contains('if (loadOnlyRawJpegPreviews_ && IsRawExtension(photo.extension)) return;')) {
+if (-not $CanvasRenderingText.Contains('if (IsRawExtension(photo.extension) && RawPreviewOnlyFor(photo.path.native())) return;')) {
     throw 'RAW JPG-preview-only mode can still request deep-zoom RAW tiles.'
 }
 if (-not $ReleaseCatalogIntegrationText.Contains('result->kind == JobKind::DecodeTile || !result->previewOnly')) {
@@ -340,8 +340,31 @@ if (-not $ReleaseCatalogIntegrationText.Contains('result->kind == JobKind::Decod
 if (-not $GraphicsCacheText.Contains('if (rawJpegOnly) requestFull = false;')) {
     throw 'RAW JPG-preview-only display requests can still promote to full RAW decode.'
 }
-if (-not $ReleaseAppInternalText.Contains('bool loadOnlyRawJpegPreviews_ = false;')) {
-    throw 'RAW JPG-preview-only setting must default to off.'
+if (-not $ReleaseAppInternalText.Contains('bool loadOnlyRawJpegPreviews_ = true;')) {
+    throw 'RAW JPG-preview-only setting must default to on (0.9.6.0).'
+}
+# 0.9.6.0: zoom past Fit decodes the one zoomed RAW in full; worker and UI agree.
+$DecodePolicyText = Read-SourceText 'src\work\background_decode_policy.cpp'
+if (-not ($DecodePolicyText.Contains('fullRawOverrideHash_') -and $GraphicsCacheText.Contains('SetFullRawOverridePath') -and
+        $CanvasRenderingText.Contains('UpdateFullRawOverride(reviewState_.SinglePath()'))) {
+    throw 'JPG-preview mode no longer decodes the full RAW when Single View zooms past Fit.'
+}
+$MigrationText = Read-SourceText 'src\core\settings_migration.h'
+$SessionIoText = Read-SourceText 'src\ui\navigation_input_and_session.cpp'
+if (-not ($MigrationText.Contains('kCurrentSettingsVersion') -and $SessionIoText.Contains('SettingsVersion') -and
+        $SessionIoText.Contains('RawPreviewSetting('))) {
+    throw 'Settings migration (SettingsVersion / RawPreviewSetting) is not wired into the session store.'
+}
+# 0.9.6.0: Lightroom/Capture One reject interop goes through one policy in every writer.
+foreach ($Rel in @('src\embedded_metadata.cpp', 'src\app\application_support.cpp')) {
+    if (-not (Read-SourceText $Rel).Contains('EncodeRatingAndPick(')) {
+        throw "$Rel writes rating/pick without xmp_interop::EncodeRatingAndPick"
+    }
+}
+foreach ($Rel in @('src\embedded_metadata.cpp', 'src\app\application_support.cpp', 'src\metadata\jpeg_xmp_locator.cpp')) {
+    if (-not (Read-SourceText $Rel).Contains('DecodeRatingAndPick(')) {
+        throw "$Rel reads rating/pick without xmp_interop::DecodeRatingAndPick"
+    }
 }
 
 $FileTransactionHeaderText = Read-SourceText 'src\transactions\file_transaction.h'
@@ -906,6 +929,17 @@ foreach ($Name in $UpdateButtons) {
     if (-not $RelocalizeBody.Contains("$Name()")) { throw "Central relocalize pass does not refresh $Name" }
 }
 
+# 0.9.6.0: one shortcut table drives OnKeyDown and the ? cheat sheet.
+$OnKeyDownBody = Get-FunctionBody (Read-SourceText 'src\ui\navigation_input_and_session.cpp') 'void QuickSiftApplicationImpl::OnKeyDown('
+if (-not $OnKeyDownBody.Contains('DispatchShortcut(') -or [regex]::IsMatch($OnKeyDownBody, "key\s*==\s*'[A-Z0-9]'")) {
+    throw 'OnKeyDown must dispatch through core/keyboard_shortcuts.h, not compare key literals.'
+}
+$SheetText = Read-SourceText 'src\ui\shortcut_sheet_and_tips_overlay.cpp'
+if (-not $SheetText.Contains('kShortcuts') -or
+        (Get-FunctionBody $SheetText 'void QuickSiftApplicationImpl::DrawShortcutSheetOverlay(').Contains('Create')) {
+    throw 'The shortcut sheet must be generated from kShortcuts and must not create resources per frame.'
+}
+
 # Shared custom-drawn checkbox style; no native Win32 checkboxes.
 foreach ($File in $AllSourceFiles) {
     if ((Remove-CppComments ([IO.File]::ReadAllText($File.FullName))) -match '\bBS_(AUTO)?CHECKBOX\b') {
@@ -954,7 +988,8 @@ foreach ($Check in @('animation_checks', 'batch_match_checks', 'design_tokens_ch
         'localization_checks', 'lock_order_checks', 'metadata_progress_checks', 'metadata_store_checks',
         'overlay_and_frost_checks', 'priority_policy_checks', 'ratings_exchange_checks', 'raw_preview_checks',
         'search_query_checks', 'thumbnail_layout_checks', 'ui_state_checks', 'write_lane_checks',
-        'sidecar_write_checks', 'lifecycle_checks', 'view_load_checks', 'filmstrip_checks')) {
+        'sidecar_write_checks', 'lifecycle_checks', 'view_load_checks', 'filmstrip_checks',
+        'xmp_interop_checks', 'keyboard_shortcut_checks')) {
     [void](Read-SourceText "scripts\checks\$Check.cpp")
 }
 foreach ($Relative in @('src\core\blocking_wait.cpp', 'src\core\blocking_wait.h', 'src\core\presentation_settings.h',

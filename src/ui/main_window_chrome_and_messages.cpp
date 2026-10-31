@@ -18,9 +18,22 @@ namespace quicksift::app {
 
 
     bool QuickSiftApplicationImpl::HandleGlobalKey(const MSG& message) {
+        // '?' arrives as WM_CHAR so the shortcut sheet works on every keyboard layout
+        // (core/keyboard_shortcuts.h kCharQuestion). Typing '?' into a text field
+        // (search, comments) stays text.
+        if (message.message == WM_CHAR && message.wParam == L'?') {
+            if (message.hwnd != hwnd_ && !IsChild(hwnd_, message.hwnd)) return false;
+            if (uiFramework_.Alerts().Visible()) return false;
+            if ((searchInput_ && message.hwnd == searchInput_) ||
+                quicksift::ui::framework::MacOsUiFramework::IsTextInput(message.hwnd)) return false;
+            ToggleShortcutSheet();
+            return true;
+        }
         if (message.message != WM_KEYDOWN && message.message != WM_SYSKEYDOWN) return false;
         if (message.hwnd != hwnd_ && !IsChild(hwnd_, message.hwnd)) return false;
         const UINT key = static_cast<UINT>(message.wParam);
+        // Caps Lock toggles auto-advance live; repaint its indicator (not consumed).
+        if (key == VK_CAPITAL) InvalidateCanvas();
         if (uiFramework_.Alerts().Visible()) {
             HandleGlassAlertKey(key, GetKeyState(VK_SHIFT) < 0);
             return true;
@@ -453,6 +466,8 @@ namespace quicksift::app {
         SetWindowPos(hwnd_, nullptr, 0, 0, 0, 0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         UpdateFullscreenButton();
+        // A pinned command pane closed for fullscreen comes back with the window chrome.
+        if (leftPanePinned_ && activeFlyout_ == FlyoutPanel::None) SetActiveFlyout(lastFlyoutSection_);
         RelayoutWindowChrome();
         if (canvas_) SetFocus(canvas_);
     }
@@ -972,6 +987,8 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             }
             return DefWindowProc(hwnd_, message, wParam, lParam);
         case WM_ACTIVATE:
+            // Caps Lock may have changed in another window: refresh its indicator.
+            if (LOWORD(wParam) != WA_INACTIVE) InvalidateCanvas();
             return OnMainActivate(wParam, lParam);
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED:
@@ -1452,6 +1469,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         SetFocus(canvas_);
         const auto point = CanvasPixelsToDips(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         if (HandleGlassAlertClick(point.x, point.y)) return 0;
+        if (!uiFramework_.Alerts().Visible() && HandleHelpOverlayClick(point.x, point.y)) return 0;
         if (!uiFramework_.Alerts().Visible() && HudHandleHit(point.x, point.y)) {
             // Only the handle strip is interactive; the rest of the HUD is click-through.
             hudDragging_ = true;

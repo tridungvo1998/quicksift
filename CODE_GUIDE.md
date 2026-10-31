@@ -201,6 +201,13 @@ Start with the first matching row.
 | Settings "Write metadata into RAW / JPG/PNG / TIFF files" toggles | `src/ui/settings_filters_and_file_commands.cpp` (`ID_SETTING_METADATA_*`) |
 | Metadata write lane on the UI side (coalescing, urgent slot, retry and Skip) | `src/ui/metadata_write_lane_controller.cpp` |
 | Thumbnail search box | `src/ui/thumbnail_search_controller.cpp` |
+| Keyboard shortcut table (bindings, sheet rows, `Find`) | `src/core/keyboard_shortcuts.h`; dispatch in `DispatchShortcut` (`src/ui/navigation_input_and_session.cpp`) |
+| Rating / pick / reject ↔ XMP (Lightroom, Capture One) and the pick label | `src/core/xmp_interop_policy.h` (every reader and writer calls it) |
+| Auto-advance rules / Caps Lock | `src/core/auto_advance_policy.h`; `src/ui/auto_advance_controller.cpp` |
+| Session settings migration (`SettingsVersion`, RAW preview default) | `src/core/settings_migration.h` |
+| `?` shortcut sheet, first-run tip, Caps Lock pill | `src/ui/shortcut_sheet_and_tips_overlay.cpp` |
+| Pinned command pane | `src/ui/left_pane_pin_controller.cpp` |
+| Full-RAW-on-zoom exception to JPG-preview mode | `RawPreviewOnlyFor` / `UpdateFullRawOverride` (`src/ui/graphics_resources_and_image_cache.cpp`), `Worker::SetFullRawOverridePath` (`src/work/background_decode_policy.cpp`) |
 | Import / Export Ratings commands | `src/ui/ratings_exchange_commands.cpp` |
 | Batch Processing commands | `src/ui/batch_processing_commands.cpp` |
 | Performance-policy plumbing and telemetry | `src/ui/performance_policy_controller.cpp` |

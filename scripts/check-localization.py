@@ -64,6 +64,7 @@ ALLOWED_WORDS = {
 IDENTICAL_ALLOWED = {
     "QuickSift", "English", "Tiếng Việt", "EXIF", "XMP", "JPEG", "RAW", "{shown} / {total}", "OK",
     "QuickSift — Fast Photo Shortlisting",
+    "Caps Lock", "Home", "End",  # keycap names are printed in English on VI keyboards
 }
 VI_LETTERS = set("ăâđêôơưàáạảãằắặẳẵầấậẩẫèéẹẻẽềếệểễìíịỉĩòóọỏõồốộổỗờớợởỡùúụủũừứựửữỳýỵỷỹ"
                  "ĂÂĐÊÔƠƯÀÁẠẢÃẰẮẶẲẴẦẤẬẨẪÈÉẸẺẼỀẾỆỂỄÌÍỊỈĨÒÓỌỎÕỒỐỘỔỖỜỚỢỞỠÙÚỤỦŨỪỨỰỬỮỲÝỴỶỸ")
@@ -395,6 +396,18 @@ def scan_sources(files: dict[str, str], translator: Translator) -> tuple[list[Fi
                     if not translator.covered(value):
                         findings.append(Finding("missing", where(path, code, init_start + s0), value))
 
+        # Inline translations (0.9.6.0): Vietnamese text belongs in localization.cpp.
+        # Choosing literal text by Language::Vietnamese in a UI file bypasses the
+        # table (the 0.9.5 delete confirmation). Native language names in the
+        # language selector are marked `loc-native`.
+        ui_source = path.startswith(("src/ui/", "src/app/")) or path.startswith(("ui/", "app/"))
+        for s0, _, value in (literal_groups(code, wide_only=True) if ui_source else ()):
+            if any(c in VI_LETTERS for c in value):
+                line_no = code.count("\n", 0, s0)
+                if line_no < len(comments) and "loc-native" in comments[line_no]:
+                    continue
+                findings.append(Finding("inline-language", where(path, code, s0), value[:80]))
+
         for name, start, end in call_spans(code, TRANSLATING_SINKS + PRELOCALIZED_SINKS):
             masked = mask_calls(code, start, end, NON_TEXT_CALLS)
             translating = name in TRANSLATING_SINKS
@@ -502,7 +515,7 @@ constexpr std::array kDynamicFragments{
 };
 '''
     sources = {
-        "src/a.cpp": '''
+        "src/ui/a.cpp": '''
 void F() {
     ShowToast(L"Open folder");
     ShowToast(L"Unknown words here");
@@ -513,6 +526,9 @@ void F() {
     const wchar_t* key = L"Not in table"; // loc-key
     // Tr(L"Commented out should be ignored")
     text = Tr(L"12 photos");
+    if (vi) message << L"Đã chuyển ảnh";
+    const wchar_t* native = L"Tiếng Việt"; // loc-native
+
 }
 ''',
     }
@@ -533,6 +549,7 @@ void F() {
             ("missing", "Unknown words here"),
             ("missing", "Not in table"),
             ("hardcoded", "ShowGlassAlertText: Hard coded English"),
+            ("inline-language", "Đã chuyển ảnh"),
         }
         got = set(kinds)
         ok = expected.issubset(got)

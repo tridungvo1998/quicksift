@@ -96,4 +96,34 @@ inline constexpr int kCheckboxGapDip = 6;
 static_assert(kAccentTopDip < kAccentBottomDip, "accent strip has height");
 } // namespace document
 
+// 0.9.6.0 canvas help overlays (ui/shortcut_sheet_and_tips_overlay.cpp) and the
+// command-pane pin (ui/left_pane_pin_controller.cpp). Canvas values are DIPs used
+// directly by Direct2D; the pin button is converted with DipToPx.
+namespace help_overlay {
+inline constexpr float kSheetPaddingDip = 22.0f;
+inline constexpr float kSheetColumnGapDip = 24.0f;
+inline constexpr float kSheetTitleGapDip = 12.0f;
+inline constexpr float kSheetMarginDip = 24.0f;      // minimum gap to the canvas edge
+inline constexpr float kSheetRadiusDip = 14.0f;
+inline constexpr float kSheetSectionTitleSizeDip = 13.0f;
+inline constexpr float kSheetHintSizeDip = 12.0f;
+inline constexpr float kSheetVeilOpacity = 0.35f;
+inline constexpr float kTipWidthDip = 300.0f;
+inline constexpr float kTipPaddingDip = 14.0f;
+inline constexpr float kTipEdgeDip = 18.0f;          // from the canvas's left/top edge
+inline constexpr float kTipRadiusDip = 12.0f;
+inline constexpr float kTipAccentBarDip = 3.0f;
+inline constexpr float kIndicatorPaddingXDip = 10.0f;
+inline constexpr float kIndicatorPaddingYDip = 5.0f;
+inline constexpr float kIndicatorEdgeDip = 12.0f;
+inline constexpr float kIndicatorRadiusDip = 10.0f;
+inline constexpr float kLayoutMaxDip = 4096.0f;
+inline constexpr float kBorderWidthDip = 1.0f;
+} // namespace help_overlay
+
+namespace left_pane_pin {
+inline constexpr int kButtonHeightDip = 30;
+inline constexpr int kInsetDip = 10;   // same inset as the tab column
+} // namespace left_pane_pin
+
 } // namespace quicksift::ui::layout

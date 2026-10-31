@@ -1,5 +1,6 @@
 // OWNER: Portable locator for the standard XMP packet in a JPEG header prefix.
 #include "metadata/jpeg_xmp_locator.h"
+#include "core/xmp_interop_policy.h"
 
 #include "core/ratings_exchange.h"
 #include "metadata/metadata_value_parser.h"
@@ -97,6 +98,7 @@ std::optional<core::PhotoMetadataValues> FastJpegXmpFields(std::span<const std::
     static const XmpPropertyQuery kRating{ L"xmp:Rating", L"xmp", L"http://ns.adobe.com/xap/1.0/" };
     static const XmpPropertyQuery kLabel{ L"xmp:Label", L"xmp", L"http://ns.adobe.com/xap/1.0/" };
     static const XmpPropertyQuery kPick{ L"quicksift:Pick", L"quicksift", L"https://quicksift.local/ns/1.0/" };
+    static const XmpPropertyQuery kStoredStars{ L"quicksift:Rating", L"quicksift", L"https://quicksift.local/ns/1.0/" };
     if (!NamespaceOnlyUnderPrefix(*text, kRating.namespaceName, kRating.namespaceUri) ||
         !NamespaceOnlyUnderPrefix(*text, kPick.namespaceName, kPick.namespaceUri)) return std::nullopt;
     const auto integer = [&](const XmpPropertyQuery& query, int low, int high)
@@ -108,9 +110,16 @@ std::optional<core::PhotoMetadataValues> FastJpegXmpFields(std::span<const std::
             return core::KnownMetadataValue(*parsed);
         return std::nullopt; // unusual value: Exiv2 decides how to report it
     };
-    const auto rating = integer(kRating, 0, 5);
-    const auto pick = integer(kPick, -1, 1);
+    // xmp:Rating -1 is Lightroom's / Capture One's reject (core/xmp_interop_policy.h).
+    auto rating = integer(kRating, core::xmp_interop::kXmpRatingMinimum, core::xmp_interop::kXmpRatingMaximum);
+    auto pick = integer(kPick, -1, 1);
     if (!rating || !pick) return std::nullopt;
+    std::optional<int> storedStars;
+    const XmpSimpleValueInspection stars = InspectXmpSimpleValue(*text, kStoredStars);
+    if (stars.state == XmpSimpleValueState::Value)
+        storedStars = ParseBoundedInteger(std::wstring_view(stars.value), 0, 5);
+    else if (stars.state != XmpSimpleValueState::Absent) return std::nullopt;
+    core::xmp_interop::DecodeRatingAndPick(*rating, *pick, storedStars);
     const XmpSimpleValueInspection label = InspectXmpSimpleValue(*text, kLabel);
     if (label.state == XmpSimpleValueState::Absent) {
         values.colorLabel = core::KnownMetadataValue(0);

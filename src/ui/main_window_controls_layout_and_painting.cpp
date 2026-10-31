@@ -106,6 +106,7 @@ namespace {
         libraryTooltip_ = uiFramework_.CreateTooltip(libraryTooltipSpec);
         RestyleTooltips();
         if (!CreateMainWindowButton(ID_REMOVE_LIBRARY, L"Remove from library")) return -1;
+        CreateLeftPanePinButton();
         ShowWindow(controls_[ID_REMOVE_LIBRARY], SW_HIDE);
         EnableWindow(controls_[ID_REMOVE_LIBRARY], FALSE);
 
@@ -125,7 +126,7 @@ namespace {
         const std::array<std::pair<int, std::wstring_view>, 5> settingsSections{{
             { ID_SETTING_SECTION_THUMBNAILS, L"Thumbnails" },
             { ID_SETTING_SECTION_RAW, L"RAW handling" },
-            { ID_SETTING_SECTION_METADATA, L"Metadata handling" },
+            { ID_SETTING_SECTION_METADATA, L"Culling and metadata" },
             { ID_SETTING_SECTION_DIAGNOSTICS, L"Help & Diagnostics" },
             { ID_SETTING_SECTION_LANGUAGE, L"Language" }
         }};
@@ -513,6 +514,12 @@ namespace {
         // is a sibling layered above it, so revealing the pane never resizes,
         // reflows, or jumps the current image.
         RECT rect{ outer, titleHeight + topMargin, width - outer, contentBottom };
+        // Pinned command pane (0.9.6.0): the canvas starts right of the open pane, so
+        // the pane reserves its space instead of covering the photos.
+        if (leftPanePinned_ && !fullscreen_) {
+            const RECT pane = LeftPaneOpenRect(width, height);
+            if (!IsRectEmpty(&pane)) rect.left = std::max(rect.left, static_cast<LONG>(pane.right + outer));
+        }
         if (rect.right < rect.left) rect.right = rect.left;
         if (rect.bottom < rect.top) rect.bottom = rect.top;
         return rect;
@@ -1013,7 +1020,8 @@ namespace {
             lastFlyoutHover_ = std::chrono::steady_clock::now();
             return;
         }
-        if (std::chrono::steady_clock::now() - lastFlyoutHover_
+        // A pinned pane never closes on hover-out (ui/left_pane_pin_controller.cpp).
+        if (!leftPanePinned_ && std::chrono::steady_clock::now() - lastFlyoutHover_
             > std::chrono::milliseconds(kLeftPaneHideGraceMs)) {
             SetActiveFlyout(FlyoutPanel::None);
         }
@@ -1823,12 +1831,13 @@ namespace {
         placeSection(0, { ID_SETTING_BADGE_STARS, ID_SETTING_BADGE_COLOR,
             ID_SETTING_BADGE_PICK, ID_SETTING_BADGE_PAIR }, true);
         placeSection(1, { ID_SETTING_COPY_MOVE_RAW_WITH_JPG, ID_SETTING_RAW_JPEG_PREVIEWS_ONLY }, true);
-        placeSection(2, { ID_SETTING_SAFE_JPEG, ID_SETTING_METADATA_RAW,
-            ID_SETTING_METADATA_LOSSY, ID_SETTING_METADATA_TIFF }, true);
+        placeSection(2, { ID_SETTING_AUTO_ADVANCE, ID_SETTING_PICK_LABEL, ID_SETTING_SAFE_JPEG,
+            ID_SETTING_METADATA_RAW, ID_SETTING_METADATA_LOSSY, ID_SETTING_METADATA_TIFF }, true);
         placeSection(3, { ID_SETTING_PERFORMANCE_HUD }, true);
         placeSection(3, { ID_SETTING_DIAGNOSTIC_LOG,
             ID_SETTING_CLEAR_MEMORY_CACHE, ID_SETTING_CLEAR_DISK_CACHE,
-            ID_SETTING_HELP, ID_SETTING_ABOUT }, false, false);
+            ID_SETTING_HELP, ID_SETTING_SHORTCUTS, ID_SETTING_SHOW_TIP_AGAIN,
+            ID_SETTING_ABOUT }, false, false);
 
         if (settingsSectionLabels_.size() > 4 && settingsSectionLabels_[4]) {
             PlacePaneChild(settingsSectionLabels_[4], leftEdge, y, availableWidth, sectionHeight,
@@ -1895,6 +1904,7 @@ namespace {
         const bool showPaneContent = LeftPaneShouldShowContent();
         leftPaneContentVisible_ = showPaneContent;
         LayoutFlyoutTabs(width, height, showPaneContent);
+        LayoutLeftPanePinButton(width, height, showPaneContent);
 
 
         PlaceFilmstripToggle(width, height); // shown in Single view only
@@ -2291,7 +2301,7 @@ namespace {
                 const std::wstring title = Tr(
                     i == 0 ? L"THUMBNAILS" :
                     i == 1 ? L"RAW HANDLING" :
-                    i == 2 ? L"METADATA HANDLING" :
+                    i == 2 ? L"CULLING & METADATA" :
                     i == 3 ? L"HELP & DIAGNOSTICS" : L"LANGUAGE");
                 uiFramework_.PaintSectionTitle(draw->hDC, draw->rcItem, title, Palette(),
                     currentDpi_, uiFontSemibold_);
@@ -2351,6 +2361,9 @@ namespace {
             (id == ID_SETTING_BADGE_PAIR && badgePair_) ||
             (id == ID_SETTING_COPY_MOVE_RAW_WITH_JPG && copyMoveRawWithJpg_) ||
             (id == ID_SETTING_RAW_JPEG_PREVIEWS_ONLY && loadOnlyRawJpegPreviews_) ||
+            (id == ID_SETTING_AUTO_ADVANCE && autoAdvance_) ||
+            (id == ID_SETTING_PICK_LABEL && pickLabelMapping_ != 0) ||
+            (id == ID_LEFT_PANE_PIN && leftPanePinned_) ||
             (id == ID_SETTING_PERFORMANCE_HUD && performanceHudVisible_) ||
             (id == ID_SETTING_THEME && theme_ == AppTheme::Dark) ||
             (id == ID_SETTING_LANGUAGE_ENGLISH && localizer_.CurrentLanguage() == quicksift::Language::English) ||

@@ -541,6 +541,11 @@ public:
     // thumbnail is not yet decoded or the grid is in motion.
     void PaintImagePlaceholder(ID2D1RenderTarget* target, const D2D1_RECT_F& rect,
         float radius, ID2D1Brush* fill) const;
+    // 0.9.6.0: opaque rounded panel with a hairline border for canvas overlays
+    // (shortcut sheet, first-run tip, Caps Lock pill). Caller-owned cached brushes;
+    // no allocation, so it is safe on every frame.
+    void PaintOverlayPanel(ID2D1RenderTarget* target, const D2D1_RECT_F& rect,
+        float radius, ID2D1Brush* fill, ID2D1Brush* border, float borderWidth) const noexcept;
     // Anti-aliased rounded corners for an HWND whose 1-bit window region is a few
     // pixels larger than the visual radius (ApplyAntialiasedControlRegion): paints
     // the four "square minus quarter circle" corner patches in the parent's colour

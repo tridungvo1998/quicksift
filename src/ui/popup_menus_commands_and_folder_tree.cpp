@@ -93,7 +93,7 @@ int QuickSiftApplicationImpl::TrackDropdownMenuVerbatim(HWND owner, HWND anchor,
 void QuickSiftApplicationImpl::UpdateLanguageSelectorButton() {
     if (!languageSelector_) return;
     const wchar_t* caption = localizer_.CurrentLanguage() == quicksift::Language::Vietnamese
-        ? L"Tiếng Việt" : L"English";
+        ? L"Tiếng Việt" : L"English"; // loc-native: matches the VI help heading / native language name
     // Only on change: WM_SETTEXT repaints a visible button synchronously.
     wchar_t current[64]{};
     GetWindowTextW(languageSelector_, current, static_cast<int>(std::size(current)));
@@ -381,7 +381,16 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
         case ID_SETTING_DIRECT_TIFF:
         case ID_SETTING_DIRECT_RAW:
         case ID_SETTING_SAFE_JPEG:
+        case ID_SETTING_AUTO_ADVANCE:
+        case ID_SETTING_SHORTCUTS:
+        case ID_SETTING_SHOW_TIP_AGAIN:
             ApplySettingCommand(id);
+            break;
+        case ID_SETTING_PICK_LABEL:
+            ShowPickLabelMappingMenu();
+            break;
+        case ID_LEFT_PANE_PIN:
+            ToggleLeftPanePinned();
             break;
         default:
             break;

@@ -2,6 +2,9 @@
 #include "app/quicksift_application_internal.h"
 #include "platform/application_data_paths.h"
 #include "core/presentation_settings.h"
+#include "core/settings_migration.h"
+#include "core/keyboard_shortcuts.h"
+#include "core/auto_advance_policy.h"
 
 namespace quicksift::app {
 
@@ -288,6 +291,8 @@ namespace quicksift::app {
         UpdateColorLabelFilterButton();
         UpdateZoomModeButton();
         UpdateFullscreenButton();
+        UpdatePickLabelMappingButton();
+        RefreshLeftPanePinButton();
         RelayoutTitleControlsAfterCaptionChange();
     }
 
@@ -532,7 +537,21 @@ namespace quicksift::app {
         badgePick_ = readInt(L"BadgePick", 1) != 0;
         badgePair_ = readInt(L"BadgePair", 0) != 0;
         copyMoveRawWithJpg_ = readInt(L"CopyMoveRawWithJpg", 0) != 0;
-        loadOnlyRawJpegPreviews_ = readInt(L"LoadOnlyRawJpegPreviews", 0) != 0;
+        {
+            // 0.9.6.0: JPG previews on by default; see core/settings_migration.h.
+            namespace migration = quicksift::core::settings_migration;
+            std::error_code sessionError;
+            const bool hasSession = fs::exists(sessionPath_, sessionError) && !sessionError;
+            const auto decision = migration::RawPreviewSetting(hasSession,
+                readInt(L"SettingsVersion", migration::kNoSettingsVersion),
+                readInt(L"LoadOnlyRawJpegPreviews", -1));
+            loadOnlyRawJpegPreviews_ = decision.previewOnly;
+            rawPreviewDefaultNoticePending_ = decision.showNotice;
+        }
+        pickLabelMapping_ = std::clamp(readInt(L"PickLabelMapping", 0), 0, 5);
+        autoAdvance_ = readInt(L"AutoAdvance", 0) != 0;
+        firstRunTipDismissed_ = readInt(L"FirstRunTipDismissed", 0) != 0;
+        leftPanePinned_ = readInt(L"LeftPanePinned", 0) != 0;
         theme_ = quicksift::core::presentation::ThemeFromSetting(readInt(L"Theme", 0)) ? AppTheme::Light : AppTheme::Dark;
         localizer_.SetLanguage(readInt(L"Language", 0) == 1 ?
             quicksift::Language::Vietnamese : quicksift::Language::English);
@@ -598,7 +617,12 @@ namespace quicksift::app {
         appendInt(L"BadgePick", badgePick_ ? 1 : 0);
         appendInt(L"BadgePair", badgePair_ ? 1 : 0);
         appendInt(L"CopyMoveRawWithJpg", copyMoveRawWithJpg_ ? 1 : 0);
+        appendInt(L"SettingsVersion", quicksift::core::settings_migration::kCurrentSettingsVersion);
         appendInt(L"LoadOnlyRawJpegPreviews", loadOnlyRawJpegPreviews_ ? 1 : 0);
+        appendInt(L"PickLabelMapping", pickLabelMapping_);
+        appendInt(L"AutoAdvance", autoAdvance_ ? 1 : 0);
+        appendInt(L"FirstRunTipDismissed", firstRunTipDismissed_ ? 1 : 0);
+        appendInt(L"LeftPanePinned", leftPanePinned_ ? 1 : 0);
         appendInt(L"Theme", theme_ == AppTheme::Light ? 1 : 0);
         appendInt(L"Language", localizer_.CurrentLanguage() ==
             quicksift::Language::Vietnamese ? 1 : 0);
@@ -917,64 +941,70 @@ namespace quicksift::app {
     void QuickSiftApplicationImpl::OnKeyDown(UINT key, bool ctrl, bool shift) {
         // Escape during a canvas press cancels the press (no click, no mode change).
         if (key == VK_ESCAPE && CancelCanvasPress()) return;
-        if (ctrl && key == L'Z') { Undo(); return; }
-        if (ctrl && key == L'Y') { Redo(); return; }
-        if (ctrl && key == L'5') { ApplyColorLabel(5); return; }
-        if (ctrl && key == L'0') { ApplyColorLabel(0); return; }
-        if (key >= L'1' && key <= L'5') {
-            ApplyRating(static_cast<int>(key - L'0'));
-            return;
+        // Esc closes the shortcut sheet before it means "back to Thumbnails".
+        if (key == VK_ESCAPE && shortcutSheetVisible_) { HideShortcutSheet(); return; }
+        DispatchShortcut(key, ctrl, shift);
+    }
+
+    // Every key below comes from core/keyboard_shortcuts.h, the table the '?' sheet
+    // is generated from; add a shortcut there, then handle its Action here.
+    bool QuickSiftApplicationImpl::DispatchShortcut(UINT key, bool ctrl, bool shift) {
+        namespace sc = quicksift::core::shortcuts;
+        const auto match = sc::Find(key, ctrl, shift);
+        if (!match) return false;
+        if (sc::IsCullingEdit(match->action)) {
+            ApplyCullingShortcut(match->action, match->value);
+            return true;
         }
-        if (key == L'0') { ApplyRating(0); return; }
-        if (key == L'P') { ApplyPickState(1); return; }
-        if (key == L'X') { ApplyPickState(-1); return; }
-        if (key == L'U') { ApplyPickState(0); return; }
-        if (key >= L'6' && key <= L'9') { ApplyColorLabel(static_cast<int>(key - L'5')); return; }
-        if (key == L'F') { SetZoomMode(ZoomMode::Fit); return; }
-        if (key == L'Z') { SetZoomMode(ZoomMode::ActualPixels); return; }
+        switch (match->action) {
+        case sc::Action::Undo: Undo(); break;
+        case sc::Action::Redo: Redo(); break;
+        case sc::Action::ColorLabel: ApplyColorLabel(match->value); break;
+        case sc::Action::ClearColorLabel: ApplyColorLabel(0); break;
+        case sc::Action::FitZoom: SetZoomMode(ZoomMode::Fit); break;
+        case sc::Action::ActualPixels: SetZoomMode(ZoomMode::ActualPixels); break;
         // 0.9.4.0 manual retry of failed image loads (thumbnails and Single/Compare).
-        if ((ctrl && shift && key == L'R') || key == VK_F5) { RetryFailedImageLoads(); return; }
-        if (key == L'R') { RotateView(90); return; }
-        if (key == VK_F7) { ToggleFilmstrip(); return; }
-        switch (key) {
-        case VK_RETURN:
+        case sc::Action::RetryFailedLoads: RetryFailedImageLoads(); break;
+        case sc::Action::Rotate: RotateView(90); break;
+        case sc::Action::ToggleFilmstrip: ToggleFilmstrip(); break;
+        case sc::Action::OpenSelection:
             if (reviewState_.Mode() == ViewMode::Thumbnails) {
                 if (selection_.Size() >= 2) EnterCompareFromSelection();
                 else EnterSingleFromSelection();
             }
             break;
-        case VK_ESCAPE:
+        case sc::Action::BackToThumbnails:
             SetMode(ViewMode::Thumbnails);
             break;
-        case VK_LEFT:
+        case sc::Action::Previous:
             if (reviewState_.Mode() == ViewMode::Compare) NavigateComparePane(key);
             else Navigate(-1, shift);
             break;
-        case VK_UP:
+        case sc::Action::RowUp:
             if (reviewState_.Mode() == ViewMode::Compare) NavigateComparePane(key);
             else if (reviewState_.Mode() == ViewMode::Thumbnails) {
                 Navigate(-std::max(1, CurrentThumbnailLayout().columns), shift);
             } else Navigate(-1, shift);
             break;
-        case VK_RIGHT:
+        case sc::Action::Next:
             if (reviewState_.Mode() == ViewMode::Compare) NavigateComparePane(key);
             else Navigate(1, shift);
             break;
-        case VK_DOWN:
+        case sc::Action::RowDown:
             if (reviewState_.Mode() == ViewMode::Compare) NavigateComparePane(key);
             else if (reviewState_.Mode() == ViewMode::Thumbnails) {
                 Navigate(std::max(1, CurrentThumbnailLayout().columns), shift);
             } else Navigate(1, shift);
             break;
-        case VK_SPACE:
+        case sc::Action::ToggleSingle:
             if (reviewState_.Mode() == ViewMode::Thumbnails) EnterSingleFromSelection();
             else SetMode(ViewMode::Thumbnails);
             break;
-        case VK_DELETE:
+        case sc::Action::MoveToDeleted:
             RequestDeleteOperation();
             break;
-        case L'A':
-            if (ctrl && reviewState_.Mode() == ViewMode::Thumbnails) {
+        case sc::Action::SelectAll:
+            if (reviewState_.Mode() == ViewMode::Thumbnails) {
                 selection_.Clear();
                 for (size_t visibleIndex = 0; visibleIndex < catalog_.VisibleCount(); ++visibleIndex) {
                     selection_.Select(VisiblePhoto(visibleIndex).path.wstring());
@@ -983,7 +1013,7 @@ namespace quicksift::app {
                 InvalidateCanvas();
             }
             break;
-        case VK_HOME:
+        case sc::Action::First:
             if (!catalog_.VisibleEmpty()) {
                 SelectIndex(0, shift);
                 EnsureFocusedThumbnailVisible(0);
@@ -991,7 +1021,7 @@ namespace quicksift::app {
                 InvalidateCanvas();
             }
             break;
-        case VK_END:
+        case sc::Action::Last:
             if (!catalog_.VisibleEmpty()) {
                 SelectIndex(catalog_.VisibleCount() - 1, shift);
                 EnsureFocusedThumbnailVisible(catalog_.VisibleCount() - 1);
@@ -1000,8 +1030,9 @@ namespace quicksift::app {
             }
             break;
         default:
-            break;
+            return false;
         }
+        return true;
     }
 
     void QuickSiftApplicationImpl::NavigateComparePane(UINT key) {

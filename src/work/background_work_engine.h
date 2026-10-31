@@ -67,6 +67,10 @@ public:
     // Used together with SetThumbnailDragLoadMode; 0 means reject new thumbnail work.
     void SetThumbnailScrollConcurrentCap(unsigned maxConcurrent);
     void SetRawJpegPreviewOnly(bool enabled);
+    // JPG-preview mode exception (0.9.6.0): the one photo zoomed past its embedded
+    // preview in Single View may decode the full RAW. Empty clears it.
+    void SetFullRawOverridePath(std::wstring_view path);
+    [[nodiscard]] bool RawPreviewOnlyFor(const std::filesystem::path& path) const noexcept;
     void SetNavigationEpoch(uint64_t epoch);
     void SetViewInteractionEpoch(uint64_t epoch);
     void SetInteractiveVisualFocus(bool focused);
@@ -383,7 +387,9 @@ private:
     std::unordered_set<std::wstring> filmstripWindowPaths_;
     bool filmstripWindowActive_ = false;
     std::atomic<int> activeThumbnailTarget_{ 0 };
-    std::atomic<bool> rawJpegPreviewOnly_{ false };
+    std::atomic<bool> rawJpegPreviewOnly_{ true };
+    // Hash of the full-RAW override path (0 = none); lock-free for IsCancelled.
+    std::atomic<std::size_t> fullRawOverrideHash_{ 0 };
     std::atomic<uint64_t> cacheEpoch_{ 1 };
     std::atomic<uint64_t> decoderSessionTrimEpoch_{ 0 };
     std::uint64_t decoderTrimAckEpoch_ = 0;

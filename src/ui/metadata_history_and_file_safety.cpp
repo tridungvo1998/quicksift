@@ -1,5 +1,6 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "core/xmp_interop_policy.h"
 #include "transactions/verified_file_operations_windows.h"
 #include "ui/metadata_photo_values.h"
 #include "core/priority_policy.h"
@@ -342,6 +343,17 @@ void QuickSiftApplicationImpl::SubmitMetadataEdit(MetadataEditField field, int v
         std::optional<MetadataFieldValue> expected;
         if (current.IsAuthoritative()) expected = current;
         MetadataPatch patch = MakeSingleFieldPatch(fieldId, value, expected);
+        // Settings -> "Mark picks with a label": the colour label rides along in the
+        // same patch, so it is one write and one Undo step (core/xmp_interop_policy.h).
+        if (fieldId == MetadataFieldId::PickState && current.IsKnown()) {
+            if (const auto companion = quicksift::core::xmp_interop::PickCompanionLabel(pickLabelMapping_,
+                    current.value, value, before->values.colorLabel)) {
+                patch.colorLabel.active = true;
+                patch.colorLabel.desired = *companion;
+                patch.colorLabel.requireExpected = true;
+                patch.colorLabel.expected = before->values.colorLabel;
+            }
+        }
         quicksift::transactions::MetadataChange change;
         change.before = *before;
         change.patch = patch;

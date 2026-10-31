@@ -145,6 +145,11 @@ inline constexpr int ID_SETTING_RAW_JPEG_PREVIEWS_ONLY = 2720;
 inline constexpr int ID_SETTING_METADATA_RAW = 2722;
 inline constexpr int ID_SETTING_METADATA_LOSSY = 2723;
 inline constexpr int ID_SETTING_METADATA_TIFF = 2724;
+// 0.9.6.0: culling interop, auto-advance and keyboard help.
+inline constexpr int ID_SETTING_AUTO_ADVANCE = 2725;
+inline constexpr int ID_SETTING_PICK_LABEL = 2726;
+inline constexpr int ID_SETTING_SHORTCUTS = 2727;
+inline constexpr int ID_SETTING_SHOW_TIP_AGAIN = 2728;
 inline constexpr int ID_FOLDER_TREE = 3001;
 inline constexpr int ID_CANVAS = 3002;
 inline constexpr int ID_STATUS_TEXT = 3003;
@@ -168,6 +173,7 @@ inline constexpr int ID_SETTING_SECTION_METADATA = 3023;
 inline constexpr int ID_SETTING_SECTION_DIAGNOSTICS = 3024;
 inline constexpr int ID_SETTING_SECTION_LANGUAGE = 3025;
 inline constexpr int ID_THUMBNAIL_SEARCH = 3026;
+inline constexpr int ID_LEFT_PANE_PIN = 3027;
 
 inline constexpr int ID_DOCUMENT_TEXT = 5001;
 inline constexpr int ID_DOCUMENT_EXPORT = 5002;
@@ -303,6 +309,11 @@ inline constexpr std::array kAllIds{
     ID_SETTING_DIAGNOSTIC_LOG,
     ID_SETTING_COPY_MOVE_RAW_WITH_JPG,
     ID_SETTING_RAW_JPEG_PREVIEWS_ONLY,
+    ID_SETTING_AUTO_ADVANCE,
+    ID_SETTING_PICK_LABEL,
+    ID_SETTING_SHORTCUTS,
+    ID_SETTING_SHOW_TIP_AGAIN,
+    ID_LEFT_PANE_PIN,
     ID_FOLDER_TREE,
     ID_CANVAS,
     ID_STATUS_TEXT,
@@ -334,7 +345,7 @@ inline constexpr std::array kAllIds{
 inline constexpr std::array kPopupMenuButtonIds{
     ID_FORMATS, ID_DATE_FILTER, ID_SORT, ID_THUMB_SIZE, ID_ZOOM_MODE,
     ID_STAR_FILTER, ID_PICK_FILTER, ID_LABEL_FILTER, ID_COLOR_LABEL,
-    ID_RATING_MENU, ID_PICK_STATE_MENU, ID_SETTING_LANGUAGE_SELECTOR,
+    ID_RATING_MENU, ID_PICK_STATE_MENU, ID_SETTING_LANGUAGE_SELECTOR, ID_SETTING_PICK_LABEL,
     ID_ISO_FILTER, ID_APERTURE_FILTER, ID_FOCAL_FILTER, ID_SHUTTER_FILTER,
     ID_CAMERA_FILTER, ID_HOUR_FILTER,
 };

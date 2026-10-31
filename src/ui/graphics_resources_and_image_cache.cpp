@@ -221,6 +221,7 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::DiscardDeviceResources() {
         ClearBitmapCache();
+        ReleaseHelpOverlayLayouts();
         uiWicFactory_.Reset();
         textBrush_.Reset();
         panelBrush_.Reset();
@@ -1283,7 +1284,7 @@ namespace quicksift::app {
         // this runs for every visible card / view pane on every frame).
         const std::wstring pathText = path.wstring();
         const bool raw = IsRawExtension(ExtensionLower(path));
-        const bool rawJpegOnly = raw && loadOnlyRawJpegPreviews_;
+        const bool rawJpegOnly = raw && RawPreviewOnlyFor(pathText);
         if (rawJpegOnly) requestFull = false;
         // Thumbnails have a strict grid target. Embedded previews can report a tiny
         // source dimension (for example 160 px), which must not clamp the requested
@@ -1420,9 +1421,23 @@ namespace quicksift::app {
     }
 
 
+    // JPG-preview-only mode with its single exception: the RAW zoomed past Fit in
+    // Single View (fullRawOverridePath_) decodes in full. Mirrors Worker::RawPreviewOnlyFor.
+    bool QuickSiftApplicationImpl::RawPreviewOnlyFor(std::wstring_view path) const {
+        return loadOnlyRawJpegPreviews_ && (fullRawOverridePath_.empty() || path != fullRawOverridePath_);
+    }
+
+    void QuickSiftApplicationImpl::UpdateFullRawOverride(std::wstring_view singlePath, bool zoomedPastFit) {
+        const std::wstring_view wanted = loadOnlyRawJpegPreviews_ && zoomedPastFit ? singlePath : std::wstring_view{};
+        if (wanted == fullRawOverridePath_) return; // steady state: no allocation
+        fullRawOverridePath_.assign(wanted);
+        worker_.SetFullRawOverridePath(fullRawOverridePath_);
+        if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE);
+    }
+
     BitmapEntry* QuickSiftApplicationImpl::GetOrRequestIntermediateViewBitmap(
         const fs::path& path, int desired, JobPriority priority) {
-        if (loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path))) {
+        if (IsRawExtension(ExtensionLower(path)) && RawPreviewOnlyFor(path.native())) {
             return GetOrRequestBitmap(path, desired, priority, false, CacheClass::Preview);
         }
         if (const auto photo = IndexForPath(path.wstring()); photo) {

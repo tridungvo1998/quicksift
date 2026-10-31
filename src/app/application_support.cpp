@@ -1,5 +1,6 @@
 // OWNER: Shared native helpers used by UI and background services.
 #include "core/sidecar_write_policy.h"
+#include "core/xmp_interop_policy.h"
 #include "app/application_support.h"
 #include "core/metadata_vocabulary.h"
 #include "diagnostics/log_and_continue.h"
@@ -296,6 +297,9 @@ const quicksift::metadata::XmpPropertyQuery kLabelQuery{
     L"xmp:Label", L"xmp", L"http://ns.adobe.com/xap/1.0/" };
 const quicksift::metadata::XmpPropertyQuery kPickQuery{
     L"quicksift:Pick", L"quicksift", L"https://quicksift.local/ns/1.0/" };
+// The star rating kept while a photo is rejected (core/xmp_interop_policy.h).
+const quicksift::metadata::XmpPropertyQuery kStoredStarsQuery{
+    L"quicksift:Rating", L"quicksift", L"https://quicksift.local/ns/1.0/" };
 
 MetadataFieldValue IntegerFieldFromInspection(
     const quicksift::metadata::XmpSimpleValueInspection& inspected,
@@ -329,13 +333,19 @@ PhotoMetadataValues SidecarValuesFromText(const std::wstring& text, bool absentI
         const MetadataFieldValue empty = absentIsKnown ? KnownMetadataValue(0) : UnknownMetadataValue();
         return { empty, empty, empty };
     }
+    namespace interop = quicksift::core::xmp_interop;
     values.rating = IntegerFieldFromInspection(
-        quicksift::metadata::InspectXmpSimpleValue(text, kRatingQuery), 0, 5,
-        absentIsKnown);
+        quicksift::metadata::InspectXmpSimpleValue(text, kRatingQuery),
+        interop::kXmpRatingMinimum, interop::kXmpRatingMaximum, absentIsKnown);
     values.colorLabel = LabelFieldFromInspection(
         quicksift::metadata::InspectXmpSimpleValue(text, kLabelQuery), absentIsKnown);
     values.pickState = IntegerFieldFromInspection(
         quicksift::metadata::InspectXmpSimpleValue(text, kPickQuery), -1, 1, absentIsKnown);
+    std::optional<int> storedStars;
+    const auto stars = quicksift::metadata::InspectXmpSimpleValue(text, kStoredStarsQuery);
+    if (stars.state == quicksift::metadata::XmpSimpleValueState::Value)
+        storedStars = quicksift::metadata::ParseBoundedInteger(stars.value, 0, 5);
+    interop::DecodeRatingAndPick(values.rating, values.pickState, storedStars);
     quicksift::core::sidecar_write::CompleteQuickSiftSidecar(values);
     return values;
 }
@@ -433,22 +443,44 @@ SidecarMetadataWriteResult WritePhotoMetadataPatch(const fs::path& image,
         }
         // The edit plus every Known value the sidecar lacks, so the next read and
         // write of this photo are sidecar-only.
+        // Rating and pick are written together through the interop mapping
+        // (core/xmp_interop_policy.h): xmp:Rating=-1 for a reject (Lightroom and
+        // Capture One), quicksift:Pick, and quicksift:Rating keeping the stars.
+        bool ratingOrPickPlanned = false;
+        PhotoMetadataValues planned = result.before;
         for (const auto& write : quicksift::core::sidecar_write::PlanWrites(sidecarBefore, result.before, patch)) {
-            bool updated = false;
-            if (write.field == MetadataFieldId::Rating) {
-                updated = UpdateXmpSimpleValue(text, { kRatingQuery.qualifiedName, kRatingQuery.namespaceName,
-                    kRatingQuery.namespaceUri, std::to_wstring(write.value) });
-                if (!updated) result.detail = L"The rating property could not be updated without rewriting unfamiliar XMP.";
-            } else if (write.field == MetadataFieldId::ColorLabel) {
-                updated = UpdateXmpSimpleValue(text, { kLabelQuery.qualifiedName, kLabelQuery.namespaceName,
-                    kLabelQuery.namespaceUri, LabelName(write.value) });
-                if (!updated) result.detail = L"The color-label property could not be updated without rewriting unfamiliar XMP.";
-            } else {
-                updated = UpdateXmpSimpleValue(text, { kPickQuery.qualifiedName, kPickQuery.namespaceName,
-                    kPickQuery.namespaceUri, std::to_wstring(write.value) });
-                if (!updated) result.detail = L"The pick-state property could not be updated without rewriting unfamiliar XMP.";
+            if (write.field == MetadataFieldId::ColorLabel) {
+                if (!UpdateXmpSimpleValue(text, { kLabelQuery.qualifiedName, kLabelQuery.namespaceName,
+                        kLabelQuery.namespaceUri, LabelName(write.value) })) {
+                    result.detail = L"The color-label property could not be updated without rewriting unfamiliar XMP.";
+                    return result;
+                }
+                continue;
             }
-            if (!updated) return result;
+            ratingOrPickPlanned = true;
+            if (write.field == MetadataFieldId::Rating) planned.rating = KnownMetadataValue(write.value);
+            else planned.pickState = KnownMetadataValue(write.value);
+        }
+        if (ratingOrPickPlanned) {
+            namespace interop = quicksift::core::xmp_interop;
+            const interop::EncodedRatingPick encoded = interop::EncodeRatingAndPick(
+                interop::KnownValue(planned.rating), interop::KnownValue(planned.pickState));
+            if (encoded.writeXmpRating && !UpdateXmpSimpleValue(text, { kRatingQuery.qualifiedName,
+                    kRatingQuery.namespaceName, kRatingQuery.namespaceUri, std::to_wstring(encoded.xmpRating) })) {
+                result.detail = L"The rating property could not be updated without rewriting unfamiliar XMP.";
+                return result;
+            }
+            if (encoded.writePick && !UpdateXmpSimpleValue(text, { kPickQuery.qualifiedName,
+                    kPickQuery.namespaceName, kPickQuery.namespaceUri, std::to_wstring(encoded.pick) })) {
+                result.detail = L"The pick-state property could not be updated without rewriting unfamiliar XMP.";
+                return result;
+            }
+            if (encoded.writeStoredStars && !UpdateXmpSimpleValue(text, { kStoredStarsQuery.qualifiedName,
+                    kStoredStarsQuery.namespaceName, kStoredStarsQuery.namespaceUri,
+                    std::to_wstring(encoded.storedStars) })) {
+                result.detail = L"The rating property could not be updated without rewriting unfamiliar XMP.";
+                return result;
+            }
         }
         TextFileWriteStatus writeStatus;
         if (!WriteTextFile(sidecar, text, encoding, expectedSidecar, &writeStatus)) {

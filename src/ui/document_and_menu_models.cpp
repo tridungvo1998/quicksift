@@ -118,7 +118,7 @@ std::string BuildDocumentRtf(std::wstring_view text, bool helpDocument, const Th
             firstContent = false;
             continue;
         }
-        const bool technical = line == L"TECHNICAL DOCUMENTATION" || line == L"TÀI LIỆU KỸ THUẬT";
+        const bool technical = line == L"TECHNICAL DOCUMENTATION" || line == L"TÀI LIỆU KỸ THUẬT"; // loc-native: matches the VI help heading / native language name
         const bool heading = helpDocument && IsDocumentHeading(line);
         if (firstContent) {
             rtf += "\\pard\\keepn\\sb0\\sa180\\cf3\\b\\fs32 ";

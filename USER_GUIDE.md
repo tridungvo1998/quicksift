@@ -2,7 +2,7 @@
 
 ## 1. Open and navigate a shoot
 
-Choose **Open** and select a folder containing photographs. Hover the narrow strip at the left edge of the window to open the left command pane. Vertical tabs inside that pane switch between **Library**, **File**, **Cull & Rate**, **Filter**, **Info**, and **Settings**; the selected section’s buttons and menus wrap onto additional rows when horizontal space runs out. Move the pointer away to hide the pane. QuickSift builds its catalog and thumbnails in the background; you can begin reviewing while lower-priority work continues.
+Choose **Open** and select a folder containing photographs. Hover the narrow strip at the left edge of the window to open the left command pane. Vertical tabs inside that pane switch between **Library**, **File**, **Cull & Rate**, **Filter**, **Info**, and **Settings**; the selected section’s buttons and menus wrap onto additional rows when horizontal space runs out. Move the pointer away to hide the pane, or click **Pin pane** at the bottom of the tab column to keep it open. A pinned pane gets its own space, so the photos move right instead of being covered. Click **Unpin pane** to return to hover. The choice is remembered. On the first launch a short welcome tip explains this; click it to dismiss it (**Settings → Show the welcome tip again** brings it back). Press **?** at any time for a sheet of every keyboard shortcut, and press **?** or **Esc** to close it. QuickSift builds its catalog and thumbnails in the background; you can begin reviewing while lower-priority work continues.
 
 QuickSift has three review modes:
 
@@ -19,7 +19,15 @@ In the thumbnail grid, click an image to select it, use **Shift-click** for a ra
 - Use **Pick**, **Reject**, or **Unmark** to set or clear the cull state.
 - Use **Label** to assign a color label.
 
-In thumbnail view, rating, cull, and label operations apply to the current selection. Filters change what is visible; they do not delete or rewrite source files.
+In thumbnail view, rating, cull, and label operations apply to the current selection.
+
+**Auto-advance.** Turn on **Settings → Culling and metadata → Advance after rating/pick/reject** (off by default), or switch **Caps Lock** on, to move to the next photo after `1`–`5`, `0`, `P`, `X` or `U`. A pill at the top of the photo shows *Auto-advance on (Caps Lock)* while Caps Lock alone turns it on.
+- Only those keys advance. Buttons, menus, colour labels and Undo do not.
+- It works in Single and Thumbnail view when the edit targeted one photo. It does not work in Compare or with several photos selected.
+- If the edit makes a filter hide the photo (for example *Unrated only*), the photo that takes its place is next.
+- At the last visible photo QuickSift stays there and shows *Last photo — auto-advance stopped here.*
+
+Filters change what is visible; they do not delete or rewrite source files.
 
 ## 3. Inspect photographs
 
@@ -152,7 +160,7 @@ So `red` means the red label; type `"red"` or `name:red` to search for the word 
 
 Open the left pane and choose **Info** to inspect EXIF for the active photograph, or **Settings** for appearance, language, badges, metadata-writing behavior, and related preferences. Switching between English and Vietnamese updates the interface immediately.
 
-**Settings → Load only JPG previews for RAW** is off by default. When enabled, RAW photographs are displayed only from a JPEG preview embedded in the RAW container. QuickSift does not demosaic RAW sensor pixels, does not fall back to WIC/Shell full-RAW rendering, does not request RAW deep-zoom tiles, and does not reuse an ambiguous persistent RAW bitmap created under full-decode mode. A RAW without a usable embedded JPEG may therefore remain unavailable until this setting is turned off. Changing the setting cancels stale queued/in-flight RAW decode policy and refreshes visible images. In Single view this mode shows the largest embedded JPEG at full quality (QuickSift scans the whole RAW container for it, falling back to LibRaw's own preview).
+**Settings → Load only JPG previews for RAW** is **on by default from 0.9.6.0**. New installs start with it on. If you used an earlier version, QuickSift switches it on once and shows a notice; that version stored "off" as its default, so it cannot tell a deliberate choice from the old default. Turn it off again in Settings and that choice is kept from then on. **Zooming past Fit (or to 100%) in Single view decodes that one RAW in full**, including deep-zoom tiles, so you can judge focus. Zooming back to Fit, opening another photo or leaving Single view returns to JPG previews. When enabled, RAW photographs are displayed only from a JPEG preview embedded in the RAW container. QuickSift does not demosaic RAW sensor pixels, does not fall back to WIC/Shell full-RAW rendering, does not request RAW deep-zoom tiles, and does not reuse an ambiguous persistent RAW bitmap created under full-decode mode. A RAW without a usable embedded JPEG may therefore remain unavailable until this setting is turned off. Changing the setting cancels stale queued/in-flight RAW decode policy and refreshes visible images. In Single view this mode shows the largest embedded JPEG at full quality (QuickSift scans the whole RAW container for it, falling back to LibRaw's own preview).
 
 The RAW you are viewing in Single or Compare view, including its full demosaic, gets the foreground decode budget (at least 12 seconds) so large RAWs are not cancelled and retried mid-decode. Every filter button shows a dropdown arrow.
 
@@ -228,6 +236,24 @@ The dialog remembers its settings until QuickSift closes. Keyboard: Tab / Shift+
 
 ## 9. Metadata behavior
 
+### Lightroom Classic and Capture One compatibility (0.9.6.0)
+
+| QuickSift state | `xmp:Rating` | `quicksift:Pick` | `quicksift:Rating` | `xmp:Label` |
+|---|---|---|---|---|
+| *n* stars, no pick | *n* (0–5) | 0 | *n* | unchanged |
+| *n* stars, picked | *n* | 1 | *n* | the **Mark picks with a label** colour if the photo had no label (off by default) |
+| *n* stars, rejected | **−1** | −1 | *n* | unchanged; a label added by the pick setting is removed |
+
+Reading a file:
+- `xmp:Rating = −1`, written by Lightroom, Capture One or QuickSift, reads as **rejected**. The stars come from `quicksift:Rating`, or 0 when it is absent, so un-rejecting restores them.
+- `quicksift:Pick = −1` with a rating of 0–5:
+  - With `quicksift:Rating` present, another app un-rejected the photo, so it reads as not rejected.
+  - Without it, the file was written by QuickSift 0.9.5 or older and the photo stays rejected.
+- Filters, badges, *Export Ratings* and Undo all use these model values, so a Lightroom reject is a reject everywhere in QuickSift.
+- Neither app has a field for picks that the other reads. Picks stay in `quicksift:Pick`, and **Settings → Mark picks with a label** lets a colour label carry them across.
+- The same mapping is used for XMP sidecars and for direct (embedded) writes.
+- A custom or unreadable star value is never overwritten. When a reject's stars are unknown, `xmp:Rating` is left as it is.
+
 ### Saving ratings, picks and labels (write lane)
 
 - Every rating, pick/reject and colour-label change is saved **in the background**. The interface never waits for the file write, and Single/Compare image loading keeps going.
@@ -257,6 +283,7 @@ Work from verified media copies whenever practical, especially while evaluating 
 `1`–`5` assign a rating and `0` clears it. Pick, Reject, and Unmark change only the pick state.
 `6`–`9` assign Red, Yellow, Green, and Blue labels; `Ctrl+5` assigns Purple and `Ctrl+0` clears
 the color label. Reapplying an already authoritative value is a no-op and does not rewrite files.
+**Caps Lock** turns on auto-advance while it is on, and **?** opens the full shortcut sheet.
 
 ### Images that fail to load
 

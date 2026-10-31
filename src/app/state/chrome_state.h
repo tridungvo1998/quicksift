@@ -33,7 +33,7 @@ struct ChromeState {
     bool fullscreenTitleVisible_ = true;
     LONG_PTR preFullscreenStyle_ = 0;
     LONG_PTR preFullscreenExStyle_ = 0;
-    WINDOWPLACEMENT preFullscreenPlacement_{ sizeof(WINDOWPLACEMENT) };
+    WINDOWPLACEMENT preFullscreenPlacement_{ sizeof(WINDOWPLACEMENT), 0, 0, {}, {}, {} };
     std::chrono::steady_clock::time_point fullscreenEdgeHoverSince_{};
 
     std::chrono::steady_clock::time_point lastAnimationTick_{};

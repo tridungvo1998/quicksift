@@ -3,6 +3,27 @@
 
 namespace quicksift::app {
 
+    namespace {
+    std::size_t FullRawOverrideHash(std::wstring_view path) noexcept {
+        if (path.empty()) return 0;
+        const std::size_t hash = std::hash<std::wstring_view>{}(path);
+        return hash == 0 ? 1 : hash;
+    }
+    } // namespace
+
+    bool Worker::RawPreviewOnlyFor(const std::filesystem::path& path) const noexcept {
+        if (!rawJpegPreviewOnly_.load(std::memory_order_acquire)) return false;
+        const std::size_t override = fullRawOverrideHash_.load(std::memory_order_acquire);
+        return override == 0 || override != FullRawOverrideHash(path.native());
+    }
+
+    void Worker::SetFullRawOverridePath(std::wstring_view path) {
+        // Queued and running jobs whose mode no longer matches are cancelled by
+        // IsCancelled (rawJpegPreviewOnly != RawPreviewOnlyFor(path)); the UI then
+        // requests the decode it needs.
+        fullRawOverrideHash_.store(FullRawOverrideHash(path), std::memory_order_release);
+    }
+
     void Worker::SetRawJpegPreviewOnly(bool enabled) {
         const bool previous = rawJpegPreviewOnly_.exchange(enabled, std::memory_order_acq_rel);
         if (previous == enabled) return;
@@ -14,7 +35,7 @@ namespace quicksift::app {
                         it->kind == JobKind::DecodeFull || it->kind == JobKind::DecodeTile ||
                         it->kind == JobKind::Face;
                     if (decodeJob && IsRawExtension(ExtensionLower(it->path)) &&
-                        it->rawJpegPreviewOnly != enabled) {
+                        it->rawJpegPreviewOnly != RawPreviewOnlyFor(it->path)) {
                         pending_.erase(it->key.empty() ? JobKey(*it) : it->key);
                         it = queue.erase(it);
                     } else {

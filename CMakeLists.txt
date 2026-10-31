@@ -94,6 +94,10 @@ add_library(QuickSiftCore STATIC
     src/core/ratings_exchange.h
     src/core/batch_match_policy.h
     src/core/metadata_vocabulary.h
+    src/core/xmp_interop_policy.h
+    src/core/keyboard_shortcuts.h
+    src/core/auto_advance_policy.h
+    src/core/settings_migration.h
     src/core/photo_predicate.h
     src/core/search_query.h
     src/core/exif_capture_time.h
@@ -264,6 +268,9 @@ set(QS_APP_SOURCES
     src/ui/batch_processing_commands.cpp
     src/ui/blocking_wait_controller.cpp
     src/ui/thumbnail_search_controller.cpp
+    src/ui/auto_advance_controller.cpp
+    src/ui/shortcut_sheet_and_tips_overlay.cpp
+    src/ui/left_pane_pin_controller.cpp
     src/ui/document_and_menu_models.cpp
     src/core/system_profile.cpp
     src/diagnostics/diagnostic_log.cpp

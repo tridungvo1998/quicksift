@@ -34,6 +34,12 @@ struct PaneState {
     int libraryScrollDragOffset_ = 0;
 
     FlyoutPanel activeFlyout_ = FlyoutPanel::None;
+    // Pinned command pane: stays open and the canvas gives it room (persisted).
+    bool leftPanePinned_ = false;
+    std::wstring leftPanePinTooltipText_;
+    HWND leftPanePinTooltip_ = nullptr;
+    int leftPanePinLastW_ = -1; // skip SetWindowRgn when the size is unchanged
+    int leftPanePinLastH_ = -1;
     std::array<int, 7> paneScrollOffset_{}; // indexed by FlyoutPanel
     // [Pane] timing (core/pane_timing.h): LayoutControls fills paneLayoutTiming_
     // whenever pane content is laid out; open/reveal/first-paint are logged once

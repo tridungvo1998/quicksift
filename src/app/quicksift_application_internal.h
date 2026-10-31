@@ -5,6 +5,7 @@
 #include "core/pane_timing.h"
 #include "core/worker_lifetime.h"
 #include "core/view_load_policy.h"
+#include "core/keyboard_shortcuts.h"
 #include "app/application_support.h"
 #include "core/hydrated_facts.h"
 #include "core/metadata_queue_order.h"
@@ -1127,6 +1128,50 @@ private:
     bool hudHandleHot_ = false;
     D2D1_POINT_2F hudDragOffset_{};
     bool HudHandleHit(float x, float y) const noexcept;
+
+    // 0.9.6.0 keyboard help and tips (ui/shortcut_sheet_and_tips_overlay.cpp).
+    // Layouts are rebuilt only when the language, theme or DPI changes (no per-frame allocation).
+    bool shortcutSheetVisible_ = false;
+    int shortcutSheetLayoutLanguage_ = -1;
+    // Two columns of "keys<TAB>description" rows (section titles bold) plus a title.
+    D2D1_SIZE_F shortcutSheetLeftSize_{};
+    D2D1_SIZE_F shortcutSheetRightSize_{};
+    D2D1_SIZE_F shortcutSheetTitleSize_{};
+    ComPtr<IDWriteTextLayout> shortcutSheetLeftLayout_;
+    ComPtr<IDWriteTextLayout> shortcutSheetRightLayout_;
+    ComPtr<IDWriteTextLayout> shortcutSheetTitleLayout_;
+    int firstRunTipLayoutLanguage_ = -1;
+    ComPtr<IDWriteTextLayout> firstRunTipLayout_;
+    D2D1_SIZE_F firstRunTipTextSize_{};
+    D2D1_RECT_F firstRunTipRect_{};
+    int capsIndicatorLayoutLanguage_ = -1;
+    ComPtr<IDWriteTextLayout> capsIndicatorLayout_;
+    D2D1_SIZE_F capsIndicatorTextSize_{};
+    bool BuildShortcutSheetLayouts();
+    void ToggleShortcutSheet();
+    void HideShortcutSheet();
+    void DrawShortcutSheetOverlay();
+    void DrawFirstRunTipOverlay();
+    void DrawCapsLockAutoAdvanceIndicator();
+    void ReleaseHelpOverlayLayouts() noexcept;
+    void ShowFirstRunTipIfNeeded();
+    void DismissFirstRunTip();
+    bool HandleHelpOverlayClick(float x, float y);
+    bool DispatchShortcut(UINT key, bool ctrl, bool shift);
+    // Auto-advance (ui/auto_advance_controller.cpp).
+    bool AutoAdvanceActive() const noexcept;
+    void ApplyCullingShortcut(quicksift::core::shortcuts::Action action, int value);
+    // Command-pane pin (ui/left_pane_pin_controller.cpp).
+    void CreateLeftPanePinButton();
+    void LayoutLeftPanePinButton(int width, int height, bool showPaneContent);
+    void ToggleLeftPanePinned();
+    void RefreshLeftPanePinButton();
+    void ApplyStartupPreferences();
+    // Pick -> colour label setting and the RAW preview zoom override.
+    void ShowPickLabelMappingMenu();
+    void UpdatePickLabelMappingButton();
+    bool RawPreviewOnlyFor(std::wstring_view path) const;
+    void UpdateFullRawOverride(std::wstring_view singlePath, bool zoomedPastFit);
     // Reads only Theme + Language from the session file; called before window creation.
     void LoadEarlyPresentationSettings();
     bool earlyPresentationLoaded_ = false;
@@ -1426,7 +1471,7 @@ void ShowColorLabelMenu();
 
     // ---- Thumbnail search state ----
     quicksift::core::metadata_order::VisibleWindow MetadataPriorityWindow() const;
-    WINDOWPLACEMENT savedPlacement_{ sizeof(WINDOWPLACEMENT) };
+    WINDOWPLACEMENT savedPlacement_{ sizeof(WINDOWPLACEMENT), 0, 0, {}, {}, {} };
     bool hasSavedPlacement_ = false;
 
     quicksift::Localizer localizer_;

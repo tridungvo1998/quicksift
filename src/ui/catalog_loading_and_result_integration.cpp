@@ -915,7 +915,7 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
             if (result->cacheClass != CacheClass::Thumbnail && !result->previewOnly)
                 viewRetryState_.erase(thumbnailKey);
             if (result->viewLane && result->kind == JobKind::DecodeFull && result->previewOnly &&
-                !(loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path)))) {
+                !(IsRawExtension(ExtensionLower(path)) && RawPreviewOnlyFor(path))) {
                 // The full decode could only produce a preview (every codec failed, the
                 // Shell fallback succeeded). That is the best this file can give: remember
                 // it so paint/backstop do not re-run the expensive full decode forever.
@@ -933,7 +933,7 @@ void QuickSiftApplicationImpl::DrainPostedWorkerMessages() {
     // True when a decoded result must not be admitted (RAW JPG-preview-only mode,
     // or a thumbnail decoded for an older thumbnail size).
     bool QuickSiftApplicationImpl::DecodedResultIsObsolete(const std::shared_ptr<WorkResult>& result, const std::wstring& path) {
-        if (loadOnlyRawJpegPreviews_ && IsRawExtension(ExtensionLower(path)) &&
+        if (IsRawExtension(ExtensionLower(path)) && RawPreviewOnlyFor(path) &&
             (result->kind == JobKind::DecodeTile || !result->previewOnly)) {
             // A RAW decode can already be in flight when the setting changes.
             // Never admit stale demosaiced/tile pixels after JPG-preview-only mode

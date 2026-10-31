@@ -460,6 +460,8 @@ namespace quicksift::app {
         UpdateZoomModeButton();
         UpdateThumbnailSizeButton();
         UpdateToggleButtons();
+        UpdatePickLabelMappingButton();
+        RefreshLeftPanePinButton();
         UpdateLanguageSelectorButton();
         UpdateHistoryButtons();
         RefreshFaceWarningTooltipText();
@@ -565,7 +567,8 @@ namespace quicksift::app {
 
     void QuickSiftApplicationImpl::RestyleTooltips() {
         const ThemePalette palette = Palette();
-        for (HWND tooltip : { truncationTooltip_, libraryTooltip_, faceWarningTooltip_, faceLockAvailabilityTooltip_ }) {
+        for (HWND tooltip : { truncationTooltip_, libraryTooltip_, faceWarningTooltip_, faceLockAvailabilityTooltip_,
+                leftPanePinTooltip_ }) {
             quicksift::ui::framework::MacOsUiFramework::StyleTooltip(tooltip, palette, currentDpi_, uiFont_);
         }
     }

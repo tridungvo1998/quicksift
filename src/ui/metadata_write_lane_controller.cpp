@@ -6,6 +6,7 @@
 // Threading: UI thread only. Never blocks: every call here is a queue handoff or a
 // lock-free progress read; all file I/O happens on the metadata transaction thread.
 #include "app/quicksift_application_internal.h"
+#include "core/xmp_interop_policy.h"
 #include "core/priority_policy.h"
 #include "diagnostics/log_categories.h"
 #include "ui/metadata_photo_values.h"
@@ -78,7 +79,14 @@ void QuickSiftApplicationImpl::QueueMetadataEdit(const std::vector<fs::path>& ta
         }
         const MetadataFieldValue current = MetadataFieldFor(shown->values, field);
         if (current.IsKnown() && current.value == value) continue; // nothing new to show
-        const PhotoMetadataValues display = pendingMetadataEdits_.Record(*shown, field, value);
+        PhotoMetadataValues display = pendingMetadataEdits_.Record(*shown, field, value);
+        // Pick -> colour label companion (Settings), coalesced into the same entry.
+        if (field == MetadataFieldId::PickState && current.IsKnown()) {
+            if (const auto companion = quicksift::core::xmp_interop::PickCompanionLabel(pickLabelMapping_,
+                    current.value, value, shown->values.colorLabel)) {
+                display = pendingMetadataEdits_.Record(*shown, MetadataFieldId::ColorLabel, *companion);
+            }
+        }
         catalog_.EditPhoto(*index, [&](PhotoItem& item) {
             ApplyValuesToPhoto(item, display);
             ++item.metadataRevision;

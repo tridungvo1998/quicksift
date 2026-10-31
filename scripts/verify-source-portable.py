@@ -596,20 +596,44 @@ def verify(root: Path) -> None:
         if token not in bundled_header + bundled_codecs:
             fail(f"RAW JPG-preview-only codec guard is missing: {token}")
     for token in ("rawJpegPreviewOnly_", "raw-jpeg-only", "aRawJpegOnly == bRawJpegOnly",
-                  "job.rawJpegPreviewOnly != rawJpegPreviewOnly_.load",
+                  "job.rawJpegPreviewOnly != RawPreviewOnlyFor(job.path)",
                   "desiredVisualTargets_.clear()"):
         if token not in worker_header + worker_source:
             fail(f"RAW decode-policy queue/coalescing guard is missing: {token}")
     if "!rawJpegOnly" not in worker_source and "sourceJob.rawJpegPreviewOnly" not in worker_source:
         fail("RAW JPG-preview-only mode can consume or persist ambiguous bitmap/tile cache pixels")
-    if "if (loadOnlyRawJpegPreviews_ && IsRawExtension(photo.extension)) return;" not in canvas_rendering:
+    if "if (IsRawExtension(photo.extension) && RawPreviewOnlyFor(photo.path.native())) return;" not in canvas_rendering:
         fail("RAW JPG-preview-only mode can still request deep-zoom RAW tiles")
     if "result->kind == JobKind::DecodeTile || !result->previewOnly" not in result_integration:
         fail("late full-RAW pixels are not rejected after the JPG-preview-only toggle changes")
     if "if (rawJpegOnly) requestFull = false;" not in graphics_cache:
         fail("RAW JPG-preview-only display requests can still promote to full RAW decode")
-    if "bool loadOnlyRawJpegPreviews_ = false;" not in app_internal_release:
-        fail("RAW JPG-preview-only setting must default to off")
+    if "bool loadOnlyRawJpegPreviews_ = true;" not in app_internal_release:
+        fail("RAW JPG-preview-only setting must default to on (0.9.6.0)")
+    # 0.9.6.0: zoom past Fit decodes the one zoomed RAW in full; worker and UI agree.
+    decode_policy = read(root, "src/work/background_decode_policy.cpp")
+    if "fullRawOverrideHash_" not in decode_policy or "SetFullRawOverridePath" not in graphics_cache or \
+            "UpdateFullRawOverride(reviewState_.SinglePath()" not in canvas_rendering:
+        fail("JPG-preview mode no longer decodes the full RAW when Single View zooms past Fit")
+    migration = read(root, "src/core/settings_migration.h")
+    session_io = read(root, "src/ui/navigation_input_and_session.cpp")
+    if "kCurrentSettingsVersion" not in migration or "SettingsVersion" not in session_io or \
+            "RawPreviewSetting(" not in session_io:
+        fail("settings migration (SettingsVersion / RawPreviewSetting) is not wired into the session store")
+    # 0.9.6.0: Lightroom/Capture One reject interop goes through one policy in every writer.
+    for rel in ("src/embedded_metadata.cpp", "src/app/application_support.cpp"):
+        if "EncodeRatingAndPick(" not in read(root, rel):
+            fail(f"{rel} writes rating/pick without xmp_interop::EncodeRatingAndPick")
+    for rel in ("src/embedded_metadata.cpp", "src/app/application_support.cpp", "src/metadata/jpeg_xmp_locator.cpp"):
+        if "DecodeRatingAndPick(" not in read(root, rel):
+            fail(f"{rel} reads rating/pick without xmp_interop::DecodeRatingAndPick")
+    # 0.9.6.0: one shortcut table drives OnKeyDown and the ? cheat sheet.
+    on_key_down = function_body(session_io, "void QuickSiftApplicationImpl::OnKeyDown(")
+    if "DispatchShortcut(" not in on_key_down or re.search(r"key\s*==\s*'[A-Z0-9]'", on_key_down):
+        fail("OnKeyDown must dispatch through core/keyboard_shortcuts.h, not compare key literals")
+    sheet = read(root, "src/ui/shortcut_sheet_and_tips_overlay.cpp")
+    if "kShortcuts" not in sheet or "Create" in function_body(sheet, "void QuickSiftApplicationImpl::DrawShortcutSheetOverlay("):
+        fail("the shortcut sheet must be generated from kShortcuts and must not create resources per frame")
 
     transactions = "".join((
         read(root, "src/transactions/file_transaction.cpp"),
@@ -1057,7 +1081,7 @@ def verify_polish_contracts(root: Path) -> None:
                   "localization_checks.cpp", "metadata_progress_checks.cpp", "ui_state_checks.cpp",
                   "raw_preview_checks.cpp", "search_query_checks.cpp", "jpeg_xmp_checks.cpp",
                   "sidecar_write_checks.cpp", "lifecycle_checks.cpp", "view_load_checks.cpp",
-                  "filmstrip_checks.cpp"):
+                  "filmstrip_checks.cpp", "xmp_interop_checks.cpp", "keyboard_shortcut_checks.cpp"):
         if not (root / "scripts" / "checks" / check).exists():
             fail(f"portable check program is missing: scripts/checks/{check}")
 

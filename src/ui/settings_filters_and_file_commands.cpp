@@ -66,6 +66,35 @@ void QuickSiftApplicationImpl::ShowPickStateMenu() {
     }
 }
 
+// Settings -> "Mark picks with a label" (core/xmp_interop_policy.h PickCompanionLabel).
+void QuickSiftApplicationImpl::ShowPickLabelMappingMenu() {
+    const auto control = controls_.find(ID_SETTING_PICK_LABEL);
+    if (control == controls_.end()) return;
+    std::vector<MenuItem> items;
+    items.reserve(vocab::kColors.size());
+    for (const auto& entry : vocab::kColors) {
+        items.push_back(MakeMenuItem(std::wstring(entry.label), entry.value + 1, pickLabelMapping_ == entry.value));
+    }
+    const int command = TrackDropdownMenu(control->second, std::move(items));
+    if (command <= 0 || command > static_cast<int>(vocab::kColors.size())) return;
+    pickLabelMapping_ = command - 1;
+    SaveSession();
+    UpdatePickLabelMappingButton();
+    ShowToast(pickLabelMapping_ == 0 ? L"Picks no longer add a colour label." :
+        L"New picks also get this colour label, so Lightroom and Capture One can see them.");
+}
+
+void QuickSiftApplicationImpl::UpdatePickLabelMappingButton() {
+    const auto control = controls_.find(ID_SETTING_PICK_LABEL);
+    if (control == controls_.end() || !control->second) return;
+    const std::wstring caption = FillToken(Tr(L"Mark picks with a label: {color}"), L"{color}",
+        Tr(vocab::Color(pickLabelMapping_).label));
+    wchar_t current[160]{};
+    GetWindowTextW(control->second, current, static_cast<int>(std::size(current)));
+    if (caption != current) SetWindowTextW(control->second, caption.c_str());
+    InvalidateRect(control->second, nullptr, FALSE);
+}
+
 void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         const int active = ActiveColorLabelForUi();
         std::vector<MenuItem> items = {
@@ -241,6 +270,21 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             InvalidateCanvas();
             ScheduleVisibleWork();
             ShowToast(L"Cache cleared.");
+            return;
+        case ID_SETTING_AUTO_ADVANCE:
+            autoAdvance_ = !autoAdvance_;
+            SaveSession();
+            ShowToast(autoAdvance_ ? L"Auto-advance on: rating, pick or reject moves to the next photo." :
+                L"Auto-advance off. Turn Caps Lock on to use it temporarily.");
+            if (controls_.contains(ID_SETTING_AUTO_ADVANCE))
+                InvalidateRect(controls_[ID_SETTING_AUTO_ADVANCE], nullptr, FALSE);
+            InvalidateCanvas();
+            return;
+        case ID_SETTING_SHORTCUTS: ToggleShortcutSheet(); return;
+        case ID_SETTING_SHOW_TIP_AGAIN:
+            firstRunTipDismissed_ = false;
+            SaveSession();
+            ShowFirstRunTipIfNeeded();
             return;
         case ID_SETTING_DIAGNOSTIC_LOG: ShowDiagnosticLog(); return;
         case ID_SETTING_HELP: ShowHelp(); return;
@@ -608,20 +652,13 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         const std::vector<fs::path> active = ActivePaths();
         if (active.empty() || currentFolder_.empty()) return;
         const fs::path destination = currentFolder_ / L"Deleted";
-        std::wostringstream message;
-        if (localizer_.CurrentLanguage() == quicksift::Language::Vietnamese) {
-            message << L"QuickSift sẽ chuyển " << active.size()
-                << L" ảnh đã chọn cùng các tệp XMP sidecar tương ứng vào:\n\n"
-                << destination.wstring()
-                << L"\n\nThao tác này không dùng Thùng rác. Bạn có thể Hoàn tác khi bản ghi lịch sử được bảo vệ vẫn còn khả dụng.";
-        } else {
-            message << L"QuickSift will move " << active.size() << L" selected photo"
-                << (active.size() == 1 ? L"" : L"s")
-                << L" and matching XMP sidecars into:\n\n"
-                << destination.wstring()
-                << L"\n\nThis does not use the Recycle Bin. You can Undo while the protected file-operation history remains available.";
-        }
-        ShowGlassConfirmation(L"Move selected photos to Deleted?", message.str(),
+        // 0.9.6.0: table-driven (localization.cpp) instead of inline EN/VI text.
+        const wchar_t* key = active.size() == 1 ?
+            L"QuickSift will move {count} selected photo and matching XMP sidecars into:\n\n{folder}\n\nThis does not use the Recycle Bin. You can Undo while the protected file-operation history remains available." :
+            L"QuickSift will move {count} selected photos and matching XMP sidecars into:\n\n{folder}\n\nThis does not use the Recycle Bin. You can Undo while the protected file-operation history remains available.";
+        std::wstring message = FillToken(Tr(key), L"{count}", std::to_wstring(active.size()));
+        message = FillToken(std::move(message), L"{folder}", destination.wstring());
+        ShowGlassConfirmation(L"Move selected photos to Deleted?", message,
             L"Move to Deleted", PendingGlassAction::DeleteSelection, GlassAlertKind::Warning);
     }
 
@@ -846,13 +883,15 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         // that is one atomic media group, not a collision.
         std::unordered_map<std::wstring, std::wstring> plannedSidecarSources;
         plannedSidecarSources.reserve(active.size() + 1);
-        std::wstring conflictDetail;
+        std::wstring conflictReason; // localization key (literals below are marked loc-key)
+        std::wstring conflictFile;
         int conflictCount = 0;
 
-        auto recordConflict = [&](const fs::path& path, const std::wstring& reason) {
+        auto recordConflict = [&](const fs::path& path, const wchar_t* reason) {
             ++conflictCount;
-            if (conflictDetail.empty()) {
-                conflictDetail = reason + L"\n\n" + path.filename().wstring();
+            if (conflictReason.empty()) {
+                conflictReason = reason;
+                conflictFile = path.filename().wstring();
             }
         };
 
@@ -872,8 +911,8 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             const fs::file_status sourceStatus = fs::symlink_status(source, ec);
             if (ec || fs::is_symlink(sourceStatus) || !fs::is_regular_file(sourceStatus)) {
                 recordConflict(source, fs::is_symlink(sourceStatus) ?
-                    L"Symbolic-link image paths are not moved or deleted for safety." :
-                    L"The source file is missing or inaccessible.");
+                    L"Symbolic-link image paths are not moved or deleted for safety." : // loc-key
+                    L"The source file is missing or inaccessible."); // loc-key
                 continue;
             }
 
@@ -888,16 +927,16 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
             const fs::file_status sidecarStatus = fs::symlink_status(transfer.sourceSidecar, ec);
             if (ec && ec != std::errc::no_such_file_or_directory) {
                 recordConflict(transfer.sourceSidecar,
-                    L"QuickSift could not safely inspect the matching XMP sidecar.");
+                    L"QuickSift could not safely inspect the matching XMP sidecar."); // loc-key
                 transferValid = false;
             } else if (!ec && fs::exists(sidecarStatus)) {
                 if (fs::is_symlink(sidecarStatus)) {
                     recordConflict(transfer.sourceSidecar,
-                        L"The matching XMP is a symbolic link and was left untouched for safety.");
+                        L"The matching XMP is a symbolic link and was left untouched for safety."); // loc-key
                     transferValid = false;
                 } else if (!fs::is_regular_file(sidecarStatus)) {
                     recordConflict(transfer.sourceSidecar,
-                        L"The matching XMP path is not a normal file.");
+                        L"The matching XMP path is not a normal file."); // loc-key
                     transferValid = false;
                 } else {
                     transfer.sidecarPresent = true;
@@ -911,18 +950,18 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
                     source, transfer.sourceSidecar, scanSucceeded);
                 if (!scanSucceeded) {
                     recordConflict(source.parent_path(),
-                        L"QuickSift could not finish checking whether this XMP is shared.");
+                        L"QuickSift could not finish checking whether this XMP is shared."); // loc-key
                     continue;
                 }
                 if (sharedSidecar) {
                     recordConflict(transfer.sourceSidecar,
-                        L"This XMP sidecar is shared by another media file, so moving it would detach metadata from that file.");
+                        L"This XMP sidecar is shared by another media file, so moving it would detach metadata from that file."); // loc-key
                     continue;
                 }
             }
 
             if (NormalizedPathKey(source) == NormalizedPathKey(transfer.destination)) {
-                recordConflict(transfer.destination, L"The destination is the same as the source.");
+                recordConflict(transfer.destination, L"The destination is the same as the source."); // loc-key
                 continue;
             }
             bool destinationIsSymlink = false;
@@ -961,13 +1000,17 @@ void QuickSiftApplicationImpl::ShowColorLabelMenu() {
         }
 
         if (conflictCount > 0 || plan.size() != active.size()) {
-            std::wostringstream message;
-            message << (remove ? L"Delete-to-folder" : (move ? L"Move" : L"Copy"))
-                << L" was stopped before any files were changed.\n\n"
-                << conflictDetail;
-            if (conflictCount > 1) message << L"\n\nPlus " << (conflictCount - 1) << L" other conflict(s).";
-            message << L"\n\nQuickSift never overwrites or automatically renames files.";
-            ShowGlassAlert(L"File conflict — nothing changed", message.str(), GlassAlertKind::Warning);
+            // 0.9.6.0: every piece is a table key; the file name stays verbatim.
+            std::wstring message = Tr(remove ? L"Delete-to-folder was stopped before any files were changed." :
+                (move ? L"Move was stopped before any files were changed." :
+                    L"Copy was stopped before any files were changed."));
+            if (!conflictReason.empty()) message += L"\n\n" + Tr(conflictReason) + L"\n\n" + conflictFile;
+            if (conflictCount > 1) {
+                message += L"\n\n" + FillToken(Tr(L"Plus {count} other conflict(s)."), L"{count}",
+                    std::to_wstring(conflictCount - 1));
+            }
+            message += L"\n\n" + Tr(L"QuickSift never overwrites or automatically renames files.");
+            ShowGlassAlertText(Tr(L"File conflict — nothing changed"), message, GlassAlertKind::Warning);
             return false;
         }
         return true;
