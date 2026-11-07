@@ -9,6 +9,17 @@
 - **Maintainability:** the large functions were split, data-only state structs were added, layout constants are named, and CODE_GUIDE is the documentation hub.
 - **Repository:** the stale historical notes were removed (`notes/`, `PRE_RELEASE_AUDIT.md`, `VALIDATION.md`, `MODULARIZATION_NOTES.md`), as were the generated `SOURCE_MANIFEST.sha256` and `codebase_bundle.*`. A `.gitignore` was added.
 
+### Responsiveness and cache maintenance
+
+- Failed-decoder Windows Shell previews no longer run handlers during painting. A low-priority, bounded child process provides fallback pixels; an unresponsive handler is stopped after 5 seconds without holding up normal app shutdown. Failed requests are cached for 30 seconds, and file/catalog identity or thumbnail size changes invalidate the entry. Fallbacks are capped at 1024 pixels and 32 MiB of GPU surfaces.
+- Settings changes are coalesced into immutable background saves. Normal close and Windows shutdown wait for the latest save; a failed final save is reported instead of silently losing settings. Verified, atomic session publication is unchanged.
+- Bitmap lookups use non-owning probes and a fixed two-size buffer. Compare layout and decorative gradient resources are reused until their actual inputs change. Filtering no longer builds a whole-folder path set solely to retain Compare panes.
+- Folder discovery retains its first 64-photo batch, then grows batches from 256 up to 4096 to reduce repeated full-order integration. Preparing the metadata queue now rolls back only the new tail instead of cloning every pending entry. Ordering, progressive results and metadata priority are unchanged.
+- Embedded-JPEG scanning in RAW files now checks cancellation during both container and JPEG entropy scans; a cancelled scan never supplies a partial preview.
+- Disposable bitmap-cache writes reuse conservative free-space observations for at most 250 ms / 16 MiB, debit payload plus 64 KiB per file, and recheck immediately near the existing free-space reserve. Directory repair is only attempted after a failed temporary-file open. Checksums, flushes, write-through atomic publication and all original/XMP/session safety remain intact.
+- Saturated GPU eviction reuses geometric-growth candidate storage, released when the cache is cleared. Victim ranking, protected images, byte caps, net replacement accounting and allocation-failure fallback are unchanged; no bulk eviction or relaxed durability policy was introduced without Windows profiling.
+- Added deterministic regression checks and matching source-verifier guards. Native UI/handler behavior still requires Windows testing; no benchmark speedup is claimed.
+
 ### Round 24: Lightroom interop, auto-advance, shortcut sheet
 
 - **Fixed: the "Move selected photos to Deleted?" message was written inline in English and Vietnamese.** It now comes from the translation table, with separate one-photo and several-photo sentences. The file-conflict alert ("… was stopped before any files were changed") and its eight reasons were also untranslated in Vietnamese, and they are now localized too. `check-localization.py` adds an `inline-language` rule: Vietnamese text in `src/ui` or `src/app` outside `localization.cpp` fails the check, with a self-test.

@@ -1,5 +1,6 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
+#include "diagnostics/log_and_continue.h"
 #include "platform/application_data_paths.h"
 #include "core/presentation_settings.h"
 #include "core/settings_migration.h"
@@ -309,6 +310,7 @@ namespace quicksift::app {
     }
 
     void QuickSiftApplicationImpl::OnTimer(UINT_PTR timer) {
+        if (timer == ID_TIMER_SHELL_PREVIEW) { InvalidateCanvas(); return; }
         if (timer == ID_TIMER_BLOCKING_WAIT) { UpdateBlockingWaitDialog(); return; }
         // Lost-wake backstop (0.9.4.0 polish): a finished ratings / batch worker whose
         // WM_APP completion post failed would otherwise never be consumed (and the
@@ -580,7 +582,7 @@ namespace quicksift::app {
         hasSavedPlacement_ = savedWidth > 320 && savedHeight > 240;
     }
 
-    void QuickSiftApplicationImpl::SaveSession() {
+    bool QuickSiftApplicationImpl::SaveSession(bool finalSave) {
         if (sessionPath_.empty()) {
             sessionPath_ = quicksift::platform::SessionFilePath();
         }
@@ -661,13 +663,15 @@ namespace quicksift::app {
             }
         }
 
-        AtomicFileSnapshot expected;
-        if (!CaptureAtomicFileSnapshot(sessionPath_, expected) ||
-            !WriteTextFile(sessionPath_, document,
-                TextFileEncoding::Utf16LittleEndian, expected)) {
-            QS_LOG_ERROR(L"Session", L"The session file could not be published atomically: " +
-                sessionPath_.wstring());
+        try {
+            auto ticket = sessionWriter_.Submit({sessionPath_.wstring(), std::move(document)});
+            if (!finalSave || sessionWriter_.Drain(ticket)) return true;
+            ShowGlassAlert(L"Settings could not be saved",
+                L"QuickSift could not save your settings. Check free space and folder permissions, then try closing again.", GlassAlertKind::Error);
+        } catch (...) {
+            QS_LOG_AND_CONTINUE(L"Session", L"SaveSession");
         }
+        return false;
     }
 
     void QuickSiftApplicationImpl::RestoreSessionAfterCreate() {
@@ -1042,7 +1046,7 @@ namespace quicksift::app {
         if (!activeSlot || *activeSlot >= paths.size()) return;
 
         const D2D1_SIZE_F canvas = CanvasSizeInDips();
-        const auto cells = BuildBestCompareLayout(
+        const auto& cells = BuildBestCompareLayout(
             D2D1::RectF(0.0f, 0.0f, canvas.width, canvas.height));
         std::optional<std::size_t> nextSlot;
         if (cells.size() == paths.size()) {

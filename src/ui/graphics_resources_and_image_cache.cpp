@@ -1,6 +1,8 @@
 // OWNER: Compiled QuickSiftApplication feature module.
 #include "app/quicksift_application_internal.h"
 #include "core/blur_outline_policy.h"
+#include "core/priority_policy.h"
+#include "core/cache_eviction_policy.h"
 #include "diagnostics/log_and_continue.h"
 #include <shobjidl.h>
 #include <shellapi.h>
@@ -220,6 +222,8 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::DiscardDeviceResources() {
+        canvasGradientBrushes_.clear();
+        compareLayoutKey_.Invalidate();
         ClearBitmapCache();
         ReleaseHelpOverlayLayouts();
         uiWicFactory_.Reset();
@@ -242,7 +246,6 @@ namespace quicksift::app {
         // Round 22: Shell-fallback bitmaps belong to the discarded target too; the
         // filmstrip drew them on the new target after a device loss (D2D error).
         shellFallbackCache_.clear();
-        shellFallbackLastUse_ = {};
         for (auto& brush : badgeColorBrushes_) brush.Reset();
         hwndRenderTarget_.Reset();
         ResetModernDeviceResources();
@@ -659,6 +662,8 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::ClearBitmapCache() {
+        decltype(bitmapEvictionScratch_)().swap(bitmapEvictionScratch_);
+        decltype(tileEvictionScratch_)().swap(tileEvictionScratch_);
         decltype(bitmapCache_) emptyBitmaps;
         bitmapCache_.swap(emptyBitmaps);
         decltype(tileCache_) emptyTiles;
@@ -722,7 +727,7 @@ namespace quicksift::app {
         CacheClass cacheClass) const {
         const size_t limit = CacheLimitForClass(cacheClass);
         if (!budget.incomingClass || *budget.incomingClass != cacheClass) return limit;
-        return budget.incomingBytes >= limit ? 0 : limit - budget.incomingBytes;
+        return quicksift::core::EvictionReservationLimit(limit, budget.incomingBytes);
     }
 
     void QuickSiftApplicationImpl::EvictBitmapCache(bool forceProtected ,
@@ -780,42 +785,29 @@ namespace quicksift::app {
         };
         auto limitFor = [&](CacheClass cacheClass) { return EvictionLimitFor(budget, cacheClass); };
         auto bytesFor = [&](CacheClass cacheClass) { return CacheBytesForClass(cacheClass); };
-        using BitmapIterator = decltype(bitmapCache_)::iterator;
-        struct BitmapCandidate {
-            BitmapIterator iterator;
-            uint64_t lastUse = 0;
-            CacheClass cacheClass = CacheClass::Preview;
-            bool frequent = false;
-            bool facePriority = false;
-            bool recent = false;
-            bool erased = false;
-        };
-        using TileIterator = decltype(tileCache_)::iterator;
-        struct TileCandidate {
-            TileIterator iterator;
-            uint64_t lastUse = 0;
-            bool recent = false;
-            bool erased = false;
-        };
-
-        std::vector<BitmapCandidate> bitmaps;
-        bitmaps.reserve(bitmapCache_.size());
+        using BitmapCandidate = BitmapEvictionCandidate;
+        using TileCandidate = TileEvictionCandidate;
+        auto& bitmaps = bitmapEvictionScratch_;
+        auto& tiles = tileEvictionScratch_;
+        bitmaps.clear(); tiles.clear();
+        struct ClearScratch {
+            decltype(bitmapEvictionScratch_)& bitmaps;
+            decltype(tileEvictionScratch_)& tiles;
+            ~ClearScratch() { bitmaps.clear(); tiles.clear(); }
+        } clear{bitmaps, tiles};
         for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
-            if (!forceProtected && IsProtectedBitmap(it->first)) continue;
+            if (!quicksift::core::EvictionEligible(IsProtectedBitmap(it->first), forceProtected)) continue;
             const bool recent = it->first.cacheClass != CacheClass::Thumbnail &&
                 isRecent(it->second.lastUseTime);
             bitmaps.push_back(BitmapCandidate{ it, it->second.lastUse, it->second.cacheClass,
                 it->second.frequent, reviewState_.FaceLockEnabled() && PathHasDetectedFace(it->first.path), recent, false });
         }
         std::sort(bitmaps.begin(), bitmaps.end(), [](const BitmapCandidate& left, const BitmapCandidate& right) {
-            if (left.recent != right.recent) return !left.recent;
-            if (left.facePriority != right.facePriority) return !left.facePriority;
-            if (left.frequent != right.frequent) return !left.frequent;
-            return left.lastUse < right.lastUse;
+            return quicksift::core::EvictionRankLess(
+                {left.recent, left.facePriority, left.frequent, left.lastUse},
+                {right.recent, right.facePriority, right.frequent, right.lastUse});
         });
 
-        std::vector<TileCandidate> tiles;
-        tiles.reserve(tileCache_.size());
         for (auto it = tileCache_.begin(); it != tileCache_.end(); ++it) {
             tiles.push_back(TileCandidate{ it, it->second.lastUse, isRecent(it->second.lastUseTime), false });
         }
@@ -886,7 +878,7 @@ namespace quicksift::app {
         auto oldest = bitmapCache_.end();
         for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
             if (onlyClass && it->second.cacheClass != *onlyClass) continue;
-            if (!forceProtected && IsProtectedBitmap(it->first)) continue;
+            if (!quicksift::core::EvictionEligible(IsProtectedBitmap(it->first), forceProtected)) continue;
             const bool candidateRecent = it->first.cacheClass != CacheClass::Thumbnail &&
                 isRecent(it->second.lastUseTime);
             const bool oldestRecent = oldest != bitmapCache_.end() &&
@@ -936,7 +928,7 @@ namespace quicksift::app {
             auto oldestBitmap = bitmapCache_.end();
             auto oldestTile = tileCache_.end();
             for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
-                if (!forceProtected && IsProtectedBitmap(it->first)) continue;
+                if (!quicksift::core::EvictionEligible(IsProtectedBitmap(it->first), forceProtected)) continue;
                 const bool recent = it->first.cacheClass != CacheClass::Thumbnail &&
                     isRecent(it->second.lastUseTime);
                 if (oldestBitmap == bitmapCache_.end() || (bitmapRecent && !recent) ||
@@ -1092,7 +1084,7 @@ namespace quicksift::app {
 
 
     BitmapEntry* QuickSiftApplicationImpl::FindBitmapNoTouch(const fs::path& path, int desired, CacheClass preferredClass) const {
-        const std::wstring keyPath = path.wstring();
+        const std::wstring_view keyPath = path.native();
         static constexpr CacheClass classes[] = {
             CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full
         };
@@ -1114,7 +1106,7 @@ namespace quicksift::app {
         // and charged to the budget but invisible to this lookup.
         for (const int bucket : indexedSizes->second) {
             for (CacheClass cacheClass : classes) {
-                const CacheKey candidate{ keyPath, bucket, cacheClass };
+                const CacheKeyView candidate{ keyPath, bucket, cacheClass };
                 const auto it = bitmapCache_.find(candidate);
                 if (it == bitmapCache_.end()) continue;
                 const int classDistance = std::abs(static_cast<int>(cacheClass) -
@@ -1143,7 +1135,7 @@ namespace quicksift::app {
 
 
     BitmapEntry* QuickSiftApplicationImpl::FindBitmap(const fs::path& path, int desired, CacheClass preferredClass) {
-        const std::wstring keyPath = path.wstring();
+        const std::wstring_view keyPath = path.native();
         static constexpr CacheClass classes[] = {
             CacheClass::Thumbnail, CacheClass::Preview, CacheClass::Full
         };
@@ -1167,7 +1159,7 @@ namespace quicksift::app {
         // and charged to the budget but invisible to this lookup.
         for (const int bucket : indexedSizes->second) {
             for (CacheClass cacheClass : classes) {
-                const CacheKey candidate{ keyPath, bucket, cacheClass };
+                const CacheKeyView candidate{ keyPath, bucket, cacheClass };
                 const auto it = bitmapCache_.find(candidate);
                 if (it == bitmapCache_.end()) continue;
                 const int classDistance = std::abs(static_cast<int>(cacheClass) -
@@ -1202,46 +1194,72 @@ namespace quicksift::app {
 
 
     ComPtr<ID2D1Bitmap> QuickSiftApplicationImpl::GetOrCreateShellFallback(const fs::path& path, int targetSize) {
-        const std::wstring key = path.wstring();
+        const int target = std::clamp(targetSize, 16, quicksift::core::kShellPreviewMaximumEdge);
         const auto now = std::chrono::steady_clock::now();
-        if (shellFallbackLastUse_ != std::chrono::steady_clock::time_point{} &&
-            now - shellFallbackLastUse_ > std::chrono::seconds(5)) shellFallbackCache_.clear();
-        shellFallbackLastUse_ = now;
-        if (auto it = shellFallbackCache_.find(key); it != shellFallbackCache_.end()) return it->second;
-        // 0.9.4.0: IShellItemImageFactory::GetImage is synchronous file I/O and may run
-        // a thumbnail handler (seconds for RAW/HEIC on slow storage). Paint callers only
-        // reach this for definitively failed decodes, and at most one new Shell bitmap
-        // is created per frame; the rest are deferred to the next frame.
-        if (shellFallbackFrameBudget_ <= 0) {
-            shellFallbackDeferred_ = true;
-            return nullptr;
+        const auto* photo = PhotoForPath(path.native());
+        if (!photo) return nullptr;
+        const quicksift::core::ShellPreviewIdentity identity{generation_, photo->fileSize, photo->modifiedStamp, target};
+        const CacheKeyView probe{path.native(), target, CacheClass::Thumbnail};
+        if (auto it = shellFallbackCache_.find(probe); it != shellFallbackCache_.end()) {
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.at).count();
+            if (quicksift::core::ShellPreviewReusable(it->second.identity, identity, it->second.failed, age)) {
+                return it->second.bitmap;
+            }
+            shellFallbackCache_.erase(it);
         }
-        --shellFallbackFrameBudget_;
-        // The WIC factory used to be created only by the (never used) Direct2D
-        // image-source cache, so this fallback always discarded the Shell bitmap
-        // after paying for GetImage. Create it here, before any Shell I/O.
-        if (!uiWicFactory_ && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&uiWicFactory_)))) return nullptr;
-        ComPtr<IShellItem> item;
-        if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item)))) return nullptr;
-        ComPtr<IShellItemImageFactory> factory;
-        if (FAILED(item.As(&factory))) return nullptr;
-        HBITMAP hbmp = nullptr;
-        const SIZE size{ std::max(16, targetSize), std::max(16, targetSize) };
-        if (FAILED(factory->GetImage(size, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK, &hbmp)) || !hbmp) return nullptr;
-        ComPtr<IWICBitmap> wic;
-        if (!uiWicFactory_ || FAILED(uiWicFactory_->CreateBitmapFromHBITMAP(hbmp, nullptr, WICBitmapUsePremultipliedAlpha, &wic))) { DeleteObject(hbmp); return nullptr; }
-        DeleteObject(hbmp);
-        ComPtr<ID2D1Bitmap> bitmap;
-        if (!renderTarget_ || FAILED(renderTarget_->CreateBitmapFromWicBitmap(wic.Get(), nullptr, &bitmap))) return nullptr;
-        shellFallbackCache_[key] = bitmap;
-        return bitmap;
+        // Only terminal decoder failures reach here. No storage/COM work in paint.
+        if (shellFallbackCache_.size() >= 128) {
+            auto victim = shellFallbackCache_.end();
+            for (auto it = shellFallbackCache_.begin(); it != shellFallbackCache_.end(); ++it)
+                if (!it->second.pending && (victim == shellFallbackCache_.end() || it->second.at < victim->second.at)) victim = it;
+            if (victim == shellFallbackCache_.end()) return nullptr;
+            shellFallbackCache_.erase(victim);
+        }
+        if (shellPreviewService_.Request({path.native(), identity})) {
+            ShellFallbackEntry entry; entry.identity = identity; entry.at = now; entry.pending = true;
+            shellFallbackCache_.emplace(CacheKey{path.native(), target, CacheClass::Thumbnail}, std::move(entry));
+        }
+        return nullptr;
     }
 
+    void QuickSiftApplicationImpl::DrainShellFallbackResults() {
+        // Optional fallback uploads stay behind the foreground view decoder.
+        if (quicksift::core::priority::Demand().Snapshot().viewForeground != 0) return;
+        quicksift::work::ShellPreviewResult result;
+        if (!shellPreviewService_.TryPop(result)) return;
+        const auto& request = result.request;
+        const CacheKeyView key{request.path, request.identity.target, CacheClass::Thumbnail};
+        const auto it = shellFallbackCache_.find(key);
+        const auto* photo = PhotoForPath(request.path);
+        if (it == shellFallbackCache_.end() || !photo || request.identity.generation != generation_ ||
+            it->second.identity != request.identity || photo->fileSize != request.identity.fileSize ||
+            photo->modifiedStamp != request.identity.modifiedStamp) return;
+        auto& entry = it->second; entry.pending = false; entry.failed = true;
+        entry.at = std::chrono::steady_clock::now();
+        if (!renderTarget_ || result.pixels.empty()) return;
+        const auto properties = D2D1::BitmapProperties(
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+        const HRESULT hr = renderTarget_->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(result.width), static_cast<UINT32>(result.height)),
+            result.pixels.data(), static_cast<UINT32>(result.width * 4), properties, &entry.bitmap);
+        entry.failed = FAILED(hr);
+        entry.bytes = entry.failed ? 0 : result.pixels.size();
+        constexpr std::size_t kShellGpuBytes = 32ull * 1024ull * 1024ull;
+        std::size_t total = 0;
+        for (const auto& cached : shellFallbackCache_) total += cached.second.bytes;
+        while (total > kShellGpuBytes) {
+            auto victim = shellFallbackCache_.end();
+            for (auto candidate = shellFallbackCache_.begin(); candidate != shellFallbackCache_.end(); ++candidate)
+                if (candidate != it && candidate->second.bytes &&
+                    (victim == shellFallbackCache_.end() || candidate->second.at < victim->second.at)) victim = candidate;
+            if (victim == shellFallbackCache_.end()) break;
+            total -= victim->second.bytes;
+            shellFallbackCache_.erase(victim);
+        }
+    }
 
     BitmapEntry* QuickSiftApplicationImpl::FindBestViewBitmap(const fs::path& path, int desiredEdge,
         CacheClass preferredClass) {
-        const std::wstring keyPath = path.wstring();
+        const std::wstring_view keyPath = path.native();
         const auto sizesIt = pathToBitmapSizes_.find(keyPath);
         if (sizesIt == pathToBitmapSizes_.end() || sizesIt->second.empty()) return nullptr;
 
@@ -1251,7 +1269,7 @@ namespace quicksift::app {
             BitmapEntry* best = nullptr; const CacheKey* bestKey = nullptr;
             int bestDistance = INT_MAX; int bestTier = -1;
             for (CacheClass c : classes) {
-                CacheKey key{ keyPath, size, c };
+                CacheKeyView key{ keyPath, size, c };
                 auto it = bitmapCache_.find(key);
                 if (it == bitmapCache_.end() || !it->second.bitmap) continue;
                 const int tier = c == CacheClass::Thumbnail ? 0 : (it->second.previewOnly ? 1 : 2);
@@ -1263,12 +1281,14 @@ namespace quicksift::app {
             return {best, bestKey};
         };
         const auto lb = sizesIt->second.lower_bound(threshold);
-        std::vector<int> candidates;
-        if (lb != sizesIt->second.end()) candidates.push_back(*lb);
-        if (lb != sizesIt->second.begin()) candidates.push_back(*std::prev(lb));
-        if (candidates.empty()) candidates.push_back(*sizesIt->second.rbegin());
+        std::array<int, 2> candidates{};
+        std::size_t candidateCount = 0;
+        if (lb != sizesIt->second.end()) candidates[candidateCount++] = *lb;
+        if (lb != sizesIt->second.begin()) candidates[candidateCount++] = *std::prev(lb);
+        if (candidateCount == 0) candidates[candidateCount++] = *sizesIt->second.rbegin();
         BitmapEntry* best = nullptr; const CacheKey* bestKey = nullptr; int bestScore = INT_MIN;
-        for (int size : candidates) {
+        for (std::size_t i = 0; i < candidateCount; ++i) {
+            const int size = candidates[i];
             auto [entry, key] = chooseAtSize(size); if (!entry) continue;
             const int edge = BitmapMaximumEdge(entry); if (edge <= 0) continue;
             const int score = (edge >= threshold ? 100000 : 0) + edge;
@@ -1280,6 +1300,14 @@ namespace quicksift::app {
 
     BitmapEntry* QuickSiftApplicationImpl::GetOrRequestBitmap(const fs::path& path, int desired, JobPriority priority, bool requestFull,
         CacheClass cacheClass, uint64_t viewportEpoch, bool ignoreThumbnailViewport) {
+        if (!requestFull && cacheClass == CacheClass::Thumbnail) {
+            const CacheKeyView probe{path.native(), BucketFor(std::max(1, desired)), cacheClass};
+            if (auto it = bitmapCache_.find(probe); it != bitmapCache_.end() &&
+                BitmapSatisfiesDisplay(&it->second, std::max(1, desired), false)) {
+                TouchBitmapEntry(it->first, it->second);
+                return &it->second;
+            }
+        }
         // One path materialization per call (fs::path::wstring() allocates a copy;
         // this runs for every visible card / view pane on every frame).
         const std::wstring pathText = path.wstring();

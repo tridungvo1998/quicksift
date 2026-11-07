@@ -31,7 +31,7 @@ D2D1_RECT_F QuickSiftApplicationImpl::ViewAreaForPath(const std::wstring& path) 
     const D2D1_RECT_F bounds = D2D1::RectF(0.0f, 0.0f, canvas.width, canvas.height);
     if (reviewState_.Mode() == ViewMode::Compare) {
         if (const auto slot = reviewState_.CompareSlotForPath(path)) {
-            const std::vector<D2D1_RECT_F> cells = BuildBestCompareLayout(bounds);
+            const auto& cells = BuildBestCompareLayout(bounds);
             if (*slot < cells.size()) {
                 const D2D1_RECT_F cell = cells[*slot];
                 return D2D1::RectF(cell.left + 2.0f, cell.top + 2.0f,

@@ -1,4 +1,5 @@
 // OWNER: Compiled QuickSiftApplication feature module.
+#include "core/queue_append_transaction.h"
 #include "app/quicksift_application_internal.h"
 #include "diagnostics/log_categories.h"
 #include "core/log_rate_limiter.h"
@@ -297,6 +298,7 @@ void QuickSiftApplicationImpl::RetryFailedImageLoads() {
         storageProfile_ = quicksift::DetectStorageProfile(folder, systemProfile_.lowMemory);
         worker_.SetStorageProfile(storageProfile_);
         ++generation_;
+        shellPreviewService_.Cancel(generation_);
         reviewState_.ResetForFolder();
         worker_.SetActiveGeneration(generation_);
         worker_.SetNavigationEpoch(reviewState_.Epochs().navigation);
@@ -463,16 +465,16 @@ void QuickSiftApplicationImpl::RetryFailedImageLoads() {
             std::inplace_merge(visibleOrder.begin(),
                 visibleOrder.begin() + static_cast<std::ptrdiff_t>(oldVisibleSize),
                 visibleOrder.end(), compare);
-            // Prepare the metadata queue before catalog mutation. Deque append may
-            // allocate; swapping the fully prepared queue after catalog commit is
-            // noexcept and keeps scanner acknowledgement truthful under low memory.
+            // Prepare only the new metadata tail. A throwing append or catalog commit
+            // rolls that tail back; existing pending entries are never copied.
+            // Commit the guard immediately after the atomic catalog commit.
             if (metadataIndices.size() > std::numeric_limits<size_t>::max() -
                 pendingRatings_) {
                 throw std::length_error("metadata progress counter overflow");
             }
-            std::deque<size_t> prospectiveMetadataQueue = pendingMetadataIndices_;
+            quicksift::core::QueueAppendTransaction metadataAppend(pendingMetadataIndices_);
             for (const size_t index : metadataIndices) {
-                prospectiveMetadataQueue.push_back(index);
+                pendingMetadataIndices_.push_back(index);
             }
             const std::wstring previousCurrent = reviewState_.SinglePath();
             const std::wstring previousFocus = reviewState_.ThumbnailFocusPath();
@@ -480,7 +482,7 @@ void QuickSiftApplicationImpl::RetryFailedImageLoads() {
                 std::span<const PhotoItem>(batch->photos.data(), batch->photos.size()),
                 std::move(visibleOrder)));
             catalogCommitted = true;
-            pendingMetadataIndices_.swap(prospectiveMetadataQueue);
+            metadataAppend.Commit();
             pendingRatings_ += metadataIndices.size();
             RestorePhotoOrderState(previousCurrent, previousFocus);
             if (reviewState_.SinglePath().empty() && !catalog_.VisibleEmpty()) {

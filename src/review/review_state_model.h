@@ -1,6 +1,7 @@
 // OWNER: Authoritative review-session state for thumbnails, zoom, Compare synchronization, FaceLock, and async epochs.
 #pragma once
 
+#include <functional>
 #include "core/app_types.h"
 #include "review/view_transform_policy.h"
 
@@ -96,6 +97,7 @@ public:
     void ClearCompare() noexcept;
     bool ReplaceComparePath(const std::wstring& oldPath, const std::wstring& newPath);
     bool RetainComparedPaths(const std::unordered_set<std::wstring>& visiblePaths);
+    bool RetainComparedPaths(const std::function<bool(const std::wstring&)>& isVisible);
 
     [[nodiscard]] ViewState SharedView() const noexcept;
     void SetSharedView(ViewState state) noexcept { sharedView_ = state; }

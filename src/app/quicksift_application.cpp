@@ -91,6 +91,7 @@ bool QuickSiftApplicationImpl::PostFromWorker(const quicksift::core::worker_life
 }
 
 void QuickSiftApplicationImpl::StopAllWorkersForTeardown() noexcept {
+    sessionWriter_.Stop();
     // 1. No worker can post to the window any more (blocks until an in-flight
     //    post returns). 2. Every worker sees its stop/cancel flag. 3. Join all,
     //    so none can touch a member after this returns.

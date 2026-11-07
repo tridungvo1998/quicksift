@@ -531,7 +531,7 @@ if (-not $CompletionQueueText.Contains('DrainInto(std::deque<BackgroundCompletio
     throw 'Completion draining can lose committed results on allocation failure.'
 }
 foreach ($Token in @('ScanCompletionStatus::Failed', 'ScanCompletionStatus::Succeeded',
-        'AcknowledgeBatch', 'prospectiveMetadataQueue', 'PumpMetadataQueue')) {
+        'AcknowledgeBatch', 'QueueAppendTransaction', 'PumpMetadataQueue')) {
     if (-not $CatalogIntegrationText.Contains($Token)) { throw "Catalog scan integration is missing $Token" }
 }
 
@@ -858,6 +858,15 @@ $UnexpectedExecutablePathUsers = Get-ChildItem -LiteralPath (Join-Path $SourceDi
 if ($UnexpectedExecutablePathUsers) { throw "Executable-directory/current-directory ownership escaped the package path resolver: $($UnexpectedExecutablePathUsers.FullName -join ', ')" }
 $SourceCodeText = (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src') -Recurse -File -Include '*.cpp','*.h' |
     ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+# One audited self-launch: isolated Shell preview, never an arbitrary executable.
+$ShellService = Read-SourceText 'src\work\shell_preview_service.cpp'
+if ([regex]::Matches($ShellService, 'CreateProcessW\(').Count -ne 1) { throw 'Shell preview must have exactly one audited self-launch' }
+foreach ($Token in @('GetModuleFileNameW(nullptr', 'CreateProcessW(executable, command.data()',
+        'PROC_THREAD_ATTRIBUTE_HANDLE_LIST', 'CREATE_SUSPENDED', 'JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE',
+        'AssignProcessToJobObject', 'WaitForSingleObject(child.value, 50)', 'kShellPreviewTimeoutMs')) {
+    if (-not $ShellService.Contains($Token)) { throw "Shell preview isolation contract missing: $Token" }
+}
+$SourceCodeText = $SourceCodeText.Replace($ShellService, $ShellService.Replace('CreateProcessW(', 'AuditedSelfLaunch('))
 foreach ($Forbidden in @('WriteProcessMemory(', 'CreateRemoteThread(', 'PAGE_EXECUTE_READWRITE', 'VirtualProtect(',
         'ShellExecuteW(', 'CreateProcessW(', 'WinExec(', 'URLDownloadToFile')) {
     if ($SourceCodeText.Contains($Forbidden)) { throw "Packaged-release hygiene forbids unexpected self-modifying/process-launch primitive: $Forbidden" }
@@ -1169,10 +1178,27 @@ foreach ($File in (Get-ChildItem -LiteralPath (Join-Path $SourceDir 'src') -Recu
     }
 }
 $ShellFallbackBody = Remove-CppComments (Get-FunctionBody (Read-SourceText 'src\ui\graphics_resources_and_image_cache.cpp') 'ComPtr<ID2D1Bitmap> QuickSiftApplicationImpl::GetOrCreateShellFallback(')
-$FactoryAt = $ShellFallbackBody.IndexOf('CoCreateInstance(CLSID_WICImagingFactory')
-if ($FactoryAt -lt 0 -or $FactoryAt -gt $ShellFallbackBody.IndexOf('GetImage(')) {
-    throw 'The Shell fallback must create its WIC factory before calling GetImage.'
+foreach ($Forbidden in @('GetImage(', 'CoCreateInstance(', 'SHCreateItemFromParsingName(')) {
+    if ($ShellFallbackBody.Contains($Forbidden)) { throw "Shell fallback paint must stay asynchronous: $Forbidden" }
 }
+if (-not $ShellFallbackBody.Contains('shellPreviewService_.Request(')) { throw 'Shell fallback must use the isolated service' }
+$ShellChild = Read-SourceText 'src\work\shell_preview_service.cpp'
+if ($ShellChild.IndexOf('CoCreateInstance(CLSID_WICImagingFactory') -gt $ShellChild.IndexOf('shell->GetImage(')) { throw 'Shell child must create WIC before expensive handler extraction' }
+$OptimizationContracts = @{
+    'src\ui\graphics_resources_and_image_cache.cpp' = @('CacheKeyView', 'std::array<int, 2>', 'bitmapEvictionScratch_', 'ClearScratch')
+    'src\ui\canvas_rendering_and_overlays.cpp' = @('compareLayoutKey_.Matches', 'canvasGradientBrushes_', 'DrainShellFallbackResults')
+    'src\ui\navigation_input_and_session.cpp' = @('sessionWriter_.Submit', 'sessionWriter_.Drain')
+    'src\ui\main_window_chrome_and_messages.cpp' = @('SaveSession(true)', 'shellPreviewService_.Stop()')
+    'src\bundled_codecs.cpp' = @('FindLargestEmbeddedJpeg(bytes, options.isCancelled)')
+    'src\persistent_cache.cpp' = @('derivativeSpace_.NeedsRefresh', 'derivativeSpace_.Reserve', 'FlushNativeOutputFile(file)', 'ReplaceFileAtomically(temporary, destination)')
+}
+foreach ($Path in $OptimizationContracts.Keys) {
+    $Text = Read-SourceText $Path
+    foreach ($Token in $OptimizationContracts[$Path]) {
+        if (-not $Text.Contains($Token)) { throw "Optimization safety contract missing: $Token" }
+    }
+}
+[void](Read-SourceText 'scripts\checks\optimization_checks.cpp')
 
 # 0.9.5.0 round 19: LayoutControls re-lays the title bar only when one of its inputs changed
 # (TitleLayoutKey) or it was marked dirty (DPI, fonts, language, theme).

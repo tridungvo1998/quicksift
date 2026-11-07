@@ -13,6 +13,7 @@
 #define NOMINMAX
 #endif
 
+#include "core/bitmap_cache_key.h"
 #include <windows.h>
 #include <roapi.h>
 #include <windowsx.h>
@@ -240,6 +241,7 @@ inline constexpr UINT_PTR ID_TIMER_METADATA_WRITE_LANE = 23;
 inline constexpr UINT_PTR ID_TIMER_USER_COMMENT_RETRY = 24;
 inline constexpr UINT_PTR ID_TIMER_LIBRARY_LIST_RETRY = 25;
 inline constexpr UINT_PTR ID_TIMER_BLOCKING_WAIT = 26;
+inline constexpr UINT_PTR ID_TIMER_SHELL_PREVIEW = 27;
 
 inline constexpr UINT_PTR kFaceWarningTooltipId = 1;
 
@@ -447,25 +449,10 @@ std::wstring ReadPropertyDisplay(IPropertyStore* store, const wchar_t* canonical
 std::wstring BuildExifText(const fs::path& path);
 std::optional<fs::path> PickFolder(HWND owner, const wchar_t* title);
 
-struct CacheKey {
-    std::wstring path;
-    int size = 0;
-    CacheClass cacheClass = CacheClass::Preview;
-    bool operator==(const CacheKey& other) const noexcept {
-        return size == other.size && cacheClass == other.cacheClass && path == other.path;
-    }
-};
-
-struct CacheKeyHash {
-    size_t operator()(const CacheKey& key) const noexcept {
-        const std::uint64_t sizeHash =
-            static_cast<std::uint64_t>(key.size) * 0x9E3779B185EBCA87ull;
-        const std::uint64_t classShift =
-            static_cast<std::uint64_t>(key.cacheClass) << 58;
-        return std::hash<std::wstring>{}(key.path) ^
-            static_cast<size_t>(sizeHash ^ classShift);
-    }
-};
+using quicksift::core::CacheKey;
+using quicksift::core::CacheKeyView;
+using quicksift::core::CacheKeyHash;
+using quicksift::core::CacheKeyEqual;
 
 struct BitmapEntry {
     ComPtr<ID2D1Bitmap> bitmap;

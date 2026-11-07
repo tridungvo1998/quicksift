@@ -97,6 +97,27 @@ int main() {
         Check(!FindLargestEmbeddedJpeg(junk).Found(), "all-0xFF input terminates");
     }
     {
+        int probes = 0;
+        Bytes junk(200000, 0);
+        Check(!FindLargestEmbeddedJpeg(junk, [&] { return ++probes == 3; }).Found() && probes == 3,
+            "outer scan cancels at bounded checkpoints");
+        Bytes entropy{0xFF, 0xD8}; Seg(entropy, 0xC0, Sof(6000, 4000)); Seg(entropy, 0xDA, {1,1,0,0,63,0});
+        entropy.insert(entropy.end(), 200000, 0x01); entropy.insert(entropy.end(), {0xFF,0xD9});
+        probes = 0;
+        Check(!FindLargestEmbeddedJpeg(entropy, [&] { return ++probes == 3; }).Found() && probes == 3,
+            "entropy scan cancellation does not return partial JPEG");
+        Check(!FindLargestEmbeddedJpeg(entropy, []() -> bool { throw 1; }).Found(), "throwing cancellation probe treated as cancellation");
+        Check(FindLargestEmbeddedJpeg(entropy, [] { return false; }).Found(), "uncancelled entropy retains full validation");
+        Bytes malformed{0xFF, 0xD8}; Seg(malformed, 0xC0, Sof(6000, 4000)); Seg(malformed, 0xDA, {1,1,0,0,63,0});
+        malformed.insert(malformed.end(), 20000, 0x01);
+        malformed.insert(malformed.end(), {0xFF, 0xC4, 0, 1}); // invalid segment rewinds outer scan
+        probes = 0;
+        Check(!FindLargestEmbeddedJpeg(malformed, [&] { return ++probes == 7; }).Found() && probes == 7,
+            "cancellation remains bounded after malformed-candidate rewind");
+        entropy.resize(entropy.size() - 2);
+        Check(!FindLargestEmbeddedJpeg(entropy, [] { return false; }).Found(), "truncated entropy still rejected");
+    }
+    {
         using namespace quicksift::core::decode_timeout;
         Check(AdaptiveTimeoutMs(0, true, true) >= 12000, "foreground RAW decode gets >= 12 s");
         Check(AdaptiveTimeoutMs(0, false, true) >= 8000, "foreground non-RAW decode gets >= 8 s");

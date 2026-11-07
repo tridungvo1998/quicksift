@@ -130,6 +130,13 @@ add_library(QuickSiftCore STATIC
     src/core/hydrated_facts.h
     src/core/filter_value_index.h
     src/core/embedded_jpeg_scan.h
+    src/core/bitmap_cache_key.h
+    src/core/compare_layout_key.h
+    src/core/snapshot_writer.h
+    src/core/queue_append_transaction.h
+    src/core/shell_preview_policy.h
+    src/core/derivative_space_budget.h
+    src/core/cache_eviction_policy.h
     src/core/decode_timeout_policy.h
     src/core/metadata_lane_policy.h
     src/core/metadata_progress.h
@@ -237,6 +244,8 @@ set(QS_APP_SOURCES
     src/work/background_decode_policy.cpp
     src/work/background_performance_controller.cpp
     src/work/background_work_engine.h
+    src/work/shell_preview_service.cpp
+    src/work/shell_preview_service.h
     src/work/folder_scanner.cpp
     src/work/folder_scanner.h
     src/work/background_completion_queue.h

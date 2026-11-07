@@ -173,7 +173,7 @@ void QuickSiftApplicationImpl::OnBlockingWaitPrimary() {
             std::to_wstring(pendingMetadataEdits_.Size()) + L" unsaved metadata edit(s)");
         pendingMetadataEdits_.Clear();
     }
-    SaveSession();
+    if (!SaveSession(true)) return;
     worker_.RequestCacheFlush();
     closingAfterTransactionCancellation_ = true;
     transactions_.RequestCloseAtSafeBoundary();

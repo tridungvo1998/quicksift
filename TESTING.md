@@ -117,3 +117,20 @@ Manual checks:
 2. **Build failures.** On a test machine, run `build.cmd` with Visual Studio's C++ workload removed, or with `QS_SIGN_CERT_SHA1` set to a wrong thumbprint.
    - Each run ends with `Build failed:` / `What to do:` / `Technical detail:` and a non-zero `%ERRORLEVEL%`.
    - A successful build prints nothing new.
+
+## Optimization regression gate (0.9.6.0)
+
+`optimization_checks.cpp` covers transparent key/hash equivalence and existing path semantics; Compare key invalidation (bounds, DPI, generation, mode, ordered identity, aspect/rotation); Shell negative-entry identity/size/expiry; deterministic latest-wins save ordering, unchanged-save skipping, observable failures, retry and final shutdown drain; metadata queue append rollback and invalid catalog order; bounded scan batches; low-space/overflow/query-expiry decisions; protected eviction eligibility, rank and incoming-byte caps; indexed Compare retention/pane cleanup. `raw_preview_checks.cpp` also covers outer and entropy-loop cancellation, throwing probes and truncated JPEGs.
+
+Both source verifiers enforce asynchronous paint, the single restricted self-launch, inherited handle allowlisting, suspended child/job assignment, bounded cancellation waits, final session drains, scratch reuse and retained cache flush/atomic-publication primitives. Run all existing checks as well as the new suite. These are invariant checks, not Windows performance measurements.
+
+Windows manual gate:
+- Broken/unsupported JPEG/RAW/HEIC: fallback success, no fallback available, handler crash and a deliberately unresponsive test handler; close and switch folders during extraction. Confirm no child survives app exit. Test packaged and portable launches, including restrictive job/process policies and paths with spaces/non-ASCII characters.
+- Large folders (1k/10k/100k): first results remain progressive, ordering/filter counts stay stable, metadata never outranks decode; inject allocation failure during queue tail preparation/catalog commit and verify rollback.
+- Compare 2–6 mixed orientations: async dimensions, rotation, pin/unpin, resize/fullscreen, 100/150/200% DPI, theme/high contrast, display-driver reset. Painting and hit-testing must agree.
+- Change multiple settings rapidly, close immediately, reopen and check settings/migration/first-run flags. Disk-full/read-only settings folder: final-save error prevents silent loss; retry after restoring access. Exercise normal close, Force quit and Windows logoff/cancelled shutdown.
+- Saturate GPU cache with thumbnails, Full, Preview and tiles; revisit active/visible photos, replace lower-resolution surfaces, force device loss and memory pressure. Check byte accounting and protected-photo behavior.
+- Cache disk fills or directories are deleted while writing: repair/reject safely; corrupt/truncate cache entries and verify checksum rejection/regeneration. No durability setting for originals/XMP/session may change.
+- Rapid Single View navigation through large RAWs while scanning; cancelled scans must not continue into fallback decoding or display stale previews. Verify Lightroom interop, auto-advance, shortcut sheet, filmstrip badges/fade and all EN/VI help still work.
+
+Off-Windows object compilation and portable/sanitizer checks do not substitute for these UI, handler, packaging and driver tests.

@@ -1207,13 +1207,13 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         // count, elapsed, reason), live, with Force quit (blocking_wait_controller).
         // Read-only indexing/metadata reads never block closing.
         if (ShowBlockingWaitIfNeeded(quicksift::core::blocking_wait::Command::Close)) return 0;
-        SaveSession();
+        if (!SaveSession(true)) return 0;
         DestroyWindow(hwnd_);
         return 0;
     }
 
     LRESULT QuickSiftApplicationImpl::OnQueryEndSession() {
-        SaveSession();
+        if (!SaveSession(true)) return FALSE;
         // A shutdown query is not a normal close request. Ask active work to
         // stop at its next safe boundary, but do not auto-close QuickSift if
         // this shutdown attempt is vetoed or cancelled by another process.
@@ -1238,7 +1238,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
             shutdownBlocked_ = false;
         }
         if (wParam != FALSE) {
-            SaveSession();
+            static_cast<void>(SaveSession(true));
             DestroyWindow(hwnd_);
         } else {
             // Another application vetoed shutdown. Re-open the coordinator
@@ -1303,6 +1303,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         // The later worker_.Stop() joins only after in-flight work observes
         // the stop flag. Only metadata writes (subject to kHardTimeout)
         // are allowed to finish.
+        shellPreviewService_.Stop();
         worker_.RequestStop();
         {
             std::lock_guard lock(searchMutex_);
@@ -1319,6 +1320,7 @@ LRESULT CALLBACK QuickSiftApplicationImpl::MainWndProc(HWND hwnd, UINT message, 
         KillTimer(hwnd_, ID_TIMER_CACHE_FLUSH);
         KillTimer(hwnd_, ID_TIMER_AUTOHIDE);
         KillTimer(hwnd_, ID_TIMER_METADATA_UI);
+        KillTimer(hwnd_, ID_TIMER_SHELL_PREVIEW);
         KillTimer(hwnd_, ID_TIMER_VIEW_RESOURCE_TRIM);
         KillTimer(hwnd_, ID_TIMER_BACKGROUND_ANALYSIS);
         KillTimer(hwnd_, ID_TIMER_FOLDER_SELECTION);

@@ -443,6 +443,7 @@ PersistentCache::PersistentCache(fs::path baseDirectory)
     : baseDirectory_(std::move(baseDirectory)) {}
 
 bool PersistentCache::InitializeStorage() {
+    { std::lock_guard lock(derivativeSpaceMutex_); derivativeSpace_.Invalidate(); }
     if (baseDirectory_.empty()) return false;
     bitmapDirectory_ = baseDirectory_ / L"bitmaps";
     pyramidDirectory_ = baseDirectory_ / L"pyramid";
@@ -1430,14 +1431,23 @@ void PersistentCache::StoreBitmapFile(const fs::path& destination, std::uint64_t
     const std::uint64_t expected = static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4ull;
     if (expected != pixels.size() || expected > kMaximumBitmapBytes) return;
     std::error_code ec;
-    const fs::space_info space = fs::space(baseDirectory_, ec);
-    if (!ec && (space.available <= minimumFreeSpaceBytes_ || expected > space.available - minimumFreeSpaceBytes_)) return;
-    fs::create_directories(destination.parent_path(), ec);
-    if (ec) return;
-
+    {
+        std::lock_guard lock(derivativeSpaceMutex_);
+        const auto now = core::DerivativeSpaceBudget::Clock::now();
+        if (derivativeSpace_.NeedsRefresh(expected, minimumFreeSpaceBytes_, now)) {
+            const auto space = fs::space(baseDirectory_, ec);
+            if (ec) { derivativeSpace_.Invalidate(); return; } // disposable cache fails closed
+            derivativeSpace_.Observe(space.available, now);
+        }
+        if (!derivativeSpace_.Reserve(expected, minimumFreeSpaceBytes_)) return;
+    }
     fs::path temporary;
     NativeOutputFile file = kInvalidNativeOutputFile;
-    if (!CreateUniqueTemporaryFile(destination, temporary, file)) return;
+    if (!CreateUniqueTemporaryFile(destination, temporary, file)) {
+        // Directories are created by InitializeStorage; repair only after a failed open.
+        fs::create_directories(destination.parent_path(), ec);
+        if (ec || !CreateUniqueTemporaryFile(destination, temporary, file)) return;
+    }
 
     BitmapHeader header{};
     std::memcpy(header.magic, kBitmapMagic.data(), kBitmapMagic.size());

@@ -72,8 +72,6 @@ struct ViewerState {
     bool completionPumpTimerActive_ = false;
     // Paint-time Shell thumbnail creation budget (0.9.4.0): at most one synchronous
     // Shell fallback per frame and only for definitively failed decodes.
-    int shellFallbackFrameBudget_ = 0;
-    bool shellFallbackDeferred_ = false;
     // Shared frame pump for scrollbar drag AND wheel/keyboard flings: one layout/paint
     // (and at most one viewport publish) per frame while motion is active.
     bool thumbnailScrollFrameTimerActive_ = false;

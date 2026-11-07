@@ -519,6 +519,7 @@ namespace quicksift::app {
         std::uniform_real_distribution<float> position(0.08f, 0.92f);
         std::uniform_real_distribution<float> radius(0.20f, 0.42f);
         const auto& accentColors = quicksift::ui::BackgroundAccentColors();
+        canvasGradientBrushes_.clear();
         backgroundBlobs_.clear();
         for (COLORREF color : accentColors) {
             backgroundBlobs_.push_back({ position(random), position(random), radius(random), color });
@@ -575,6 +576,7 @@ namespace quicksift::app {
 
 
     void QuickSiftApplicationImpl::ApplyTheme() {
+        canvasGradientBrushes_.clear();
         MarkTitleLayoutDirty();
         const ThemePalette palette = Palette();
         RestyleTooltips();

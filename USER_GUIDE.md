@@ -301,3 +301,13 @@ Ratings, pick states and labels are read in the background, below image decoding
 ## Metadata storage switches
 
 In **Settings → Metadata handling**, **Write metadata into RAW files**, **Write metadata into JPG/PNG files** and **Write metadata into TIFF files** are switches (highlighted means on). When a switch is on, ratings, pick states and labels for that format are written inside the image, through a verified temporary copy. When it is off, they are written to an XMP sidecar next to the image (`IMG_0001.xmp` for a RAW), and the image itself is never modified. By default RAW files use sidecars and JPG/PNG/TIFF are written in place. Existing metadata is not migrated when you change a switch; the folder is reloaded from the newly selected source.
+
+## Responsiveness and settings safety
+
+Normal photo decoding, controls and shortcuts are unchanged. QuickSift reuses Compare layouts, background brushes and cache lookup storage, integrates large folders in progressive bounded batches, and cancels abandoned RAW preview scans sooner.
+
+If the normal decoder has definitively failed, Windows Shell may provide a fallback thumbnail asynchronously. Its handler runs separately at low priority (maximum 5 seconds); a stuck handler does not freeze the canvas or prevent closing QuickSift. Fallbacks are bounded to 1024 pixels. A failed fallback is not retried on every repaint: it can retry after 30 seconds, or when the catalog file identity/size or requested thumbnail size changes.
+
+Settings are saved by a serialized background writer. Changes waiting to be written are combined, but normal close and Windows shutdown wait for the latest settings. If that final save fails, QuickSift reports it: check free space and folder permissions and try closing again. A crash or forced power loss can still lose a not-yet-written setting; originals and metadata transactions keep their existing verified safety rules.
+
+The disposable thumbnail cache still uses checksums, flushed temporary files and atomic publication. Short conservative free-space observations reduce repeated disk queries; low-space conditions are checked immediately. Cache eviction still protects visible photos and uses the same memory limits.

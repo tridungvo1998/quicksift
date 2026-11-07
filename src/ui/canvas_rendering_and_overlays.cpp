@@ -23,6 +23,7 @@ namespace quicksift::app {
             return;
         }
 
+        DrainShellFallbackResults();
         renderTarget_->BeginDraw();
         // Anti-aliased geometry and text for every canvas frame (overlays, face
         // outlines, alerts, toasts). Grayscale text AA is used because the canvas
@@ -34,10 +35,7 @@ namespace quicksift::app {
         // last tick starts its transition from this frame (no layout in paint: this
         // only sets animation targets).
         uiFramework_.SyncOverlayTransitions(std::chrono::steady_clock::now());
-        // Paint never waits on decode workers or storage: at most one synchronous Shell
-        // fallback (failed decodes only) may be created per frame (0.9.4.0).
-        shellFallbackFrameBudget_ = ThumbnailScrollPrefersPlaceholders() ? 0 : 1;
-        shellFallbackDeferred_ = false;
+        // Shell handlers run in a bounded child process; paint only consumes owned pixels.
         const ThemePalette palette = Palette();
         renderTarget_->Clear(ToD2D(palette.windowBottom));
         DrawCanvasBackground();
@@ -93,8 +91,18 @@ namespace quicksift::app {
             }
         }
         EndPaint(canvas_, &paint);
-        // A deferred Shell fallback is created on the next frame (one per frame).
-        if (shellFallbackDeferred_ && !ThumbnailScrollPrefersPlaceholders()) InvalidateCanvas();
+        // Poll isolated fallback completions without a repaint/message busy loop.
+        const bool shellPending = shellPreviewService_.HasWork();
+        for (auto& cached : shellFallbackCache_) {
+            if (!shellPending && cached.second.pending) {
+                // Allocation/launch failures must not strand a pending placeholder forever.
+                cached.second.pending = false; cached.second.failed = true;
+                cached.second.at = std::chrono::steady_clock::now();
+            }
+        }
+        if (shellPending && !ThumbnailScrollPrefersPlaceholders())
+            StartUiTimer(ID_TIMER_SHELL_PREVIEW, 50u, L"Shell preview completion");
+        else KillTimer(hwnd_, ID_TIMER_SHELL_PREVIEW);
     }
 
 
@@ -430,22 +438,28 @@ namespace quicksift::app {
         if (!renderTarget_) return;
         const D2D1_SIZE_F size = renderTarget_->GetSize();
         const float alpha = theme_ == AppTheme::Dark ? 0.115f : 0.11f;
-        for (const ColorBlob& blob : backgroundBlobs_) {
-            D2D1_GRADIENT_STOP stops[] = {
-                { 0.0f, ToD2D(blob.color, alpha) },
-                { 0.60f, ToD2D(blob.color, alpha * (theme_ == AppTheme::Dark ? 0.26f : 0.42f)) },
-                { 1.0f, ToD2D(blob.color, 0.0f) }
-            };
-            ComPtr<ID2D1GradientStopCollection> collection;
-            if (FAILED(renderTarget_->CreateGradientStopCollection(stops, static_cast<UINT32>(std::size(stops)),
-                D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &collection))) continue;
+        if (canvasGradientBrushes_.size() != backgroundBlobs_.size())
+            canvasGradientBrushes_.resize(backgroundBlobs_.size());
+        for (std::size_t i = 0; i < backgroundBlobs_.size(); ++i) {
+            const ColorBlob& blob = backgroundBlobs_[i];
+            auto& brush = canvasGradientBrushes_[i];
             const float radius = blob.radius * std::max(size.width, size.height) * (theme_ == AppTheme::Dark ? 2.95f : 2.05f);
-            ComPtr<ID2D1RadialGradientBrush> brush;
-            const D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES properties{
-                D2D1::Point2F(blob.x * size.width, blob.y * size.height),
-                D2D1::Point2F(0.0f, 0.0f), radius, radius
-            };
-            if (FAILED(renderTarget_->CreateRadialGradientBrush(properties, collection.Get(), &brush))) continue;
+            const auto center = D2D1::Point2F(blob.x * size.width, blob.y * size.height);
+            if (!brush) {
+                D2D1_GRADIENT_STOP stops[] = {
+                    { 0.0f, ToD2D(blob.color, alpha) },
+                    { 0.60f, ToD2D(blob.color, alpha * (theme_ == AppTheme::Dark ? 0.26f : 0.42f)) },
+                    { 1.0f, ToD2D(blob.color, 0.0f) }
+                };
+                ComPtr<ID2D1GradientStopCollection> collection;
+                if (FAILED(renderTarget_->CreateGradientStopCollection(stops, static_cast<UINT32>(std::size(stops)),
+                    D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP, &collection))) continue;
+                const D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES properties{ center, D2D1::Point2F(0.0f, 0.0f), radius, radius };
+                if (FAILED(renderTarget_->CreateRadialGradientBrush(properties, collection.Get(), &brush))) continue;
+            }
+            brush->SetCenter(center);
+            brush->SetRadiusX(radius);
+            brush->SetRadiusY(radius);
             renderTarget_->FillRectangle(D2D1::RectF(0.0f, 0.0f, size.width, size.height), brush.Get());
         }
     }
@@ -1027,9 +1041,25 @@ namespace quicksift::app {
     }
 
 
-    std::vector<D2D1_RECT_F> QuickSiftApplicationImpl::BuildBestCompareLayout(const D2D1_RECT_F& bounds) const {
+    const std::vector<D2D1_RECT_F>& QuickSiftApplicationImpl::BuildBestCompareLayout(const D2D1_RECT_F& bounds) const {
         const auto& comparePaths = reviewState_.ComparePaths();
         const int count = static_cast<int>(comparePaths.size());
+        if (comparePaths.size() > quicksift::core::CompareLayoutKey::kCapacity) {
+            compareLayoutKey_.Invalidate(); compareLayoutCells_.clear(); return compareLayoutCells_;
+        }
+        const std::array<float, 5> geometry{ bounds.left, bounds.top, bounds.right, bounds.bottom, CanvasDpi() };
+        std::array<float, quicksift::core::CompareLayoutKey::kCapacity> aspects{};
+        const auto aspectCount = std::min(comparePaths.size(), aspects.size());
+        for (std::size_t i = 0; i < aspectCount; ++i) aspects[i] = AspectForPath(comparePaths[i]);
+        const std::span<const float> aspectSpan(aspects.data(), aspectCount);
+        if (compareLayoutKey_.Matches(geometry, generation_, static_cast<int>(reviewState_.Mode()), comparePaths, aspectSpan))
+            return compareLayoutCells_;
+        compareLayoutKey_.Invalidate();
+        auto storeLayout = [&](std::vector<D2D1_RECT_F> cells) -> const std::vector<D2D1_RECT_F>& {
+            compareLayoutCells_ = std::move(cells);
+            compareLayoutKey_.Assign(geometry, generation_, static_cast<int>(reviewState_.Mode()), comparePaths, aspectSpan);
+            return compareLayoutCells_;
+        };
         std::vector<std::vector<int>> arrangements;
         std::vector<int> current;
         std::function<void(int)> enumerate = [&](int remaining) {
@@ -1076,7 +1106,7 @@ namespace quicksift::app {
 
                     const float imageW = std::max(1.0f, cellW - 4.0f);
                     const float imageH = std::max(1.0f, rowH - labelHeight - 4.0f);
-                    const float aspect = std::max(0.10f, AspectForPath(comparePaths[imageIndex]));
+                    const float aspect = std::max(0.10f, aspects[imageIndex]);
                     const float fittedW = std::min(imageW, imageH * aspect);
                     const float fittedH = fittedW / aspect;
                     score += fittedW * fittedH;
@@ -1090,7 +1120,7 @@ namespace quicksift::app {
                 best = std::move(cells);
             }
         }
-        if (best.size() == static_cast<size_t>(count)) return best;
+        if (best.size() == static_cast<size_t>(count)) return storeLayout(std::move(best));
         // Scoring can reject every arrangement on a short window. A plain grid is
         // better than painting nothing and swallowing clicks.
         std::vector<D2D1_RECT_F> fallback;
@@ -1106,7 +1136,7 @@ namespace quicksift::app {
             const float top = bounds.top + gap + row * (cellH + gap);
             fallback.push_back(D2D1::RectF(left, top, left + cellW, top + cellH));
         }
-        return fallback;
+        return storeLayout(std::move(fallback));
     }
 
 
@@ -1117,7 +1147,7 @@ namespace quicksift::app {
             return;
         }
 
-        const std::vector<D2D1_RECT_F> cells = BuildBestCompareLayout(bounds);
+        const auto& cells = BuildBestCompareLayout(bounds);
         if (cells.size() != reviewState_.ComparePaths().size()) {
             DrawCenteredText(Tr(L"Compare layout is unavailable for this window"), bounds,
                 largeText_.Get(), mutedBrush_.Get());
@@ -1708,7 +1738,7 @@ namespace quicksift::app {
     std::optional<size_t> QuickSiftApplicationImpl::HitCompareSlot(float x, float y) const {
         if (reviewState_.Mode() != ViewMode::Compare) return std::nullopt;
         const D2D1_SIZE_F canvas = CanvasSizeInDips();
-        const auto cells = BuildBestCompareLayout(D2D1::RectF(0.0f, 0.0f, canvas.width, canvas.height));
+        const auto& cells = BuildBestCompareLayout(D2D1::RectF(0.0f, 0.0f, canvas.width, canvas.height));
         for (size_t slot = 0; slot < cells.size() && slot < reviewState_.ComparePaths().size(); ++slot) {
             const D2D1_RECT_F& rect = cells[slot];
             if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return slot;

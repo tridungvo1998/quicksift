@@ -3,6 +3,7 @@
 #include "app/application_support.h"
 #include "diagnostics/diagnostic_log.h"
 #include "runtime_support.h"
+#include "work/shell_preview_service.h"
 #include "platform/application_data_paths.h"
 
 #include <exception>
@@ -11,7 +12,9 @@
 #include <objbase.h>
 #include <string>
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
+    if (commandLine && std::wstring_view(commandLine) == L"--quicksift-shell-preview")
+        return quicksift::work::RunShellPreviewChild();
     if (!quicksift::diagnostics::Initialize()) {
         const std::filesystem::path dataRoot = quicksift::diagnostics::DataRootPath();
         const bool packaged = quicksift::platform::RunningWithPackageIdentity();

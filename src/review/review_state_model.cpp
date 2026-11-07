@@ -186,12 +186,16 @@ bool ReviewStateModel::ReplaceComparePath(const std::wstring& oldPath,
 
 bool ReviewStateModel::RetainComparedPaths(
     const std::unordered_set<std::wstring>& visiblePaths) {
+    return RetainComparedPaths([&](const std::wstring& path) { return visiblePaths.contains(path); });
+}
+
+bool ReviewStateModel::RetainComparedPaths(const std::function<bool(const std::wstring&)>& isVisible) {
     const bool wasCompare = mode_ == ViewMode::Compare;
     std::erase_if(comparePaths_, [&](const std::wstring& path) {
-        return !visiblePaths.contains(path);
+        return !isVisible(path);
     });
     std::erase_if(independentPanes_, [&](const auto& entry) {
-        return !visiblePaths.contains(entry.first) || !IsCompared(entry.first);
+        return !isVisible(entry.first) || !IsCompared(entry.first);
     });
 
     if (comparePaths_.size() < 2) {

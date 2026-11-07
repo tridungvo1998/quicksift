@@ -1,4 +1,5 @@
 // OWNER: Bounded folder enumeration and queue-owned scan completion delivery.
+#include "core/queue_append_transaction.h"
 #include "work/folder_scanner.h"
 
 #include <chrono>
@@ -212,6 +213,7 @@ void FolderScanner::RunScan(const ScanRequest& request) {
         };
 
         size_t batchTarget = kInitialBatchSize;
+        size_t discovered = 0;
         auto batch = std::make_unique<ScanBatch>();
         batch->generation = generation;
         batch->photos.reserve(batchTarget);
@@ -266,9 +268,10 @@ void FolderScanner::RunScan(const ScanRequest& request) {
                             static_cast<std::uint64_t>(found.nFileSizeLow);
                         item.sidecarStamp = 0;
                         batch->photos.push_back(std::move(item));
+                        ++discovered;
                         if (batch->photos.size() >= batchTarget) {
                             if (!postBatch(batch)) break;
-                            batchTarget = kSteadyBatchSize;
+                            batchTarget = quicksift::core::ScanBatchTarget(discovered);
                             batch = std::make_unique<ScanBatch>();
                             batch->generation = generation;
                             batch->photos.reserve(batchTarget);

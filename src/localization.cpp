@@ -23,6 +23,9 @@ struct TranslationPair {
 // paths opt into localization without introducing numeric resource IDs or a
 // second copy of every menu layout.
 const std::initializer_list<TranslationPair> kTranslations{
+    TranslationPair{L"Settings could not be saved", L"Không thể lưu thiết lập"},
+    TranslationPair{L"QuickSift could not save your settings. Check free space and folder permissions, then try closing again.",
+        L"QuickSift không thể lưu thiết lập của bạn. Hãy kiểm tra dung lượng trống và quyền truy cập thư mục, rồi thử đóng lại."},
     TranslationPair{L"QuickSift", L"QuickSift"},
     TranslationPair{L"Selection is intentionally limited to visible results; hidden photos were removed from the selection.",
         L"Vùng chọn được giới hạn có chủ ý trong các kết quả đang hiển thị; ảnh bị ẩn đã được bỏ khỏi vùng chọn."},
@@ -1391,6 +1394,10 @@ AN TOÀN METADATA VÀ TỆP
 CAM KẾT CUNG CẤP MÃ NGUỒN
 
 Chi tiết cam kết cung cấp mã nguồn bằng văn bản, thông tin liên hệ và mã nguồn tương ứng được trình bày trong mục Giới thiệu QuickSift.
+HIỆU NĂNG VÀ LƯU THIẾT LẬP
+• Ảnh dự phòng từ Windows Shell được lấy trong tiến trình nền riêng, chỉ khi bộ giải mã chính đã thất bại. Trình xử lý bị treo được dừng sau 5 giây; canvas và thao tác đóng ứng dụng không phải chờ trình xử lý đó. Ảnh dự phòng tối đa 1024 pixel; lần thất bại được lưu 30 giây trước khi thử lại, hoặc được làm mới khi thông tin tệp/cỡ ảnh thay đổi.
+• Thiết lập được gộp và lưu tuần tự ở nền. Đóng bình thường hoặc đăng xuất Windows sẽ chờ lưu thiết lập mới nhất. Nếu lưu cuối cùng thất bại, hãy kiểm tra dung lượng trống và quyền thư mục rồi thử đóng lại. Mất điện hoặc sự cố vẫn có thể làm mất thay đổi chưa kịp lưu. Quy tắc bảo vệ tệp gốc và metadata không đổi.
+
 )HELP";
     }
 
@@ -1544,6 +1551,10 @@ METADATA AND FILE SAFETY
 WRITTEN OFFER FOR SOURCE CODE
 
 The written offer, contact information, license details, and corresponding source-code location are provided in About QuickSift.
+PERFORMANCE AND SETTINGS SAFETY
+• Windows Shell fallback previews are extracted in a separate low-priority process, only after the normal decoder has failed. A stuck handler is stopped after 5 seconds without freezing the canvas or holding up app close. Fallbacks are limited to 1024 pixels; failures are cached for 30 seconds, or invalidated by changed catalog file facts/thumbnail size.
+• Settings changes are combined and saved serially in the background. Normal close and Windows shutdown wait for the latest settings. If the final save fails, check free space and folder permissions and try closing again. A crash or power loss can still lose an unwritten change. Original-file and metadata safety rules are unchanged.
+
 )HELP";
 }
 

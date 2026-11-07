@@ -1,5 +1,8 @@
 // OWNER: Private application composition root and feature-module declaration surface.
 #pragma once
+#include "work/shell_preview_service.h"
+#include "core/snapshot_writer.h"
+#include "core/compare_layout_key.h"
 #include "core/blocking_wait.h"
 #include "core/hud_snapshot.h"
 #include "core/pane_timing.h"
@@ -659,6 +662,19 @@ private:
     };
     size_t CacheLimitForClass(CacheClass cacheClass) const;
     size_t CacheBytesForClass(CacheClass cacheClass) const;
+    struct BitmapEvictionCandidate {
+        std::unordered_map<CacheKey, BitmapEntry, CacheKeyHash, CacheKeyEqual>::iterator iterator;
+        uint64_t lastUse = 0;
+        CacheClass cacheClass = CacheClass::Preview;
+        bool frequent = false, facePriority = false, recent = false, erased = false;
+    };
+    struct TileEvictionCandidate {
+        std::unordered_map<TileKey, TileEntry, TileKeyHash>::iterator iterator;
+        uint64_t lastUse = 0;
+        bool recent = false, erased = false;
+    };
+    std::vector<BitmapEvictionCandidate> bitmapEvictionScratch_;
+    std::vector<TileEvictionCandidate> tileEvictionScratch_;
     size_t EvictionLimitFor(const CacheEvictionBudget& budget, CacheClass cacheClass) const;
     void EvictBitmapCacheByCandidates(const CacheEvictionBudget& budget);
     bool EvictOldestBitmap(const CacheEvictionBudget& budget, std::optional<CacheClass> onlyClass);
@@ -775,7 +791,7 @@ private:
 
     float AspectForPath(const std::wstring& path) const;
 
-    std::vector<D2D1_RECT_F> BuildBestCompareLayout(const D2D1_RECT_F& bounds) const;
+    const std::vector<D2D1_RECT_F>& BuildBestCompareLayout(const D2D1_RECT_F& bounds) const;
 
     void RenderCompare(const D2D1_RECT_F& bounds);
 
@@ -1176,7 +1192,7 @@ private:
     void LoadEarlyPresentationSettings();
     bool earlyPresentationLoaded_ = false;
 
-    void SaveSession();
+    bool SaveSession(bool finalSave = false);
 
     void RestoreSessionAfterCreate();
 
@@ -1536,10 +1552,33 @@ void ShowColorLabelMenu();
     ComPtr<IDWriteTextFormat> mediumText_;
     ComPtr<IDWriteTextFormat> largeText_;
 
-    std::unordered_map<CacheKey, BitmapEntry, CacheKeyHash> bitmapCache_;
-    std::unordered_map<std::wstring, std::set<int>> pathToBitmapSizes_;
-    std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap>> shellFallbackCache_;
-    std::chrono::steady_clock::time_point shellFallbackLastUse_{};
+    quicksift::core::SnapshotWriter sessionWriter_{ [](const quicksift::core::TextSnapshot& snapshot) {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        struct EndBackground {
+            ~EndBackground() { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END); }
+        } endBackground;
+        AtomicFileSnapshot expected;
+        const fs::path path(snapshot.path);
+        const bool saved = CaptureAtomicFileSnapshot(path, expected) &&
+            WriteTextFile(path, snapshot.document, TextFileEncoding::Utf16LittleEndian, expected);
+        if (!saved) QS_LOG_ERROR(L"Session", L"Atomic session save failed; final drain will report failure");
+        return saved;
+    } };
+    mutable quicksift::core::CompareLayoutKey compareLayoutKey_;
+    mutable std::vector<D2D1_RECT_F> compareLayoutCells_;
+    std::vector<ComPtr<ID2D1RadialGradientBrush>> canvasGradientBrushes_;
+    std::unordered_map<CacheKey, BitmapEntry, CacheKeyHash, CacheKeyEqual> bitmapCache_;
+    std::unordered_map<std::wstring, std::set<int>, quicksift::core::PathTextHash, quicksift::core::PathTextEqual> pathToBitmapSizes_;
+    struct ShellFallbackEntry {
+        ComPtr<ID2D1Bitmap> bitmap;
+        quicksift::core::ShellPreviewIdentity identity;
+        std::chrono::steady_clock::time_point at;
+        std::size_t bytes = 0;
+        bool pending = false, failed = false;
+    };
+    std::unordered_map<CacheKey, ShellFallbackEntry, CacheKeyHash, CacheKeyEqual> shellFallbackCache_;
+    quicksift::work::ShellPreviewService shellPreviewService_;
+    void DrainShellFallbackResults();
     std::unordered_map<size_t, std::uint8_t> cacheFrequency_;
     size_t cacheFrequencySamples_ = 0;
     std::unordered_set<std::wstring> protectedThumbnailPaths_;

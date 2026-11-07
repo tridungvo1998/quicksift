@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "core/derivative_space_budget.h"
 #include "core/metadata_state.h"
 
 #include <atomic>
@@ -268,6 +269,8 @@ private:
         std::span<const std::uint8_t> pixels);
     static std::int64_t CurrentAccessStamp();
 
+    std::mutex derivativeSpaceMutex_;
+    core::DerivativeSpaceBudget derivativeSpace_;
     std::filesystem::path baseDirectory_;
     std::filesystem::path bitmapDirectory_;
     std::filesystem::path pyramidDirectory_;

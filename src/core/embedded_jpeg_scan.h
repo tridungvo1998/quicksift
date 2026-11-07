@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <functional>
 
 namespace quicksift::core {
 
@@ -22,6 +23,7 @@ struct EmbeddedJpegLocation {
 // after SOS the entropy-coded data is scanned for EOI while skipping FF00
 // stuffing and RSTn markers. Only baseline/extended/progressive frames
 // (SOF0/1/2) count; lossless SOF3 is RAW sensor data, not a preview.
-[[nodiscard]] EmbeddedJpegLocation FindLargestEmbeddedJpeg(std::span<const std::uint8_t> bytes) noexcept;
+[[nodiscard]] EmbeddedJpegLocation FindLargestEmbeddedJpeg(std::span<const std::uint8_t> bytes,
+    const std::function<bool()>& isCancelled = {}) noexcept;
 
 } // namespace quicksift::core

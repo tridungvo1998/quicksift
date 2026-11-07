@@ -564,11 +564,8 @@ void QuickSiftApplicationImpl::ShowLanguageMenu() {
             ShowToast(Tr(L"Selection is intentionally limited to visible results; hidden photos were removed from the selection."));
         }
 
-        std::unordered_set<std::wstring> visiblePaths;
-        visiblePaths.reserve(catalog_.VisibleCount());
-        for (size_t index = 0; index < catalog_.VisibleCount(); ++index)
-            visiblePaths.insert(VisiblePhoto(index).path.wstring());
-        const bool compareExited = reviewState_.RetainComparedPaths(visiblePaths);
+        const bool compareExited = reviewState_.RetainComparedPaths(
+            [this](const std::wstring& path) { return IsPathVisible(path); });
         if (compareExited) SetMode(ViewMode::Thumbnails);
 
         if (const auto focusIndex = IndexForPath(reviewState_.ThumbnailFocusPath())) selection_.SetAnchor(*focusIndex);

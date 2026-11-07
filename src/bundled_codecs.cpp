@@ -473,7 +473,7 @@ bool DecodeRaw(const fs::path& path, const DecodeOptions& options, DecodedImageD
             gMappedInputLimit.load(std::memory_order_relaxed));
         if (mapped.Open(path, MappedFileView::AccessPattern::Sequential, limit, true) && !Cancelled(options)) {
             const auto bytes = mapped.Bytes();
-            const auto best = quicksift::core::FindLargestEmbeddedJpeg(bytes);
+            const auto best = quicksift::core::FindLargestEmbeddedJpeg(bytes, options.isCancelled);
             if (best.Found() && best.LongestEdge() > 800) {
                 DecodeOptions previewOptions = options;
                 previewOptions.preferEmbeddedPreview = false;

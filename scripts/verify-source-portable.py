@@ -559,6 +559,16 @@ def verify(root: Path) -> None:
         for path in (root / "src").rglob("*")
         if path.is_file() and path.suffix in {".cpp", ".h"}
     )
+    # One audited self-launch: isolated Shell preview, never an arbitrary executable.
+    shell_service = read(root, "src/work/shell_preview_service.cpp")
+    if shell_service.count("CreateProcessW(") != 1:
+        fail("Shell preview must have exactly one audited self-launch")
+    for token in ("GetModuleFileNameW(nullptr", "CreateProcessW(executable, command.data()",
+                  "PROC_THREAD_ATTRIBUTE_HANDLE_LIST", "CREATE_SUSPENDED", "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+                  "AssignProcessToJobObject", "WaitForSingleObject(child.value, 50)", "kShellPreviewTimeoutMs"):
+        if token not in shell_service:
+            fail("Shell preview isolation contract missing: " + token)
+    source_text = source_text.replace(shell_service, shell_service.replace("CreateProcessW(", "AuditedSelfLaunch("))
     for forbidden in ("WriteProcessMemory(", "CreateRemoteThread(", "PAGE_EXECUTE_READWRITE",
                       "VirtualProtect(", "ShellExecuteW(", "CreateProcessW(", "WinExec(",
                       "URLDownloadToFile"):
@@ -793,7 +803,7 @@ def verify(root: Path) -> None:
     if "pending.swap(queue_)" in completion_queue or "result.reserve(pending.size())" in completion_queue:
         fail("completion draining can lose committed results on allocation failure")
     for token in ("ScanCompletionStatus::Failed", "ScanCompletionStatus::Succeeded",
-                  "AcknowledgeBatch", "prospectiveMetadataQueue", "PumpMetadataQueue"):
+                  "AcknowledgeBatch", "QueueAppendTransaction", "PumpMetadataQueue"):
         if token not in catalog_integration:
             fail(f"catalog scan integration contract is missing {token}")
 
@@ -1422,9 +1432,28 @@ def verify_dead_image_source_cache_removed(root: Path) -> None:
                 fail(f"the removed Direct2D image-source cache is back ({token}): {path.relative_to(root)}")
     fallback = strip_cpp(function_body(read(root, "src/ui/graphics_resources_and_image_cache.cpp"),
         "ComPtr<ID2D1Bitmap> QuickSiftApplicationImpl::GetOrCreateShellFallback("))
-    create = fallback.find("CoCreateInstance(CLSID_WICImagingFactory")
-    if create < 0 or create > fallback.find("GetImage("):
-        fail("the Shell fallback must create its WIC factory before calling GetImage")
+    for forbidden in ("GetImage(", "CoCreateInstance(", "SHCreateItemFromParsingName("):
+        if forbidden in fallback:
+            fail("Shell fallback paint must stay asynchronous: " + forbidden)
+    if "shellPreviewService_.Request(" not in fallback:
+        fail("Shell fallback must use the isolated service")
+    child = read(root, "src/work/shell_preview_service.cpp")
+    if child.find("CoCreateInstance(CLSID_WICImagingFactory") > child.find("shell->GetImage("):
+        fail("Shell child must create WIC before expensive handler extraction")
+    contracts = {
+        "src/ui/graphics_resources_and_image_cache.cpp": ("CacheKeyView", "std::array<int, 2>", "bitmapEvictionScratch_", "ClearScratch"),
+        "src/ui/canvas_rendering_and_overlays.cpp": ("compareLayoutKey_.Matches", "canvasGradientBrushes_", "DrainShellFallbackResults"),
+        "src/ui/navigation_input_and_session.cpp": ("sessionWriter_.Submit", "sessionWriter_.Drain"),
+        "src/ui/main_window_chrome_and_messages.cpp": ("SaveSession(true)", "shellPreviewService_.Stop()"),
+        "src/bundled_codecs.cpp": ("FindLargestEmbeddedJpeg(bytes, options.isCancelled)",),
+        "src/persistent_cache.cpp": ("derivativeSpace_.NeedsRefresh", "derivativeSpace_.Reserve", "FlushNativeOutputFile(file)", "ReplaceFileAtomically(temporary, destination)"),
+    }
+    for path, tokens in contracts.items():
+        for token in tokens:
+            if token not in read(root, path): fail("Optimization safety contract missing: " + token)
+    if not (root / "scripts/checks/optimization_checks.cpp").exists():
+        fail("Optimization regression checks are missing")
+
 
 
 def verify_title_layout_contracts(root: Path) -> None:
