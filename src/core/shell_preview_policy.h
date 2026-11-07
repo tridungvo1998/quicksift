@@ -11,6 +11,10 @@ struct ShellPreviewIdentity {
     int target = 0;
     bool operator==(const ShellPreviewIdentity&) const = default;
 };
+inline bool ShellPreviewResultCurrent(ShellPreviewIdentity stored, ShellPreviewIdentity result,
+    std::uint64_t currentSequence, std::uint64_t resultSequence) noexcept {
+    return stored == result && currentSequence == resultSequence;
+}
 inline bool ShellPreviewReusable(ShellPreviewIdentity stored, ShellPreviewIdentity wanted,
     bool failed, std::int64_t ageMs) noexcept {
     return stored == wanted && (!failed || ageMs < 30000);

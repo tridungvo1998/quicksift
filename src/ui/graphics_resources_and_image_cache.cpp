@@ -1202,7 +1202,8 @@ namespace quicksift::app {
         const CacheKeyView probe{path.native(), target, CacheClass::Thumbnail};
         if (auto it = shellFallbackCache_.find(probe); it != shellFallbackCache_.end()) {
             const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.at).count();
-            if (quicksift::core::ShellPreviewReusable(it->second.identity, identity, it->second.failed, age)) {
+            if (quicksift::core::ShellPreviewReusable(it->second.identity, identity, it->second.failed, age) &&
+                (!it->second.pending || shellPreviewService_.HasWork())) {
                 return it->second.bitmap;
             }
             shellFallbackCache_.erase(it);
@@ -1215,8 +1216,9 @@ namespace quicksift::app {
             if (victim == shellFallbackCache_.end()) return nullptr;
             shellFallbackCache_.erase(victim);
         }
-        if (shellPreviewService_.Request({path.native(), identity})) {
-            ShellFallbackEntry entry; entry.identity = identity; entry.at = now; entry.pending = true;
+        const auto sequence = nextShellPreviewSequence_++;
+        if (shellPreviewService_.Request({path.native(), identity, sequence})) {
+            ShellFallbackEntry entry; entry.identity = identity; entry.at = now; entry.pending = true; entry.sequence = sequence;
             shellFallbackCache_.emplace(CacheKey{path.native(), target, CacheClass::Thumbnail}, std::move(entry));
         }
         return nullptr;
@@ -1232,7 +1234,8 @@ namespace quicksift::app {
         const auto it = shellFallbackCache_.find(key);
         const auto* photo = PhotoForPath(request.path);
         if (it == shellFallbackCache_.end() || !photo || request.identity.generation != generation_ ||
-            it->second.identity != request.identity || photo->fileSize != request.identity.fileSize ||
+            !quicksift::core::ShellPreviewResultCurrent(it->second.identity, request.identity, it->second.sequence, request.sequence) ||
+            photo->fileSize != request.identity.fileSize ||
             photo->modifiedStamp != request.identity.modifiedStamp) return;
         auto& entry = it->second; entry.pending = false; entry.failed = true;
         entry.at = std::chrono::steady_clock::now();

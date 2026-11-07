@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 namespace quicksift::work {
-struct ShellPreviewRequest { std::wstring path; core::ShellPreviewIdentity identity; };
+struct ShellPreviewRequest { std::wstring path; core::ShellPreviewIdentity identity; std::uint64_t sequence = 0; };
 struct ShellPreviewResult {
     ShellPreviewRequest request;
     int width = 0, height = 0;

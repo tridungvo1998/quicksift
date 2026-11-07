@@ -47,6 +47,7 @@ int main() {
     }
     {
         ShellPreviewIdentity id{1, 100, 200, 256};
+        Check(!ShellPreviewResultCurrent(id, id, 2, 1) && ShellPreviewResultCurrent(id, id, 2, 2), "late completion after explicit retry/device reset cannot settle a new request");
         Check(ShellPreviewReusable(id, id, true, 29999), "negative cache suppresses repeated handler calls");
         Check(!ShellPreviewReusable(id, id, true, 30000), "negative cache expires");
         for (int field = 0; field < 4; ++field) {
