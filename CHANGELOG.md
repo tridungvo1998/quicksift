@@ -9,6 +9,10 @@
 - **Maintainability:** the large functions were split, data-only state structs were added, layout constants are named, and CODE_GUIDE is the documentation hub.
 - **Repository:** the stale historical notes were removed (`notes/`, `PRE_RELEASE_AUDIT.md`, `VALIDATION.md`, `MODULARIZATION_NOTES.md`), as were the generated `SOURCE_MANIFEST.sha256` and `codebase_bundle.*`. A `.gitignore` was added.
 
+### Fixed: Settings pane scrolling
+
+- **Scrolling the Settings pane past the top no longer piles its buttons and section titles on top of each other.** When scrolling returned to the very top, the controls that had stayed fully visible kept their scrolled position while the ones scrolled out of view came back at their normal place, so they overlapped near the top. Every control is now placed from the layout at the clamped scroll position (one batched move), in every section that scrolls. Huge wheel deltas are clamped safely, and precision-touchpad scrolling accumulates small movements instead of dropping them.
+
 ### Responsiveness and cache maintenance
 
 - Failed-decoder Windows Shell previews no longer run handlers during painting. A low-priority, bounded child process provides fallback pixels; an unresponsive handler is stopped after 5 seconds without holding up normal app shutdown. Failed requests are cached for 30 seconds, and file/catalog identity or thumbnail size changes invalidate the entry. Fallbacks are capped at 1024 pixels and 32 MiB of GPU surfaces.

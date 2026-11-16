@@ -998,7 +998,7 @@ foreach ($Check in @('animation_checks', 'batch_match_checks', 'design_tokens_ch
         'overlay_and_frost_checks', 'priority_policy_checks', 'ratings_exchange_checks', 'raw_preview_checks',
         'search_query_checks', 'thumbnail_layout_checks', 'ui_state_checks', 'write_lane_checks',
         'sidecar_write_checks', 'lifecycle_checks', 'view_load_checks', 'filmstrip_checks',
-        'xmp_interop_checks', 'keyboard_shortcut_checks')) {
+        'xmp_interop_checks', 'keyboard_shortcut_checks', 'pane_scroll_checks')) {
     [void](Read-SourceText "scripts\checks\$Check.cpp")
 }
 foreach ($Relative in @('src\core\blocking_wait.cpp', 'src\core\blocking_wait.h', 'src\core\presentation_settings.h',
@@ -1031,6 +1031,20 @@ if (-not $AfterLayout.Substring(0, [Math]::Min(400, $AfterLayout.Length)).Contai
 $RepositionBody = Remove-CppComments (Get-FunctionBody $ControlsPaintText 'void QuickSiftApplicationImpl::RepositionPaneScroll(')
 if ([regex]::Matches($RepositionBody, 'InvalidateUnderHiddenPaneChild\(').Count -lt 2) {
     throw 'RepositionPaneScroll must invalidate the vacated rect on every move and hide.'
+}
+# 0.9.6.0: children are placed from the natural model whenever their live position differs
+# (the "offset != 0" shortcut left them clumped at the top), in one DeferWindowPos batch.
+foreach ($Token in @('pane::NeedsReposition(', 'pane::ScrolledTop(', 'BeginDeferWindowPos(', 'EndDeferWindowPos(')) {
+    if (-not $RepositionBody.Contains($Token)) { throw "RepositionPaneScroll must place children from the natural model: $Token" }
+}
+if ([regex]::IsMatch($RepositionBody, 'offset\s*!=\s*0\s*\|\|\s*wasClipped')) {
+    throw 'RepositionPaneScroll must not skip moves at offset 0 (Settings clump regression).'
+}
+if (-not (Remove-CppComments (Get-FunctionBody $ControlsPaintText 'bool QuickSiftApplicationImpl::ScrollPaneBy(')).Contains('pane::ScrollBy(')) {
+    throw 'ScrollPaneBy must use the saturating clamp helper.'
+}
+if (-not (Remove-CppComments (Get-FunctionBody $ControlsPaintText 'bool QuickSiftApplicationImpl::HandlePaneWheel(')).Contains('pane::TakeWheelPixels(')) {
+    throw 'HandlePaneWheel must accumulate high-resolution wheel deltas.'
 }
 if (-not (Remove-CppComments (Get-FunctionBody $ControlsPaintText 'void QuickSiftApplicationImpl::HideLeftPaneSectionContentExcept(')).Contains('InvalidateUnderHiddenPaneChild(')) {
     throw 'Hiding a pane child must repaint what was under it.'

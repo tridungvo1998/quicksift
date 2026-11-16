@@ -7,6 +7,7 @@
 #pragma once
 
 #include "app/state/app_state_common.h"
+#include "core/pane_scroll_policy.h"
 #include "core/pane_timing.h"
 
 namespace quicksift::app::state {
@@ -41,6 +42,8 @@ struct PaneState {
     int leftPanePinLastW_ = -1; // skip SetWindowRgn when the size is unchanged
     int leftPanePinLastH_ = -1;
     std::array<int, 7> paneScrollOffset_{}; // indexed by FlyoutPanel
+    // Sub-step precision-touchpad wheel remainder for the active pane (reset on tab change/edge).
+    quicksift::core::pane::WheelAccumulator paneWheel_{};
     // [Pane] timing (core/pane_timing.h): LayoutControls fills paneLayoutTiming_
     // whenever pane content is laid out; open/reveal/first-paint are logged once
     // at INFO (first of each kind, or slow) and otherwise at TRACE.

@@ -14,6 +14,31 @@ namespace quicksift::core::pane {
     return offset < 0 ? 0 : (offset > maxScroll ? maxScroll : offset);
 }
 
+// Offset after a relative scroll; saturating so huge wheel/page deltas cannot
+// overflow before the clamp (the only offset writer besides layout re-clamping).
+[[nodiscard]] constexpr int ScrollBy(int offset, long long delta, int contentHeight, int viewportHeight) noexcept {
+    const long long maxScroll = MaxScroll(contentHeight, viewportHeight);
+    long long next = static_cast<long long>(offset) + delta;
+    if (next < 0) next = 0;
+    if (next > maxScroll) next = maxScroll;
+    return static_cast<int>(next);
+}
+
+// Screen top of a pane child for `offset`. Children are ALWAYS placed from their
+// natural (unscrolled) rect, never from their current (possibly scrolled) one.
+[[nodiscard]] constexpr int ScrolledTop(int naturalTop, int offset) noexcept {
+    return naturalTop - offset;
+}
+
+// A shown child must move whenever its live position differs from the target.
+// (0.9.6.0 fix: the old "offset != 0" shortcut skipped this at the top, so returning
+// to offset 0 left fully visible children at their scrolled position while the
+// re-shown top children landed at their natural one - the Settings "clump".)
+[[nodiscard]] constexpr bool NeedsReposition(int currentLeft, int currentTop,
+    int targetLeft, int targetTop, bool currentlyVisible) noexcept {
+    return !currentlyVisible || currentLeft != targetLeft || currentTop != targetTop;
+}
+
 // Offset that brings the item [itemTop, itemBottom) (content coordinates) fully into
 // view with `margin` pixels of breathing room; unchanged when it is already visible.
 [[nodiscard]] constexpr int ScrollIntoView(int offset, int itemTop, int itemBottom,
@@ -24,9 +49,34 @@ namespace quicksift::core::pane {
     return ClampScroll(next, contentHeight, viewportHeight);
 }
 
+inline constexpr int kWheelDeltaPerNotch = 120; // WHEEL_DELTA
+inline constexpr int kDefaultWheelLines = 3;
+inline constexpr int kWheelLinePixelsDip = 16;
+inline constexpr long long kMaximumWheelPixels = 1LL << 30; // far beyond any pane; keeps int math safe
+
+[[nodiscard]] constexpr int SaturateWheelPixels(long long pixels) noexcept {
+    return static_cast<int>(pixels > kMaximumWheelPixels ? kMaximumWheelPixels :
+        (pixels < -kMaximumWheelPixels ? -kMaximumWheelPixels : pixels));
+}
+
 // Wheel delta (WHEEL_DELTA = 120 per notch) to a pixel offset change.
 [[nodiscard]] constexpr int WheelStep(int wheelDelta, int linePixels, int lines) noexcept {
-    return -(wheelDelta * linePixels * (lines > 0 ? lines : 3)) / 120;
+    const long long units = -static_cast<long long>(wheelDelta) * linePixels * (lines > 0 ? lines : kDefaultWheelLines);
+    return SaturateWheelPixels(units / kWheelDeltaPerNotch);
+}
+
+// High-resolution (precision touchpad) wheel deltas smaller than one pixel step
+// accumulate instead of truncating to zero; a direction change drops the
+// opposite remainder. Remainder is kept in 1/120-pixel units.
+struct WheelAccumulator { long long remainder = 0; };
+[[nodiscard]] constexpr int TakeWheelPixels(WheelAccumulator& accumulator, int wheelDelta,
+    int linePixels, int lines) noexcept {
+    if (wheelDelta == 0 || linePixels <= 0) return 0;
+    const long long units = -static_cast<long long>(wheelDelta) * linePixels * (lines > 0 ? lines : kDefaultWheelLines);
+    if ((units < 0) != (accumulator.remainder < 0) && accumulator.remainder != 0) accumulator.remainder = 0;
+    const long long total = accumulator.remainder + units;
+    accumulator.remainder = total % kWheelDeltaPerNotch;
+    return SaturateWheelPixels(total / kWheelDeltaPerNotch);
 }
 
 struct Thumb { int top = 0; int bottom = 0; };

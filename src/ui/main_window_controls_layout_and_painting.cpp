@@ -568,6 +568,7 @@ namespace {
         }
         const bool opening = activeFlyout_ == FlyoutPanel::None && panel != FlyoutPanel::None;
         if (panel != FlyoutPanel::None) lastFlyoutSection_ = panel;
+        paneWheel_ = {}; // wheel remainder belongs to the previous section
         activeFlyout_ = panel;
         lastFlyoutHover_ = std::chrono::steady_clock::now();
         // Opening: refresh the frost from the canvas under the pane (next canvas frame).
@@ -804,6 +805,9 @@ namespace {
     }
 
     void QuickSiftApplicationImpl::RepositionPaneScroll() {
+        // The ONE place pane children are moved for scrolling: every child goes to
+        // ScrolledTop(natural, clamped offset). Moves are batched in a single
+        // DeferWindowPos (SWP_NOREDRAW; the caller composes once afterwards).
         namespace pane = quicksift::core::pane;
         const auto index = static_cast<std::size_t>(activeFlyout_);
         if (index >= paneScrollOffset_.size()) return;
@@ -812,30 +816,52 @@ namespace {
         const int viewH = viewBottom - viewTop;
         int& offset = paneScrollOffset_[index];
         offset = pane::ClampScroll(offset, paneContentHeight_, viewH);
+        constexpr UINT kMoveFlags = SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW;
+        HDWP batch = paneNaturalRects_.empty() ? nullptr :
+            BeginDeferWindowPos(static_cast<int>(paneNaturalRects_.size()));
+        bool batchFailed = batch == nullptr;
+        auto move = [&](HWND child, int x, int y, UINT flags) {
+            if (batch) {
+                if (HDWP next = DeferWindowPos(batch, child, nullptr, x, y, 0, 0, flags)) { batch = next; return; }
+                batch = nullptr; // the failed batch is discarded; the fallback pass re-applies every move
+                batchFailed = true;
+            }
+            if (batchFailed) SetWindowPos(child, nullptr, x, y, 0, 0, flags);
+        };
         for (const auto& [child, natural] : paneNaturalRects_) {
             if (!IsWindow(child)) continue;
             const int w = static_cast<int>(natural.right - natural.left);
             const int h = static_cast<int>(natural.bottom - natural.top);
-            const int top = static_cast<int>(natural.top) - offset;
+            const int left = static_cast<int>(natural.left);
+            const int top = pane::ScrolledTop(static_cast<int>(natural.top), offset);
             const auto visibility = pane::Classify(top, top + h, viewTop, viewBottom);
             const auto clipped = std::find(paneClippedChildren_.begin(), paneClippedChildren_.end(), child);
             const bool wasClipped = clipped != paneClippedChildren_.end();
+            const bool shown = IsWindowVisible(child) != FALSE;
             RECT current{};
             GetWindowRect(child, &current);
             MapWindowPoints(nullptr, hwnd_, reinterpret_cast<POINT*>(&current), 2);
-            const bool moving = current.top != top || current.left != natural.left;
+            const bool needsMove = pane::NeedsReposition(static_cast<int>(current.left), static_cast<int>(current.top),
+                left, top, shown);
             if (visibility == pane::Visibility::Hidden) {
-                if (IsWindowVisible(child) && GetFocus() != child) {
-                    InvalidateUnderHiddenPaneChild(child); // old pixels outside the pane
-                    SetWindowPos(child, nullptr, natural.left, top, 0, 0,
-                        SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+                if (!shown) continue;
+                if (current.left != left || current.top != top) InvalidateUnderHiddenPaneChild(child); // old pixels
+                if (GetFocus() != child) {
+                    move(child, left, top, SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+                } else {
+                    // Keep keyboard focus alive: move it with the content and clip it
+                    // away entirely instead of leaving it at a stale position.
+                    move(child, left, top, kMoveFlags);
+                    if (HRGN region = CreateRectRgn(0, 0, 0, 0)) {
+                        if (!SetWindowRgn(child, region, FALSE)) DeleteObject(region);
+                    }
+                    if (!wasClipped) paneClippedChildren_.push_back(child);
                 }
                 continue;
             }
-            if (offset != 0 || wasClipped || !IsWindowVisible(child)) {
-                if (moving && IsWindowVisible(child)) InvalidateUnderHiddenPaneChild(child);
-                SetWindowPos(child, nullptr, natural.left, top, 0, 0,
-                    SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW);
+            if (needsMove) {
+                if (shown) InvalidateUnderHiddenPaneChild(child);
+                move(child, left, top, kMoveFlags);
             }
             if (visibility == pane::Visibility::Partial) {
                 // Clip to the pane viewport so nothing paints over the status bar,
@@ -857,6 +883,21 @@ namespace {
                 }
             }
         }
+        if (batch && !EndDeferWindowPos(batch)) batchFailed = true;
+        if (!batchFailed || paneNaturalRects_.empty()) return;
+        // Batch unavailable/failed: place every child directly from the same model
+        // (idempotent, so already-applied moves are harmless).
+        for (const auto& [child, natural] : paneNaturalRects_) {
+            if (!IsWindow(child)) continue;
+            const int h = static_cast<int>(natural.bottom - natural.top);
+            const int left = static_cast<int>(natural.left);
+            const int top = pane::ScrolledTop(static_cast<int>(natural.top), offset);
+            const bool hidden = pane::Classify(top, top + h, viewTop, viewBottom) == pane::Visibility::Hidden;
+            if (hidden && !IsWindowVisible(child)) continue;
+            const UINT flags = hidden && GetFocus() != child ?
+                (SWP_HIDEWINDOW | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW) : kMoveFlags;
+            SetWindowPos(child, nullptr, left, top, 0, 0, flags);
+        }
     }
 
     bool QuickSiftApplicationImpl::ScrollPaneBy(int deltaPx) {
@@ -864,8 +905,11 @@ namespace {
         if (index >= paneScrollOffset_.size() || paneNaturalRects_.empty()) return false;
         const int viewH = static_cast<int>(paneViewport_.bottom - paneViewport_.top);
         const int before = paneScrollOffset_[index];
-        const int after = quicksift::core::pane::ClampScroll(before + deltaPx, paneContentHeight_, viewH);
-        if (after == before) return false;
+        const int after = quicksift::core::pane::ScrollBy(before, deltaPx, paneContentHeight_, viewH);
+        if (after == before) {
+            paneWheel_ = {}; // at an edge: no stored remainder may fire on the reverse gesture
+            return false;
+        }
         paneScrollOffset_[index] = after;
         quicksift::ui::framework::MacOsUiFramework::HideOverflowTip(nullptr);
         RepositionPaneScroll();
@@ -877,23 +921,27 @@ namespace {
     }
 
     bool QuickSiftApplicationImpl::HandlePaneWheel(WPARAM wParam, LPARAM lParam) {
+        namespace pane = quicksift::core::pane;
         if (activeFlyout_ == FlyoutPanel::None || paneNaturalRects_.empty()) return false;
         const int viewH = static_cast<int>(paneViewport_.bottom - paneViewport_.top);
-        if (quicksift::core::pane::MaxScroll(paneContentHeight_, viewH) <= 0) return false;
+        if (pane::MaxScroll(paneContentHeight_, viewH) <= 0) return false;
         POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ScreenToClient(hwnd_, &point);
         RECT client{};
         GetClientRect(hwnd_, &client);
-        RECT pane = LeftPaneRect(static_cast<int>(client.right), static_cast<int>(client.bottom));
-        if (!PtInRect(&pane, point)) return false;
-        UINT lines = 3;
+        RECT paneRect = LeftPaneRect(static_cast<int>(client.right), static_cast<int>(client.bottom));
+        if (!PtInRect(&paneRect, point)) return false;
+        UINT lines = pane::kDefaultWheelLines;
         SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
         if (lines == WHEEL_PAGESCROLL) {
-            ScrollPaneBy(GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? -viewH : viewH);
+            paneWheel_ = {};
+            if (delta != 0) ScrollPaneBy(delta > 0 ? -viewH : viewH);
             return true;
         }
-        ScrollPaneBy(quicksift::core::pane::WheelStep(GET_WHEEL_DELTA_WPARAM(wParam), DipToPx(16),
-            static_cast<int>(lines)));
+        const int step = pane::TakeWheelPixels(paneWheel_, delta, DipToPx(pane::kWheelLinePixelsDip),
+            static_cast<int>(lines));
+        if (step != 0) ScrollPaneBy(step);
         return true; // consumed even at the ends: the canvas must not scroll under the pane
     }
 

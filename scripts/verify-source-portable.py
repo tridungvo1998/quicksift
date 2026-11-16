@@ -1091,7 +1091,8 @@ def verify_polish_contracts(root: Path) -> None:
                   "localization_checks.cpp", "metadata_progress_checks.cpp", "ui_state_checks.cpp",
                   "raw_preview_checks.cpp", "search_query_checks.cpp", "jpeg_xmp_checks.cpp",
                   "sidecar_write_checks.cpp", "lifecycle_checks.cpp", "view_load_checks.cpp",
-                  "filmstrip_checks.cpp", "xmp_interop_checks.cpp", "keyboard_shortcut_checks.cpp"):
+                  "filmstrip_checks.cpp", "xmp_interop_checks.cpp", "keyboard_shortcut_checks.cpp",
+                  "pane_scroll_checks.cpp"):
         if not (root / "scripts" / "checks" / check).exists():
             fail(f"portable check program is missing: scripts/checks/{check}")
 
@@ -1284,6 +1285,20 @@ def verify_pane_scroll_paint_contracts(root: Path) -> None:
     reposition = strip_cpp(function_body(pane_raw, "void QuickSiftApplicationImpl::RepositionPaneScroll("))
     if reposition.count("InvalidateUnderHiddenPaneChild(") < 2:
         fail("RepositionPaneScroll must invalidate the vacated rect on every move and hide")
+    # 0.9.6.0: children are placed from the natural model whenever their live
+    # position differs (the "offset != 0" shortcut left them clumped at the top),
+    # in one DeferWindowPos batch; every offset write is clamped/saturated.
+    for token in ("pane::NeedsReposition(", "pane::ScrolledTop(", "BeginDeferWindowPos(", "EndDeferWindowPos("):
+        if token not in reposition:
+            fail(f"RepositionPaneScroll must place children from the natural model: {token}")
+    if re.search(r"offset\s*!=\s*0\s*\|\|\s*wasClipped", reposition):
+        fail("RepositionPaneScroll must not skip moves at offset 0 (Settings clump regression)")
+    if "pane::ScrollBy(" not in strip_cpp(function_body(pane_raw, "bool QuickSiftApplicationImpl::ScrollPaneBy(")):
+        fail("ScrollPaneBy must use the saturating clamp helper")
+    if "pane::TakeWheelPixels(" not in strip_cpp(function_body(pane_raw, "bool QuickSiftApplicationImpl::HandlePaneWheel(")):
+        fail("HandlePaneWheel must accumulate high-resolution wheel deltas")
+    if not (root / "scripts/checks/pane_scroll_checks.cpp").exists():
+        fail("portable check program is missing: scripts/checks/pane_scroll_checks.cpp")
     hide = strip_cpp(function_body(pane_raw, "void QuickSiftApplicationImpl::HideLeftPaneSectionContentExcept("))
     if "InvalidateUnderHiddenPaneChild(" not in hide:
         fail("hiding a pane child must repaint what was under it")
