@@ -14,9 +14,50 @@ $script:QuickSiftFailureHintLimit = 12
 
 # Native output lines worth remembering for the explanation. Only matching lines
 # are kept (at most QuickSiftFailureHintLimit); all output is still streamed live.
-$script:QuickSiftHintPattern = '(?i)(\berror\b|fatal|not found|could not find|cannot find|too long|MSB\d{4}|LNK\d{4}|\bC\d{4}\b|SignTool|python|Windows SDK|Windows Kits)'
+$script:QuickSiftHintPattern = '(?i)(\berror\b|fatal|not found|could not find|cannot find|too long|MSB\d{4}|LNK\d{4}|\bC\d{4}\b|SignTool|python|Windows SDK|Windows Kits|No CMAKE_(C|CXX)_COMPILER)'
+
+# vcpkg port build failure ("error: building <port>:<triplet> failed with: BUILD_FAILED")
+# and the port's buildtrees log paths. Tracked separately from the hint list so a
+# noisy log cannot push them out, and so the explanation can name the failing port
+# and its log instead of guessing from unrelated lines.
+$script:QuickSiftVcpkgPortFailure = $null
+$script:QuickSiftVcpkgLogPaths = New-Object 'System.Collections.Generic.List[string]'
+$script:QuickSiftVcpkgPortFailurePattern = '(?i)error: building (?<port>[A-Za-z0-9._-]+)(\[[^\]]*\])?:(?<triplet>[A-Za-z0-9._-]+) failed with: (?<result>[A-Z_]+)'
+$script:QuickSiftVcpkgLogPathPattern = '(?i)(?<path>[A-Za-z]:[\\/][^\s"]*[\\/]buildtrees[\\/](?<port>[^\\/\s"]+)[\\/][^\\/\s"]+\.log)'
+
+function Update-QuickSiftVcpkgPortFailure([string]$Line) {
+    if ($null -eq $Line) { return }
+    if ($null -eq $script:QuickSiftVcpkgPortFailure -and $Line -match $script:QuickSiftVcpkgPortFailurePattern) {
+        $script:QuickSiftVcpkgPortFailure = [pscustomobject]@{ Port = $Matches['port']; Triplet = $Matches['triplet']; Result = $Matches['result'] }
+    }
+    if ($Line -match $script:QuickSiftVcpkgLogPathPattern -and $script:QuickSiftVcpkgLogPaths.Count -lt 32) {
+        $Path = $Matches['path']
+        if (-not $script:QuickSiftVcpkgLogPaths.Contains($Path)) { $script:QuickSiftVcpkgLogPaths.Add($Path) }
+    }
+}
+
+function Get-QuickSiftVcpkgPortFailureRule {
+    $Failure = $script:QuickSiftVcpkgPortFailure
+    if ($null -eq $Failure) { return $null }
+    # The step logs vcpkg names after "See logs for more information" end in -out.log or
+    # -err.log; the latest ones belong to the step that failed.
+    $PortLogs = @($script:QuickSiftVcpkgLogPaths | Where-Object {
+        $_ -match ('(?i)[\\/]buildtrees[\\/]' + [regex]::Escape($Failure.Port) + '[\\/][^\\/]*-(out|err)\.log$')
+    } | Select-Object -Last 2)
+    $LogStep = if ($PortLogs.Count -gt 0) {
+        'Open the library build log and find the first line that contains "error": ' + ($PortLogs -join ' ; ')
+    } else {
+        'Open the library build log (vcpkg buildtrees\' + $Failure.Port + '\*-out.log or *-err.log) and find the first line that contains "error".'
+    }
+    New-QuickSiftFailureRule '' `
+        ("vcpkg could not build the third-party library '" + $Failure.Port + "' (" + $Failure.Triplet + ', ' + $Failure.Result + ').') `
+        @($LogStep,
+          ('A compiler error there usually means this library version does not support your Visual Studio yet: update the QuickSift source (it may carry a fix in vcpkg_overlay_ports) or check https://github.com/microsoft/vcpkg/issues?q=' + $Failure.Port + '.'),
+          'A download or network error there: check your connection and run build-release.cmd again.')
+}
 
 function Add-QuickSiftFailureHint([string]$Line) {
+    Update-QuickSiftVcpkgPortFailure $Line
     if ($null -eq $Line -or $script:QuickSiftFailureHints.Count -ge $script:QuickSiftFailureHintLimit) { return }
     if ($Line -notmatch $script:QuickSiftHintPattern) { return }
     $Trimmed = $Line.Trim()
@@ -24,8 +65,8 @@ function Add-QuickSiftFailureHint([string]$Line) {
     $script:QuickSiftFailureHints.Add($Trimmed)
 }
 
-function New-QuickSiftFailureRule([string]$Pattern, [string]$Cause, [string[]]$Steps) {
-    [pscustomobject]@{ Pattern = $Pattern; Cause = $Cause; Steps = $Steps }
+function New-QuickSiftFailureRule([string]$Pattern, [string]$Cause, [string[]]$Steps, [switch]$KeepOverPortFailure) {
+    [pscustomobject]@{ Pattern = $Pattern; Cause = $Cause; Steps = $Steps; KeepOverPortFailure = [bool]$KeepOverPortFailure }
 }
 
 # Ordered: the first matching rule explains the failure.
@@ -49,15 +90,17 @@ $script:QuickSiftFailureRules = @(
     (New-QuickSiftFailureRule '(?i)path too long|PathTooLong|too long for|MSB3491|MSB3553|longer than 260|max(imum)? path|filename or extension is too long|fully qualified file name must be less than' `
         'A file path became too long for Windows.' `
         @('Move the QuickSift source folder to a short path, for example C:\src\QuickSift, and run the build again.',
-          'Or turn on Windows long path support (the "Enable Win32 long paths" policy), restart, and run the build again.')),
-    (New-QuickSiftFailureRule '(?i)Windows SDK|Windows Kits|makeappx\.exe was not found|No CMAKE_(C|CXX)_COMPILER|CMAKE_(C|CXX)_COMPILER could not be found|cannot open (include|source) file: .?(windows|kernel32|winsdkver)|LNK1181: cannot open input file .?kernel32' `
+          'Or turn on Windows long path support (the "Enable Win32 long paths" policy), restart, and run the build again.') -KeepOverPortFailure),
+    # Only real "SDK not found" signatures: informational lines that merely mention the
+    # SDK (cppwinrt prints "Generating headers for Windows SDK 10.0.x") must not match.
+    (New-QuickSiftFailureRule '(?i)Windows SDK.*(not found|could not be found|was not found|cannot be found|is not installed|is missing)|(no|could not find an?y?|unable to find an?y?) (suitable |valid |installed )?Windows (10 |11 )?SDK|Windows Kits.*(not found|could not be found|was not found|does not exist)|MSB8036|makeappx\.exe was not found|No CMAKE_(C|CXX)_COMPILER|CMAKE_(C|CXX)_COMPILER could not be found|cannot open (include|source) file: .?(windows|kernel32|winsdkver)|LNK1181: cannot open input file .?kernel32' `
         'The Windows SDK (part of the Visual Studio C++ tools) is missing.' `
         @('Open the Visual Studio Installer, choose Modify, and tick "Windows 11 SDK" (or a Windows 10 SDK) under Individual components.',
-          'Close this window, open a new one, and run the build again.')),
+          'Close this window, open a new one, and run the build again.') -KeepOverPortFailure),
     (New-QuickSiftFailureRule '(?i)python.*(not found|could not be found|was not found|is not recognized|missing)|could not find python|PYTHON_EXECUTABLE' `
         'A library build step needs Python, and Python was not found.' `
         @('Install Python 3 from https://www.python.org/downloads/ and tick "Add python.exe to PATH" (or run: winget install Python.Python.3.12).',
-          'Close this window, open a new one, and run the build again.')),
+          'Close this window, open a new one, and run the build again.') -KeepOverPortFailure),
     (New-QuickSiftFailureRule '(?i)pwsh|powershell(\.exe)?.*(not recognized|not found|cannot be found)' `
         'PowerShell could not be started.' `
         @('Windows 10 and 11 include Windows PowerShell; make sure C:\Windows\System32\WindowsPowerShell\v1.0 is on PATH.',
@@ -92,7 +135,7 @@ $script:QuickSiftFailureRules = @(
     (New-QuickSiftFailureRule '(?i)being used by another process|Access to the path .* is denied|access is denied|LNK1104|LNK1168' `
         'A file the build needs to write is locked or not writable.' `
         @('Close QuickSift and Visual Studio (and any window showing the build folder), then run the build again.',
-          'If it keeps happening, restart Windows and try once more.')),
+          'If it keeps happening, restart Windows and try once more.') -KeepOverPortFailure),
     (New-QuickSiftFailureRule '(?i)error: building \S+ failed|vcpkg install failed|failed to download|Downloading \S+ failed|error: .*vcpkg-tool' `
         'A third-party library could not be downloaded or built.' `
         @('Check your internet connection (and any proxy or antivirus that blocks downloads).',
@@ -129,9 +172,17 @@ function Get-QuickSiftFailureHelp([string]$Message, [string]$Context = 'Build') 
     if ($Message -match '(?m)^\s*Command:.*\s--build\s') { $Text += "`n[build step]" }
     if ($Context -eq 'Source' -and $Text -notmatch '(?i)native Windows application') { return $script:QuickSiftSourceCheckRule }
     if ($Context -eq 'Binary') { return $script:QuickSiftBinaryCheckRule }
+    $Matched = $null
     foreach ($Rule in $script:QuickSiftFailureRules) {
-        if ($Text -match $Rule.Pattern) { return $Rule }
+        if ($Text -match $Rule.Pattern) { $Matched = $Rule; break }
     }
+    # A vcpkg port that failed to build is named with its log, unless a more
+    # specific environment cause (long path, missing SDK or Python, locked file) matched.
+    if ($null -eq $Matched -or -not $Matched.KeepOverPortFailure) {
+        $PortRule = Get-QuickSiftVcpkgPortFailureRule
+        if ($null -ne $PortRule) { return $PortRule }
+    }
+    if ($null -ne $Matched) { return $Matched }
     return $script:QuickSiftUnknownRule
 }
 

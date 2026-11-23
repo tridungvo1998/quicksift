@@ -1,0 +1,23 @@
+QuickSift overlay patch: upstream dav1d commit a34e0685b9111b9eb1d7835ea7bea5b425dced73
+"compat: Fix building with newer versions of MSVC" (Martin Storsjo, 2026-09-09),
+first released in dav1d 1.5.5 and carried by vcpkg's dav1d 1.5.4#1 (Patch Tuesday
+November 2026, microsoft/vcpkg#55001). MSVC 19.52 (VS 2026 18.12) rejects the
+undefined function-like macro __has_include_next in the compat <stdatomic.h> #if
+(error C7780 / C1017); a fallback definition lets the expression evaluate to 0.
+The compat header is only used for MSVC builds where cl lacks <stdatomic.h>.
+
+diff --git a/include/compat/msvc/stdatomic.h b/include/compat/msvc/stdatomic.h
+index 618f0ee87dbd1c4818f1a3e05781062addd81c99..d637daa5c4cc575affb6d416fa01a6829fd49a72 100644
+--- a/include/compat/msvc/stdatomic.h
++++ b/include/compat/msvc/stdatomic.h
+@@ -32,6 +32,10 @@
+ #pragma warning(push)
+ #pragma warning(disable:4067)    /* newline for __has_include_next */
+ 
++#ifndef __has_include_next
++#define __has_include_next(x) 0
++#endif
++
+ #if defined(__clang__) && __has_include_next(<stdatomic.h>)
+    /* use the clang stdatomic.h with clang-cl*/
+ #  include_next <stdatomic.h>

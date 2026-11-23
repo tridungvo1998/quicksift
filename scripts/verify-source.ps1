@@ -62,7 +62,7 @@ $RequiredFiles = @(
     'CHANGELOG.md', 'SECURITY.md', 'PRE_RELEASE_CHECKLIST.md', 'THIRD_PARTY_NOTICES.md', 'LICENSE', 'SOURCE_CODE.txt',
     'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', '.vsconfig',
     'build.cmd', 'build-release.cmd', 'build.bat', 'package-msix.bat', 'open-in-visual-studio.cmd',
-    'scripts\build-failure-help.ps1',
+    'scripts\build-failure-help.ps1', 'scripts\check-build-failure-help.ps1',
     'scripts\build.ps1', 'scripts\package-msix.ps1', 'scripts\verify-source-portable.py',
     'packaging\msix\AppxManifest.xml.in', 'packaging\msix\Assets\StoreLogo.png',
     'packaging\msix\Assets\Square44x44Logo.png', 'packaging\msix\Assets\Square150x150Logo.png',
@@ -1500,7 +1500,7 @@ foreach ($Token in @('CheckWindow()', 'CheckHitTesting()', 'CheckGeometry()', 'C
 # portable gate (both verifiers, localization + self-test, all check programs through
 # scripts/run-portable-checks.py) with read-only permissions. Parity: verify_ci_workflow_contracts.
 $CiWorkflowText = Read-SourceText '.github\workflows\ci.yml'
-foreach ($Token in @('workflow_dispatch:', 'pull_request:', 'branches: [main]', 'contents: read', 'cancel-in-progress: true', 'windows-latest', './scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg', 'VCPKG_BINARY_SOURCES=clear;files,', 'actions/cache/restore@v6', 'actions/cache/save@v6', 'python scripts/verify-source-portable.py', './scripts/verify-source.ps1', 'python scripts/check-localization.py --self-test', 'python scripts/check-localization.py', 'python scripts/run-portable-checks.py', 'CXX: g++-14', 'actions/upload-artifact@v7', 'if: failure()', 'git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT', '--is-shallow-repository', 'remote.origin.promisor', 'GIT_NO_LAZY_FETCH', 'quicksift-build-logs')) {
+foreach ($Token in @('workflow_dispatch:', 'pull_request:', 'branches: [main]', 'contents: read', 'cancel-in-progress: true', 'windows-latest', './scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg', 'VCPKG_BINARY_SOURCES=clear;files,', 'actions/cache/restore@v6', 'actions/cache/save@v6', 'python scripts/verify-source-portable.py', './scripts/verify-source.ps1', 'python scripts/check-localization.py --self-test', 'python scripts/check-localization.py', 'python scripts/run-portable-checks.py', 'CXX: g++-14', 'actions/upload-artifact@v7', 'if: failure()', 'git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT', '--is-shallow-repository', 'remote.origin.promisor', 'GIT_NO_LAZY_FETCH', 'quicksift-build-logs', './scripts/check-build-failure-help.ps1')) {
     if (-not $CiWorkflowText.Contains($Token)) { throw "CI workflow is missing: $Token" }
 }
 if (-not ($CiWorkflowText -match '(?m)^\s*(?:run:\s*)?python scripts/check-localization\.py\s*$')) { throw 'CI workflow is missing: python scripts/check-localization.py' }
@@ -1514,6 +1514,37 @@ if ([regex]::IsMatch($CiWorkflowText, 'if-no-files-found:\s*ignore')) { throw 'C
 $CiRunnerText = Read-SourceText 'scripts\run-portable-checks.py'
 foreach ($Token in @('glob("*.cpp")', 'libQuickSiftCore.a', 'src/localization.cpp', 'QS_WARNINGS_AS_ERRORS=ON')) {
     if (-not $CiRunnerText.Contains($Token)) { throw "scripts/run-portable-checks.py is missing: $Token" }
+}
+
+# 0.9.6.0 CI run 45105180368: MSVC 19.52 (VS 2026 18.12) rejects dav1d 1.5.3's compat
+# <stdatomic.h> (C7780 on __has_include_next). vcpkg_overlay_ports\dav1d is the baseline port
+# plus upstream commit a34e0685, and a vcpkg port BUILD_FAILED is explained by naming the port
+# and its log, not as a missing Windows SDK. Parity: verify_vcpkg_overlay_contracts.
+$Dav1dOverlay = 'vcpkg_overlay_ports\dav1d'
+foreach ($Name in @('portfile.cmake', 'vcpkg.json', 'usage', 'msvc-has-include-next.patch')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir (Join-Path $Dav1dOverlay $Name)) -PathType Leaf)) { throw "Missing vcpkg overlay port file: $Dav1dOverlay\$Name" }
+}
+$Dav1dSha512 = '8d976b93135213d41385c20205475269a6826a68ebfd716c4d9a7a3ff2a79703e8df0573e43207c81b5db44807d2721db18ec84c0fc6bef98efab86a2cccb6cc'
+$Dav1dPortfileText = Read-SourceText "$Dav1dOverlay\portfile.cmake"
+foreach ($Token in @('REPO videolan/dav1d', 'REF "${VERSION}"', "SHA512 $Dav1dSha512", 'PATCHES', 'msvc-has-include-next.patch')) {
+    if (-not $Dav1dPortfileText.Contains($Token)) { throw "$Dav1dOverlay\portfile.cmake is missing: $Token" }
+}
+$Dav1dManifest = (Read-SourceText "$Dav1dOverlay\vcpkg.json") | ConvertFrom-Json
+if ($Dav1dManifest.name -ne 'dav1d' -or $Dav1dManifest.version -ne '1.5.3') { throw "$Dav1dOverlay\vcpkg.json must stay dav1d 1.5.3 (the version pinned by the builtin-baseline)." }
+$Dav1dPatchText = Read-SourceText "$Dav1dOverlay\msvc-has-include-next.patch"
+foreach ($Token in @('+++ b/include/compat/msvc/stdatomic.h', '+#ifndef __has_include_next', '+#define __has_include_next(x) 0', ' #if defined(__clang__) && __has_include_next(<stdatomic.h>)')) {
+    if (-not $Dav1dPatchText.Contains($Token)) { throw "$Dav1dOverlay\msvc-has-include-next.patch is missing: $Token" }
+}
+if ($Dav1dPatchText -match '[^\x00-\x7F]') { throw "$Dav1dOverlay\msvc-has-include-next.patch must stay ASCII." }
+if (-not (Read-SourceText '.gitattributes').Contains('vcpkg_overlay_ports/**/*.patch -text')) { throw '.gitattributes must keep vcpkg overlay patches byte-for-byte (vcpkg_overlay_ports/**/*.patch -text).' }
+if (-not (Read-SourceText 'scripts\build.ps1').Contains("-DVCPKG_OVERLAY_PORTS=`$(Join-Path `$SourceDir 'vcpkg_overlay_ports')")) { throw 'scripts/build.ps1 must pass vcpkg_overlay_ports to vcpkg.' }
+foreach ($Token in @('$script:QuickSiftVcpkgPortFailurePattern', 'function Get-QuickSiftVcpkgPortFailureRule', 'Update-QuickSiftVcpkgPortFailure $Line', 'KeepOverPortFailure', 'MSB8036')) {
+    if (-not $FailureHelpText.Contains($Token)) { throw "Build failure helper is missing: $Token" }
+}
+if ([regex]::IsMatch($FailureHelpText, "New-QuickSiftFailureRule '\(\?i\)Windows SDK\|")) { throw 'The missing-SDK explanation must match real SDK-not-found errors, not any line that mentions the SDK.' }
+$FailureHelpCheckText = Read-SourceText 'scripts\check-build-failure-help.ps1'
+foreach ($Token in @('. $HelperPath', 'error: building dav1d:x64-windows-static failed with: BUILD_FAILED', '-- Generating headers for Windows SDK', 'MSB8036')) {
+    if (-not $FailureHelpCheckText.Contains($Token)) { throw "scripts/check-build-failure-help.ps1 is missing: $Token" }
 }
 
 Write-Host 'QuickSift native source verification passed.' -ForegroundColor Green

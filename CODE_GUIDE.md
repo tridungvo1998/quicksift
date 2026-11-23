@@ -292,7 +292,7 @@ The build has one owner: `scripts/build.ps1`. The root `.cmd` files are intentio
 - `build-release.cmd` verifies, builds, checks, and packages Release.
 - `open-in-visual-studio.cmd` configures an external solution and opens it.
 
-When any of them fails, the trap in each script prints `Build failed:` (one-sentence cause), `What to do:` (1–3 steps) and `Technical detail:`, and keeps the non-zero exit code. Causes and steps live in one table, `scripts/build-failure-help.ps1` (ASCII only). Add a new known failure there, not in the calling script.
+When any of them fails, the trap in each script prints `Build failed:` (one-sentence cause), `What to do:` (1–3 steps) and `Technical detail:`, and keeps the non-zero exit code. Causes and steps live in one table, `scripts/build-failure-help.ps1` (ASCII only). Add a new known failure there, not in the calling script. A vcpkg `BUILD_FAILED` is explained by naming the port and its buildtrees log; environment rules marked `-KeepOverPortFailure` (long path, missing SDK or Python, locked file) win over it. Keep rule patterns to real error signatures, and add a replayed sample to `scripts/check-build-failure-help.ps1` for every new rule.
 
 Do not add dependency discovery, generator selection, signing, or packaging logic to another script. Extend `scripts/build.ps1` and add a regression/source-verifier rule when practical.
 

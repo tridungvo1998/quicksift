@@ -59,6 +59,10 @@ jobs:
       - name: Localization check
         run: python scripts/check-localization.py
 
+      - name: Build failure explanation check
+        shell: pwsh
+        run: ./scripts/check-build-failure-help.ps1
+
       - name: Build the portable core and run all check programs
         run: >-
           python scripts/run-portable-checks.py

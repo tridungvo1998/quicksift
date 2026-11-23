@@ -111,6 +111,7 @@ Source rules, enforced by both verifiers (`verify_session_log_browser_contracts`
 
 - The session log browser is read-only. The controller has no delete, move or file-open call. `ReadSessionLogTail` validates the name, opens with `GENERIC_READ` + `FILE_FLAG_OPEN_REPARSE_POINT`, rejects reparse points and reads through `PlanTail`. The worker uses a lifetime token, teardown joins it, its IDs are in `ui_command_ids.h`, and `lifecycle_checks` runs `SessionLogBrowserChecks`.
 - Every build script dot-sources `scripts/build-failure-help.ps1` (ASCII only) and has a trap that prints the explanation and exits 1. The `.cmd` wrappers keep `%ERRORLEVEL%` and explain a missing PowerShell.
+- `scripts/check-build-failure-help.ps1` (PowerShell 7 or 5.1, builds nothing) replays sample build output through those explanations. It checks that a vcpkg port `BUILD_FAILED` names the port and its log, that only real SDK-not-found errors say the SDK is missing, and that the environment causes keep priority. CI runs it in the portable job.
 
 Manual checks:
 

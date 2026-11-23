@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import io
+import json
 import re
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -212,7 +213,7 @@ def verify(root: Path) -> None:
                      "build.cmd", "build-release.cmd", "build.bat", "package-msix.bat",
                      "open-in-visual-studio.cmd", "LICENSE", "SOURCE_CODE.txt",
                      "scripts/verify-source.ps1", "scripts/build.ps1", "scripts/package-msix.ps1",
-                     "scripts/build-failure-help.ps1",
+                     "scripts/build-failure-help.ps1", "scripts/check-build-failure-help.ps1",
                      "packaging/msix/AppxManifest.xml.in",
                      "packaging/msix/Assets/StoreLogo.png",
                      "packaging/msix/Assets/Square44x44Logo.png",
@@ -1043,6 +1044,7 @@ def verify(root: Path) -> None:
     verify_view_load_contracts(root)
     verify_filmstrip_contracts(root)
     verify_ci_workflow_contracts(root)
+    verify_vcpkg_overlay_contracts(root)
 
 
 CI_WORKFLOW_TOKENS = (
@@ -1068,6 +1070,7 @@ CI_WORKFLOW_TOKENS = (
     "remote.origin.promisor",
     "GIT_NO_LAZY_FETCH",
     "quicksift-build-logs",
+    "./scripts/check-build-failure-help.ps1",
 )
 
 
@@ -1099,6 +1102,52 @@ def verify_ci_workflow_contracts(root: Path) -> None:
         if token not in runner:
             fail(f"scripts/run-portable-checks.py is missing: {token}")
 
+
+
+DAV1D_OVERLAY_SHA512 = ("8d976b93135213d41385c20205475269a6826a68ebfd716c4d9a7a3ff2a79703"
+                        "e8df0573e43207c81b5db44807d2721db18ec84c0fc6bef98efab86a2cccb6cc")
+
+
+def verify_vcpkg_overlay_contracts(root: Path) -> None:
+    """0.9.6.0 CI run 45105180368: MSVC 19.52 (VS 2026 18.12) rejects dav1d 1.5.3's compat
+    <stdatomic.h> (C7780 on __has_include_next). vcpkg_overlay_ports/dav1d is the baseline
+    port plus upstream commit a34e0685, and a vcpkg port BUILD_FAILED is explained by naming
+    the port and its log, not as a missing Windows SDK. Parity: verify-source.ps1."""
+    overlay = "vcpkg_overlay_ports/dav1d"
+    for name in ("portfile.cmake", "vcpkg.json", "usage", "msvc-has-include-next.patch"):
+        if not (root / overlay / name).is_file():
+            fail(f"missing vcpkg overlay port file: {overlay}/{name}")
+    portfile = read(root, f"{overlay}/portfile.cmake")
+    for token in ("REPO videolan/dav1d", 'REF "${VERSION}"', f"SHA512 {DAV1D_OVERLAY_SHA512}",
+                  "PATCHES", "msvc-has-include-next.patch"):
+        if token not in portfile:
+            fail(f"{overlay}/portfile.cmake is missing: {token}")
+    manifest = json.loads(read(root, f"{overlay}/vcpkg.json"))
+    if manifest.get("name") != "dav1d" or manifest.get("version") != "1.5.3":
+        fail(f"{overlay}/vcpkg.json must stay dav1d 1.5.3 (the version pinned by the builtin-baseline)")
+    patch = read(root, f"{overlay}/msvc-has-include-next.patch")
+    for token in ("+++ b/include/compat/msvc/stdatomic.h", "+#ifndef __has_include_next",
+                  "+#define __has_include_next(x) 0", " #if defined(__clang__) && __has_include_next(<stdatomic.h>)"):
+        if token not in patch:
+            fail(f"{overlay}/msvc-has-include-next.patch is missing: {token}")
+    if any(ord(ch) > 127 for ch in patch):
+        fail(f"{overlay}/msvc-has-include-next.patch must stay ASCII")
+    if "vcpkg_overlay_ports/**/*.patch -text" not in read(root, ".gitattributes"):
+        fail(".gitattributes must keep vcpkg overlay patches byte-for-byte (vcpkg_overlay_ports/**/*.patch -text)")
+    if "-DVCPKG_OVERLAY_PORTS=$(Join-Path $SourceDir 'vcpkg_overlay_ports')" not in read(root, "scripts/build.ps1"):
+        fail("scripts/build.ps1 must pass vcpkg_overlay_ports to vcpkg")
+    helper = read(root, "scripts/build-failure-help.ps1")
+    for token in ("$script:QuickSiftVcpkgPortFailurePattern", "function Get-QuickSiftVcpkgPortFailureRule",
+                  "Update-QuickSiftVcpkgPortFailure $Line", "KeepOverPortFailure", "MSB8036"):
+        if token not in helper:
+            fail(f"build failure helper is missing: {token}")
+    if re.search(r"New-QuickSiftFailureRule '\(\?i\)Windows SDK\|", helper):
+        fail("the missing-SDK explanation must match real SDK-not-found errors, not any line that mentions the SDK")
+    check = read(root, "scripts/check-build-failure-help.ps1")
+    for token in (". $HelperPath", "error: building dav1d:x64-windows-static failed with: BUILD_FAILED",
+                  "-- Generating headers for Windows SDK", "MSB8036"):
+        if token not in check:
+            fail(f"scripts/check-build-failure-help.ps1 is missing: {token}")
 
 def verify_localization(root: Path) -> None:
     """Runs scripts/check-localization.py (self-test first, then the tree)."""

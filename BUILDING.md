@@ -184,6 +184,11 @@ The compiler comes from `--cxx` or `$CXX`. The build folder must be outside the 
 
 vcpkg reads the manifest's `builtin-baseline` and every versioned port from that history. A shallow (`--depth`) or blobless (`--filter=blob:none`) clone leaves those objects on GitHub, and vcpkg's own git calls then have to fetch them; on the runner every port failed. The workflow checks that the clone is neither shallow nor partial and that the baseline is present offline (`GIT_NO_LAZY_FETCH`), and both verifiers reject such clone flags. All uploads are copied under the runner temp folder first, because the build folder (`%LOCALAPPDATA%`, drive C:) and the workspace (drive D:) have no common root.
 
+`vcpkg_overlay_ports` holds two local ports that replace the baseline versions:
+
+- `libyuv` is built with clang-cl so its x64 SIMD code is enabled.
+- `dav1d` is the baseline dav1d 1.5.3 port plus upstream commit a34e0685 (`msvc-has-include-next.patch`). Without it, MSVC 19.52 (Visual Studio 2026 18.12) stops in dav1d's `include/compat/msvc/stdatomic.h` with error C7780 (`__has_include_next` is not defined). Remove the overlay once the baseline moves to dav1d 1.5.5 or later, which includes the fix. Both verifiers check that the overlay, its patch and the pinned source hash are present.
+
 The first Windows run on a cold cache builds every dependency and can take about an hour. CI does not sign, package an MSIX, or replace the manual matrix in [`PRE_RELEASE_CHECKLIST.md`](PRE_RELEASE_CHECKLIST.md).
 
 ## Direct verification scripts
@@ -245,7 +250,7 @@ Technical detail: Command failed with exit code 1: C:\...\cmake.exe
 Build log (share it when asking for help): C:\src\QuickSift-0.9.6.0\QuickSift-BuildLog-231502.txt
 ```
 
-Known causes include missing Visual Studio, Windows SDK, CMake, Python or PowerShell, a signing certificate, a path that is too long, library downloads, compiler errors and source/binary verifier findings. The exit code is still non-zero, so scripts and CI see the failure as before. The explanations live in `scripts/build-failure-help.ps1`.
+Known causes include missing Visual Studio, Windows SDK, CMake, Python or PowerShell, a signing certificate, a path that is too long, library downloads, compiler errors and source/binary verifier findings. When one vcpkg library fails to build, the message names it and points to its log, for example `vcpkg could not build the third-party library 'dav1d' (x64-windows-static, BUILD_FAILED).` followed by the `buildtrees\dav1d\...-out.log` path. The missing-SDK message appears only for real SDK-not-found errors. `pwsh -File scripts/check-build-failure-help.ps1` checks these explanations against sample output; CI runs it too. The exit code is still non-zero, so scripts and CI see the failure as before. The explanations live in `scripts/build-failure-help.ps1`.
 
 ### Build logs
 
