@@ -1042,6 +1042,48 @@ def verify(root: Path) -> None:
     verify_layout_constants_contracts(root)
     verify_view_load_contracts(root)
     verify_filmstrip_contracts(root)
+    verify_ci_workflow_contracts(root)
+
+
+CI_WORKFLOW_TOKENS = (
+    "workflow_dispatch:",
+    "pull_request:",
+    "branches: [main]",
+    "contents: read",
+    "cancel-in-progress: true",
+    "windows-latest",
+    "./scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg",
+    "VCPKG_BINARY_SOURCES=clear;files,",
+    "actions/cache/restore@v4",
+    "actions/cache/save@v4",
+    "python scripts/verify-source-portable.py",
+    "./scripts/verify-source.ps1",
+    "python scripts/check-localization.py --self-test",
+    "python scripts/run-portable-checks.py",
+    "CXX: g++-14",
+    "actions/upload-artifact@v4",
+    "if: failure()",
+)
+
+
+def verify_ci_workflow_contracts(root: Path) -> None:
+    """0.9.6.0: .github/workflows/ci.yml runs the documented Windows Release build
+    and every portable gate (both verifiers, localization + self-test, all check
+    programs through scripts/run-portable-checks.py) with read-only permissions."""
+    workflow = read(root, ".github/workflows/ci.yml")
+    for token in CI_WORKFLOW_TOKENS:
+        if token not in workflow:
+            fail(f"CI workflow is missing: {token.strip()}")
+    if not re.search(r"^\s*(?:run:\s*)?python scripts/check-localization\.py\s*$", workflow, re.MULTILINE):
+        fail("CI workflow is missing: python scripts/check-localization.py")
+    if re.search(r"^permissions:\s*write-all|:\s*write\s*$", workflow, re.MULTILINE):
+        fail("CI workflow must stay least-privilege (no write permissions)")
+    if re.search(r"uses:\s*[^@\s]+\s*$", workflow, re.MULTILINE):
+        fail("CI workflow actions must be pinned to a version")
+    runner = read(root, "scripts/run-portable-checks.py")
+    for token in ('glob("*.cpp")', "libQuickSiftCore.a", "src/localization.cpp", "QS_WARNINGS_AS_ERRORS=ON"):
+        if token not in runner:
+            fail(f"scripts/run-portable-checks.py is missing: {token}")
 
 
 def verify_localization(root: Path) -> None:

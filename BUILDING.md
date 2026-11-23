@@ -165,6 +165,23 @@ cmake --build build-portable
 
 This validates portable policy, metadata helpers, cache behavior, and source structure. It does not compile or execute the native Win32 application.
 
+To build the core and run every deterministic check program in one step (standard-library Python only):
+
+```text
+python3 scripts/run-portable-checks.py --build-dir /tmp/qs-core --log-dir /tmp/qs-check-logs
+```
+
+The compiler comes from `--cxx` or `$CXX`. The build folder must be outside the source tree.
+
+## Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`, on pull requests and on manual dispatch. It has read-only `contents` permission, and a newer run on the same branch or pull request cancels the older one.
+
+- **Portable checks** (`ubuntu-24.04`, GCC 14 installed explicitly): `verify-source-portable.py`, `verify-source.ps1` under PowerShell 7, `check-localization.py --self-test` and `check-localization.py`, then `scripts/run-portable-checks.py`, which builds the core with warnings as errors and runs every program in `scripts/checks/`. No pip packages are needed. Logs are uploaded when a step fails.
+- **Windows Release build** (`windows-latest`, MSVC): clones vcpkg (the manifest's `builtin-baseline` is resolved from its history) and runs `scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg`. That is the documented Release path: source verification, the hardened configure/build with `vcpkg_overlay_ports`, and `verify-binary.ps1`. Built vcpkg packages are kept in a file binary cache, restored and saved with `actions/cache`, so LibRaw, Exiv2 and the other dependencies are only rebuilt when their inputs or the runner image change. The run uploads `QuickSift.exe` (kept for 14 days); when it fails, it uploads the build transcript and the CMake/vcpkg logs instead.
+
+The first Windows run on a cold cache builds every dependency and can take about an hour. CI does not sign, package an MSIX, or replace the manual matrix in [`PRE_RELEASE_CHECKLIST.md`](PRE_RELEASE_CHECKLIST.md).
+
 ## Direct verification scripts
 
 ```powershell

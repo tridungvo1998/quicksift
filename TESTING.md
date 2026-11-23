@@ -56,6 +56,8 @@ Localization is also checked by `scripts/check-localization.py` (run by `scripts
 
 Each must exit 0 with `0 failures`. All of them can be linked against the portable `libQuickSiftCore.a`.
 
+`scripts/run-portable-checks.py` builds the core and runs every program in `scripts/checks/`. The CI workflow ([`.github/workflows/ci.yml`](.github/workflows/ci.yml), described in [`BUILDING.md`](BUILDING.md#continuous-integration)) runs it with GCC 14 on Ubuntu, together with both source verifiers and the localization checker and its self-test. A Windows job runs the documented Release build and binary verification. Both verifiers require the workflow and its gates. CI replaces neither the manual Windows matrix nor UI testing.
+
 ## Manual regression philosophy
 
 UI behavior, filesystem operations, cancellation, metadata writing, and other

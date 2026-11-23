@@ -9,6 +9,13 @@
 - **Maintainability:** the large functions were split, data-only state structs were added, layout constants are named, and CODE_GUIDE is the documentation hub.
 - **Repository:** the stale historical notes were removed (`notes/`, `PRE_RELEASE_AUDIT.md`, `VALIDATION.md`, `MODULARIZATION_NOTES.md`), as were the generated `SOURCE_MANIFEST.sha256` and `codebase_bundle.*`. A `.gitignore` was added.
 
+### Continuous integration
+
+- **GitHub Actions CI** (`.github/workflows/ci.yml`) runs on pushes to `main`, on pull requests and on manual dispatch, with read-only permissions. A newer run cancels the one it replaces.
+  - An Ubuntu job installs GCC 14 and runs both source verifiers, the localization checker and its self-test, and every deterministic check program. The new `scripts/run-portable-checks.py` builds the portable core with warnings as errors for this.
+  - A Windows job runs the documented `scripts/build.ps1` Release build with binary verification and uploads `QuickSift.exe`. It caches vcpkg binary packages so dependencies are not rebuilt on every run.
+  - Logs are uploaded when a job fails, and both verifiers require the workflow. The README shows a status badge.
+
 ### Fixed: Settings pane scrolling
 
 - **Scrolling the Settings pane past the top no longer piles its buttons and section titles on top of each other.** When scrolling returned to the very top, the controls that had stayed fully visible kept their scrolled position while the ones scrolled out of view came back at their normal place, so they overlapped near the top. Every control is now placed from the layout at the clamped scroll position (one batched move), in every section that scrolls. Huge wheel deltas are clamped safely, and precision-touchpad scrolling accumulates small movements instead of dropping them.

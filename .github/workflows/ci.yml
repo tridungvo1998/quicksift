@@ -1,0 +1,172 @@
+# QuickSift continuous integration (see BUILDING.md -> "Continuous integration").
+#
+# windows-build    : the documented native Release build (scripts/build.ps1), which
+#                    runs scripts/verify-source.ps1, compiles with warnings as errors
+#                    and verifies the binary (scripts/verify-binary.ps1). vcpkg uses the
+#                    manifest baseline in vcpkg.json, vcpkg_overlay_ports and a file
+#                    binary cache restored by actions/cache.
+# portable-checks  : both source verifiers, the localization checker (+ self-test)
+#                    and every deterministic program in scripts/checks/ against the
+#                    portable core, with a pinned GCC.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  portable-checks:
+    name: Portable checks (Ubuntu, GCC 14)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CXX: g++-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the pinned compiler and Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++-14 ninja-build
+          g++-14 --version
+          cmake --version
+          pwsh --version
+
+      # Standard library only: the verifiers need no pip packages.
+      - name: Portable source verifier
+        run: python scripts/verify-source-portable.py
+
+      - name: Native source verifier (PowerShell)
+        shell: pwsh
+        run: ./scripts/verify-source.ps1
+
+      - name: Localization checker self-test
+        run: python scripts/check-localization.py --self-test
+
+      - name: Localization check
+        run: python scripts/check-localization.py
+
+      - name: Build the portable core and run all check programs
+        run: >-
+          python scripts/run-portable-checks.py
+          --cxx "$CXX"
+          --build-dir "$RUNNER_TEMP/quicksift-portable-core"
+          --log-dir "$RUNNER_TEMP/quicksift-check-logs"
+
+      - name: Upload check logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-check-logs
+          path: ${{ runner.temp }}/quicksift-check-logs/*.log
+          if-no-files-found: ignore
+
+  windows-build:
+    name: Windows Release build (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      VCPKG_DISABLE_METRICS: "1"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # Build the exact tracked bytes (LF), as the portable job and source ZIP do.
+      - name: Keep repository line endings
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Locate build folders
+        run: |
+          # scripts/build.ps1 keeps all generated files under %LOCALAPPDATA%\QuickSiftBuild.
+          $Cache = Join-Path $env:RUNNER_TEMP 'vcpkg-binary-cache'
+          New-Item -ItemType Directory -Force -Path $Cache | Out-Null
+          @(
+            "QS_BUILD_HOME=$env:LOCALAPPDATA\QuickSiftBuild"
+            "VCPKG_ROOT=$(Join-Path $env:RUNNER_TEMP 'vcpkg')"
+            "VCPKG_BINARY_CACHE_DIR=$Cache"
+            "VCPKG_BINARY_SOURCES=clear;files,$Cache,readwrite"
+            "QS_RUNNER_IMAGE=${env:ImageOS}-${env:ImageVersion}"
+          ) | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      # vcpkg ABI hashes include the compiler, so the runner image version is part
+      # of the key; restore-keys still reuse every package whose ABI is unchanged.
+      # Each save gets a unique (run id) key, so packages built after a partial
+      # restore are never lost; a save only happens when vcpkg added packages.
+      - name: Restore vcpkg binary cache
+        id: vcpkg-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-${{ hashFiles('vcpkg.json', 'vcpkg_overlay_ports/**') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-${{ hashFiles('vcpkg.json', 'vcpkg_overlay_ports/**') }}-
+            vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-
+            vcpkg-bin-${{ runner.os }}-
+
+      - name: Count cached vcpkg packages
+        run: |
+          $Count = @(Get-ChildItem -LiteralPath $env:VCPKG_BINARY_CACHE_DIR -Recurse -File -Filter *.zip).Count
+          Write-Host "Restored $Count vcpkg binary packages"
+          "QS_VCPKG_RESTORED=$Count" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Install vcpkg (contains the vcpkg.json builtin-baseline)
+        run: |
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg clone failed ($LASTEXITCODE)" }
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed ($LASTEXITCODE)" }
+
+      - name: Release build, source and binary verification
+        run: ./scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg
+
+      # Saved even when the application build fails, so dependencies that already
+      # built (LibRaw, Exiv2, libavif/dav1d, ...) are not rebuilt by the next run.
+      - name: Check for new vcpkg packages
+        id: vcpkg-new
+        if: always()
+        run: |
+          $Count = @(Get-ChildItem -LiteralPath $env:VCPKG_BINARY_CACHE_DIR -Recurse -File -Filter *.zip -ErrorAction SilentlyContinue).Count
+          Write-Host "vcpkg binary packages: $env:QS_VCPKG_RESTORED restored, $Count now"
+          "changed=$([int]($Count -gt [int]$env:QS_VCPKG_RESTORED))" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Save vcpkg binary cache
+        if: always() && steps.vcpkg-new.outputs.changed == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
+          key: vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-${{ hashFiles('vcpkg.json', 'vcpkg_overlay_ports/**') }}-${{ github.run_id }}
+
+      - name: Upload QuickSift.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickSift-windows-x64-Release
+          path: ${{ env.QS_BUILD_HOME }}/cmake-vs*/Release/QuickSift.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-logs
+          path: |
+            QuickSift-BuildLog-*.txt
+            ${{ env.QS_BUILD_HOME }}/cmake-vs*/CMakeFiles/*.log
+            ${{ env.QS_BUILD_HOME }}/cmake-vs*/vcpkg-manifest-install.log
+            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
+          if-no-files-found: ignore

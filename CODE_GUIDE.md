@@ -710,7 +710,10 @@ pwsh -NoProfile -File scripts/verify-source.ps1   # PowerShell 7 also works off 
 cmake -S . -B build -DQS_WARNINGS_AS_ERRORS=ON
 cmake --build build --config Release
 # then build and run each scripts/checks/*.cpp against libQuickSiftCore (see TESTING.md); each must exit 0
+python scripts/run-portable-checks.py --build-dir <outside-the-tree>   # core build + every check program
 ```
+
+`.github/workflows/ci.yml` runs this sequence on Ubuntu (GCC 14) and the Windows Release build (`scripts/build.ps1 -Configuration Release -VerifyBinary`) on every push to `main` and every pull request; see [`BUILDING.md`](BUILDING.md#continuous-integration). When you add a gate here, add it to the workflow and to `verify_ci_workflow_contracts` in both verifiers.
 
 Run sanitizer builds where the compiler supports them.
 

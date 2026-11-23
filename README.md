@@ -1,5 +1,7 @@
 # QuickSift 0.9.6.0 RC
 
+[![CI](https://github.com/tridungvo1998/quicksift/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tridungvo1998/quicksift/actions/workflows/ci.yml)
+
 QuickSift is a native Windows photo-culling application built for fast, careful review of production media. Version **0.9.6.0 RC** is a release candidate: the feature set is substantially complete, but the native Windows binary still requires final build, signing, clean-machine, and destructive-operation validation before public release.
 
 ## Documentation map
