@@ -15,6 +15,9 @@
   - An Ubuntu job installs GCC 14 and runs both source verifiers, the localization checker and its self-test, and every deterministic check program. The new `scripts/run-portable-checks.py` builds the portable core with warnings as errors for this.
   - A Windows job runs the documented `scripts/build.ps1` Release build with binary verification and uploads `QuickSift.exe`. It caches vcpkg binary packages so dependencies are not rebuilt on every run.
   - Logs are uploaded when a job fails, and both verifiers require the workflow. The README shows a status badge.
+  - **Fixed after the first run:** the Windows job cloned vcpkg blobless (`--filter=blob:none`). vcpkg could not fetch the baseline and versioned port files it needs, so every dependency failed to install. The workflow now makes a full clone and checks the baseline offline before building. `scripts/build.ps1` now also makes a full clone when it installs its private vcpkg. Both verifiers reject shallow, blobless or single-branch vcpkg clones.
+  - **Fixed after the first run:** failure logs could not be uploaded, because the build folder (drive C:) and the workspace (drive D:) share no root. Logs and `QuickSift.exe` are now staged under the runner temp folder before upload, and an empty log upload now warns.
+  - Actions moved to their current Node 24 majors: checkout v7, setup-python v7, cache v6 and upload-artifact v7.
 
 ### Fixed: Settings pane scrolling
 

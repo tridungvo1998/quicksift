@@ -31,9 +31,9 @@ jobs:
     env:
       CXX: g++-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -68,11 +68,11 @@ jobs:
 
       - name: Upload check logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: portable-check-logs
           path: ${{ runner.temp }}/quicksift-check-logs/*.log
-          if-no-files-found: ignore
+          if-no-files-found: warn
 
   windows-build:
     name: Windows Release build (MSVC)
@@ -88,7 +88,7 @@ jobs:
       - name: Keep repository line endings
         run: git config --global core.autocrlf false
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Locate build folders
         run: |
@@ -109,7 +109,7 @@ jobs:
       # restore are never lost; a save only happens when vcpkg added packages.
       - name: Restore vcpkg binary cache
         id: vcpkg-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
           key: vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-${{ hashFiles('vcpkg.json', 'vcpkg_overlay_ports/**') }}-${{ github.run_id }}
@@ -124,10 +124,23 @@ jobs:
           Write-Host "Restored $Count vcpkg binary packages"
           "QS_VCPKG_RESTORED=$Count" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 
-      - name: Install vcpkg (contains the vcpkg.json builtin-baseline)
+      # FULL clone (no --depth / --filter / --single-branch). vcpkg resolves the
+      # builtin-baseline and every versioned port tree from this repository's git
+      # objects; a blobless clone left them on the remote, and vcpkg's own lazy
+      # git fetches failed on the runner (run 45102593119: "could not fetch ...
+      # from promisor remote" for every port).
+      - name: Install vcpkg (full history containing the vcpkg.json builtin-baseline)
         run: |
-          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           if ($LASTEXITCODE -ne 0) { throw "vcpkg clone failed ($LASTEXITCODE)" }
+          $Baseline = (Get-Content -Raw vcpkg.json | ConvertFrom-Json).'builtin-baseline'
+          if ((git -C $env:VCPKG_ROOT rev-parse --is-shallow-repository) -ne 'false') { throw 'vcpkg clone is shallow' }
+          if (git -C $env:VCPKG_ROOT config --get remote.origin.promisor) { throw 'vcpkg clone is a partial (promisor) clone' }
+          # Offline proof that the baseline and its version database are local.
+          $env:GIT_NO_LAZY_FETCH = '1'
+          git -C $env:VCPKG_ROOT cat-file -e "$Baseline`:versions/baseline.json"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg baseline $Baseline is not available locally" }
+          Remove-Item Env:GIT_NO_LAZY_FETCH
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
           if ($LASTEXITCODE -ne 0) { throw "vcpkg bootstrap failed ($LASTEXITCODE)" }
 
@@ -146,27 +159,53 @@ jobs:
 
       - name: Save vcpkg binary cache
         if: always() && steps.vcpkg-new.outputs.changed == '1'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.VCPKG_BINARY_CACHE_DIR }}
           key: vcpkg-bin-${{ runner.os }}-${{ env.QS_RUNNER_IMAGE }}-${{ hashFiles('vcpkg.json', 'vcpkg_overlay_ports/**') }}-${{ github.run_id }}
 
+      # upload-artifact needs one root directory, and the build lives under
+      # %LOCALAPPDATA% (C:) while the workspace is on D:, so everything is
+      # staged under the runner temp folder first.
+      - name: Stage QuickSift.exe
+        run: |
+          $Exe = Get-ChildItem -Path "$env:QS_BUILD_HOME\cmake-vs*\Release\QuickSift.exe" | Select-Object -First 1
+          if (-not $Exe) { throw 'QuickSift.exe was not built' }
+          $Stage = Join-Path $env:RUNNER_TEMP 'quicksift-exe'
+          New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+          Copy-Item -LiteralPath $Exe.FullName -Destination $Stage
+
       - name: Upload QuickSift.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: QuickSift-windows-x64-Release
-          path: ${{ env.QS_BUILD_HOME }}/cmake-vs*/Release/QuickSift.exe
+          path: ${{ runner.temp }}/quicksift-exe/QuickSift.exe
           if-no-files-found: error
           retention-days: 14
 
+      - name: Collect build logs
+        if: failure()
+        run: |
+          $Logs = Join-Path $env:RUNNER_TEMP 'quicksift-build-logs'
+          New-Item -ItemType Directory -Force -Path $Logs | Out-Null
+          function Copy-Logs([string]$Root, [string]$Label, [string[]]$Patterns) {
+            if (-not (Test-Path -LiteralPath $Root)) { return }
+            $Base = (Resolve-Path -LiteralPath $Root).Path
+            Get-ChildItem -LiteralPath $Base -Recurse -File -Include $Patterns -ErrorAction SilentlyContinue | ForEach-Object {
+              $Target = Join-Path (Join-Path $Logs $Label) $_.FullName.Substring($Base.Length).TrimStart('\', '/')
+              New-Item -ItemType Directory -Force -Path (Split-Path $Target) | Out-Null
+              Copy-Item -LiteralPath $_.FullName -Destination $Target
+            }
+          }
+          Get-ChildItem -Path 'QuickSift-BuildLog-*.txt' -ErrorAction SilentlyContinue | Copy-Item -Destination $Logs
+          Copy-Logs $env:QS_BUILD_HOME 'QuickSiftBuild' @('*.log', 'CMakeCache.txt', 'CMakeConfigureLog.yaml')
+          Copy-Logs (Join-Path $env:VCPKG_ROOT 'buildtrees') 'vcpkg-buildtrees' @('*.log')
+          Write-Host "Collected $(@(Get-ChildItem -LiteralPath $Logs -Recurse -File).Count) log files"
+
       - name: Upload build logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-build-logs
-          path: |
-            QuickSift-BuildLog-*.txt
-            ${{ env.QS_BUILD_HOME }}/cmake-vs*/CMakeFiles/*.log
-            ${{ env.QS_BUILD_HOME }}/cmake-vs*/vcpkg-manifest-install.log
-            ${{ env.VCPKG_ROOT }}/buildtrees/**/*.log
-          if-no-files-found: ignore
+          path: ${{ runner.temp }}/quicksift-build-logs
+          if-no-files-found: warn

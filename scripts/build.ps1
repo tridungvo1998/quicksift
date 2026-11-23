@@ -237,7 +237,10 @@ function Get-VcpkgRoot($VsInstance) {
     }
 
     Write-Step 'Installing a private vcpkg checkout'
-    Invoke-Native $Git @('clone', '--filter=blob:none', 'https://github.com/microsoft/vcpkg.git', $Destination)
+    # Full clone: vcpkg reads the manifest builtin-baseline and versioned port trees
+    # from local git objects. A blobless (--filter=blob:none) clone needs network
+    # fetches from inside vcpkg's git calls, which failed in CI for every port.
+    Invoke-Native $Git @('clone', 'https://github.com/microsoft/vcpkg.git', $Destination)
     Invoke-Native (Join-Path $Destination 'bootstrap-vcpkg.bat') @('-disableMetrics') $Destination
 
     if (-not (Test-VcpkgRoot $Destination)) {

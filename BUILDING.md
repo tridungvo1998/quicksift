@@ -27,6 +27,8 @@ build.cmd
 
 That creates a strict **Debug** build, installs a private vcpkg checkout under `%LOCALAPPDATA%\QuickSiftBuild` when necessary, verifies the source, and builds all production targets.
 
+The private vcpkg checkout is a full clone (about 130 MB of git history), because vcpkg reads the manifest baseline and versioned ports from it. Older QuickSift scripts made a blobless clone. That clone still works while git can fetch from GitHub; to replace it, delete `%LOCALAPPDATA%\QuickSiftBuild\tools\vcpkg` and build again.
+
 Equivalent command:
 
 ```bat
@@ -178,7 +180,9 @@ The compiler comes from `--cxx` or `$CXX`. The build folder must be outside the 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on pushes to `main`, on pull requests and on manual dispatch. It has read-only `contents` permission, and a newer run on the same branch or pull request cancels the older one.
 
 - **Portable checks** (`ubuntu-24.04`, GCC 14 installed explicitly): `verify-source-portable.py`, `verify-source.ps1` under PowerShell 7, `check-localization.py --self-test` and `check-localization.py`, then `scripts/run-portable-checks.py`, which builds the core with warnings as errors and runs every program in `scripts/checks/`. No pip packages are needed. Logs are uploaded when a step fails.
-- **Windows Release build** (`windows-latest`, MSVC): clones vcpkg (the manifest's `builtin-baseline` is resolved from its history) and runs `scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg`. That is the documented Release path: source verification, the hardened configure/build with `vcpkg_overlay_ports`, and `verify-binary.ps1`. Built vcpkg packages are kept in a file binary cache, restored and saved with `actions/cache`, so LibRaw, Exiv2 and the other dependencies are only rebuilt when their inputs or the runner image change. The run uploads `QuickSift.exe` (kept for 14 days); when it fails, it uploads the build transcript and the CMake/vcpkg logs instead.
+- **Windows Release build** (`windows-latest`, MSVC): clones vcpkg with its full history and runs `scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg`. That is the documented Release path: source verification, the hardened configure/build with `vcpkg_overlay_ports`, and `verify-binary.ps1`. Built vcpkg packages are kept in a file binary cache, restored and saved with `actions/cache`, so LibRaw, Exiv2 and the other dependencies are only rebuilt when their inputs or the runner image change. The run uploads `QuickSift.exe` (kept for 14 days); when it fails, it uploads the build transcript and the CMake/vcpkg logs instead.
+
+vcpkg reads the manifest's `builtin-baseline` and every versioned port from that history. A shallow (`--depth`) or blobless (`--filter=blob:none`) clone leaves those objects on GitHub, and vcpkg's own git calls then have to fetch them; on the runner every port failed. The workflow checks that the clone is neither shallow nor partial and that the baseline is present offline (`GIT_NO_LAZY_FETCH`), and both verifiers reject such clone flags. All uploads are copied under the runner temp folder first, because the build folder (`%LOCALAPPDATA%`, drive C:) and the workspace (drive D:) have no common root.
 
 The first Windows run on a cold cache builds every dependency and can take about an hour. CI does not sign, package an MSIX, or replace the manual matrix in [`PRE_RELEASE_CHECKLIST.md`](PRE_RELEASE_CHECKLIST.md).
 

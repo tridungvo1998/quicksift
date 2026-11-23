@@ -1500,12 +1500,17 @@ foreach ($Token in @('CheckWindow()', 'CheckHitTesting()', 'CheckGeometry()', 'C
 # portable gate (both verifiers, localization + self-test, all check programs through
 # scripts/run-portable-checks.py) with read-only permissions. Parity: verify_ci_workflow_contracts.
 $CiWorkflowText = Read-SourceText '.github\workflows\ci.yml'
-foreach ($Token in @('workflow_dispatch:', 'pull_request:', 'branches: [main]', 'contents: read', 'cancel-in-progress: true', 'windows-latest', './scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg', 'VCPKG_BINARY_SOURCES=clear;files,', 'actions/cache/restore@v4', 'actions/cache/save@v4', 'python scripts/verify-source-portable.py', './scripts/verify-source.ps1', 'python scripts/check-localization.py --self-test', 'python scripts/check-localization.py', 'python scripts/run-portable-checks.py', 'CXX: g++-14', 'actions/upload-artifact@v4', 'if: failure()')) {
+foreach ($Token in @('workflow_dispatch:', 'pull_request:', 'branches: [main]', 'contents: read', 'cancel-in-progress: true', 'windows-latest', './scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg', 'VCPKG_BINARY_SOURCES=clear;files,', 'actions/cache/restore@v6', 'actions/cache/save@v6', 'python scripts/verify-source-portable.py', './scripts/verify-source.ps1', 'python scripts/check-localization.py --self-test', 'python scripts/check-localization.py', 'python scripts/run-portable-checks.py', 'CXX: g++-14', 'actions/upload-artifact@v7', 'if: failure()', 'git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT', '--is-shallow-repository', 'remote.origin.promisor', 'GIT_NO_LAZY_FETCH', 'quicksift-build-logs')) {
     if (-not $CiWorkflowText.Contains($Token)) { throw "CI workflow is missing: $Token" }
 }
 if (-not ($CiWorkflowText -match '(?m)^\s*(?:run:\s*)?python scripts/check-localization\.py\s*$')) { throw 'CI workflow is missing: python scripts/check-localization.py' }
 if ([regex]::IsMatch($CiWorkflowText, '(?m)^permissions:\s*write-all|:\s*write\s*$')) { throw 'CI workflow must stay least-privilege (no write permissions).' }
 if ([regex]::IsMatch($CiWorkflowText, '(?m)uses:\s*[^@\s]+\s*$')) { throw 'CI workflow actions must be pinned to a version.' }
+# Run 45102593119: a blobless vcpkg clone left the baseline/versioned port trees on the remote
+# and every port failed. vcpkg clones must carry full history.
+if ([regex]::IsMatch($CiWorkflowText, 'git\s+clone\b[^\n]*--(?:depth|filter|single-branch|shallow-)')) { throw 'CI must clone vcpkg with full history (no --depth/--filter/--single-branch).' }
+if ([regex]::IsMatch((Read-SourceText 'scripts\build.ps1'), "'clone'[^\n]*'--(?:depth|filter|single-branch|shallow-)")) { throw 'scripts/build.ps1 must clone vcpkg with full history (no --depth/--filter/--single-branch).' }
+if ([regex]::IsMatch($CiWorkflowText, 'if-no-files-found:\s*ignore')) { throw 'CI log uploads must warn when nothing was collected.' }
 $CiRunnerText = Read-SourceText 'scripts\run-portable-checks.py'
 foreach ($Token in @('glob("*.cpp")', 'libQuickSiftCore.a', 'src/localization.cpp', 'QS_WARNINGS_AS_ERRORS=ON')) {
     if (-not $CiRunnerText.Contains($Token)) { throw "scripts/run-portable-checks.py is missing: $Token" }

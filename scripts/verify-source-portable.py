@@ -1054,15 +1054,20 @@ CI_WORKFLOW_TOKENS = (
     "windows-latest",
     "./scripts/build.ps1 -Configuration Release -VerifyBinary -NoBootstrapVcpkg",
     "VCPKG_BINARY_SOURCES=clear;files,",
-    "actions/cache/restore@v4",
-    "actions/cache/save@v4",
+    "actions/cache/restore@v6",
+    "actions/cache/save@v6",
     "python scripts/verify-source-portable.py",
     "./scripts/verify-source.ps1",
     "python scripts/check-localization.py --self-test",
     "python scripts/run-portable-checks.py",
     "CXX: g++-14",
-    "actions/upload-artifact@v4",
+    "actions/upload-artifact@v7",
     "if: failure()",
+    "git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT",
+    "--is-shallow-repository",
+    "remote.origin.promisor",
+    "GIT_NO_LAZY_FETCH",
+    "quicksift-build-logs",
 )
 
 
@@ -1080,6 +1085,15 @@ def verify_ci_workflow_contracts(root: Path) -> None:
         fail("CI workflow must stay least-privilege (no write permissions)")
     if re.search(r"uses:\s*[^@\s]+\s*$", workflow, re.MULTILINE):
         fail("CI workflow actions must be pinned to a version")
+    # Run 45102593119: a blobless vcpkg clone left the baseline/versioned port trees
+    # on the remote and every port failed. vcpkg clones must carry full history.
+    shallow_clone = r"git\s+clone\b[^\n]*--(?:depth|filter|single-branch|shallow-)"
+    if re.search(shallow_clone, workflow):
+        fail("CI must clone vcpkg with full history (no --depth/--filter/--single-branch)")
+    if re.search(r"'clone'[^\n]*'--(?:depth|filter|single-branch|shallow-)", read(root, "scripts/build.ps1")):
+        fail("scripts/build.ps1 must clone vcpkg with full history (no --depth/--filter/--single-branch)")
+    if re.search(r"if-no-files-found:\s*ignore", workflow):
+        fail("CI log uploads must warn when nothing was collected")
     runner = read(root, "scripts/run-portable-checks.py")
     for token in ('glob("*.cpp")', "libQuickSiftCore.a", "src/localization.cpp", "QS_WARNINGS_AS_ERRORS=ON"):
         if token not in runner:
