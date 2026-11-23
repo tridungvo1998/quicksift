@@ -1132,6 +1132,7 @@ def verify_vcpkg_overlay_contracts(root: Path) -> None:
             fail(f"{overlay}/msvc-has-include-next.patch is missing: {token}")
     if any(ord(ch) > 127 for ch in patch):
         fail(f"{overlay}/msvc-has-include-next.patch must stay ASCII")
+    verify_zlib_overlay_contracts(root)
     if "vcpkg_overlay_ports/**/*.patch -text" not in read(root, ".gitattributes"):
         fail(".gitattributes must keep vcpkg overlay patches byte-for-byte (vcpkg_overlay_ports/**/*.patch -text)")
     if "-DVCPKG_OVERLAY_PORTS=$(Join-Path $SourceDir 'vcpkg_overlay_ports')" not in read(root, "scripts/build.ps1"):
@@ -1148,6 +1149,37 @@ def verify_vcpkg_overlay_contracts(root: Path) -> None:
                   "-- Generating headers for Windows SDK", "MSB8036"):
         if token not in check:
             fail(f"scripts/check-build-failure-help.ps1 is missing: {token}")
+
+
+ZLIB_OVERLAY_SHA512 = ("16fea4df307a68cf0035858abe2fd550250618a97590e202037acd18a666f57a"
+                       "fc10f8836cbbd472d54a0e76539d0e558cb26f059d53de52ff90634bbf4f47d4")
+
+
+def verify_zlib_overlay_contracts(root: Path) -> None:
+    """0.9.6.0: vcpkg_overlay_ports/zlib is upstream vcpkg's zlib 1.3.2#3 port (git-tree
+    ee4b8b34, microsoft/vcpkg#54826), which carries upstream zlib commit df84af25: the
+    non-blocking gzwrite buffer overflow, CVE-2026-85091 (vcpkg also lists CVE-2026-76844).
+    The pinned baseline only has 1.3.2#1. Parity: verify-source.ps1."""
+    overlay = "vcpkg_overlay_ports/zlib"
+    for name in ("portfile.cmake", "vcpkg.json", "usage", "vcpkg-cmake-wrapper.cmake",
+                 "0001-no-version-script-on-ohos.patch", "CVE-2026-76844.patch"):
+        if not (root / overlay / name).is_file():
+            fail(f"missing vcpkg overlay port file: {overlay}/{name}")
+    portfile = read(root, f"{overlay}/portfile.cmake")
+    for token in ("REPO madler/zlib", "REF v${VERSION}", f"SHA512 {ZLIB_OVERLAY_SHA512}",
+                  "0001-no-version-script-on-ohos.patch", "CVE-2026-76844.patch"):
+        if token not in portfile:
+            fail(f"{overlay}/portfile.cmake is missing: {token}")
+    manifest = json.loads(read(root, f"{overlay}/vcpkg.json"))
+    if manifest.get("name") != "zlib" or manifest.get("version") != "1.3.2" or manifest.get("port-version") != 3:
+        fail(f"{overlay}/vcpkg.json must stay zlib 1.3.2 port-version 3 (the vcpkg port with the gzwrite CVE fix)")
+    patch = read(root, f"{overlay}/CVE-2026-76844.patch")
+    for token in ("CVE-2026-85091", "+++ b/gzwrite.c", "+                state->strm.avail_in = 0;",
+                  "+                state->strm.next_in = state->in;"):
+        if token not in patch:
+            fail(f"{overlay}/CVE-2026-76844.patch is missing: {token}")
+    if any(ord(ch) > 127 for ch in patch):
+        fail(f"{overlay}/CVE-2026-76844.patch must stay ASCII")
 
 def verify_localization(root: Path) -> None:
     """Runs scripts/check-localization.py (self-test first, then the tree)."""

@@ -184,10 +184,11 @@ The compiler comes from `--cxx` or `$CXX`. The build folder must be outside the 
 
 vcpkg reads the manifest's `builtin-baseline` and every versioned port from that history. A shallow (`--depth`) or blobless (`--filter=blob:none`) clone leaves those objects on GitHub, and vcpkg's own git calls then have to fetch them; on the runner every port failed. The workflow checks that the clone is neither shallow nor partial and that the baseline is present offline (`GIT_NO_LAZY_FETCH`), and both verifiers reject such clone flags. All uploads are copied under the runner temp folder first, because the build folder (`%LOCALAPPDATA%`, drive C:) and the workspace (drive D:) have no common root.
 
-`vcpkg_overlay_ports` holds two local ports that replace the baseline versions:
+`vcpkg_overlay_ports` holds three local ports that replace the baseline versions:
 
 - `libyuv` is built with clang-cl so its x64 SIMD code is enabled.
 - `dav1d` is the baseline dav1d 1.5.3 port plus upstream commit a34e0685 (`msvc-has-include-next.patch`). Without it, MSVC 19.52 (Visual Studio 2026 18.12) stops in dav1d's `include/compat/msvc/stdatomic.h` with error C7780 (`__has_include_next` is not defined). Remove the overlay once the baseline moves to dav1d 1.5.5 or later, which includes the fix. Both verifiers check that the overlay, its patch and the pinned source hash are present.
+- `zlib` is an exact copy of upstream vcpkg's zlib 1.3.2 port-version 3. It carries upstream zlib commit df84af25, the non-blocking `gzwrite` buffer overflow fix (CVE-2026-85091; vcpkg also lists CVE-2026-76844). The pinned baseline only offers 1.3.2#1. Remove the overlay when the baseline reaches zlib 1.3.2#3 or 1.4 or later. Both verifiers check its version, patch and source hash.
 
 The first Windows run on a cold cache builds every dependency and can take about an hour. CI does not sign, package an MSIX, or replace the manual matrix in [`PRE_RELEASE_CHECKLIST.md`](PRE_RELEASE_CHECKLIST.md).
 

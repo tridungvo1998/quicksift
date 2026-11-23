@@ -298,6 +298,8 @@ Do not add dependency discovery, generator selection, signing, or packaging logi
 
 CMake remains the only project definition. Never hand-edit or commit generated `.sln` or `.vcxproj` files. The generated solution lives under `%LOCALAPPDATA%\QuickSiftBuild`, and CMake declares `QuickSift` as the startup project.
 
+`vcpkg_overlay_ports/` replaces individual baseline ports without moving the whole vcpkg baseline: `libyuv` (clang-cl SIMD build), `dav1d` (1.5.3 plus the MSVC 19.52 fix) and `zlib` (upstream vcpkg 1.3.2#3 with the gzwrite CVE fix). Copy an overlay byte-for-byte from the upstream vcpkg port tree, plus only the patch you need. Guard it in both verifiers, and remove it once the baseline catches up.
+
 `CMakePresets.json` exists for Visual Studio folder mode and command-line users who already have `VCPKG_ROOT`. The launcher scripts are the easiest path because they discover Visual Studio, CMake, and vcpkg.
 
 ---

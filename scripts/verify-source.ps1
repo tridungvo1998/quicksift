@@ -1536,6 +1536,25 @@ foreach ($Token in @('+++ b/include/compat/msvc/stdatomic.h', '+#ifndef __has_in
     if (-not $Dav1dPatchText.Contains($Token)) { throw "$Dav1dOverlay\msvc-has-include-next.patch is missing: $Token" }
 }
 if ($Dav1dPatchText -match '[^\x00-\x7F]') { throw "$Dav1dOverlay\msvc-has-include-next.patch must stay ASCII." }
+# vcpkg_overlay_ports\zlib is upstream vcpkg's zlib 1.3.2#3 port (git-tree ee4b8b34, microsoft/vcpkg#54826),
+# which carries upstream zlib commit df84af25: the non-blocking gzwrite buffer overflow, CVE-2026-85091
+# (vcpkg also lists CVE-2026-76844). The pinned baseline only has 1.3.2#1. Parity: verify_zlib_overlay_contracts.
+$ZlibOverlay = 'vcpkg_overlay_ports\zlib'
+foreach ($Name in @('portfile.cmake', 'vcpkg.json', 'usage', 'vcpkg-cmake-wrapper.cmake', '0001-no-version-script-on-ohos.patch', 'CVE-2026-76844.patch')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir (Join-Path $ZlibOverlay $Name)) -PathType Leaf)) { throw "Missing vcpkg overlay port file: $ZlibOverlay\$Name" }
+}
+$ZlibSha512 = '16fea4df307a68cf0035858abe2fd550250618a97590e202037acd18a666f57afc10f8836cbbd472d54a0e76539d0e558cb26f059d53de52ff90634bbf4f47d4'
+$ZlibPortfileText = Read-SourceText "$ZlibOverlay\portfile.cmake"
+foreach ($Token in @('REPO madler/zlib', 'REF v${VERSION}', "SHA512 $ZlibSha512", '0001-no-version-script-on-ohos.patch', 'CVE-2026-76844.patch')) {
+    if (-not $ZlibPortfileText.Contains($Token)) { throw "$ZlibOverlay\portfile.cmake is missing: $Token" }
+}
+$ZlibManifest = (Read-SourceText "$ZlibOverlay\vcpkg.json") | ConvertFrom-Json
+if ($ZlibManifest.name -ne 'zlib' -or $ZlibManifest.version -ne '1.3.2' -or $ZlibManifest.'port-version' -ne 3) { throw "$ZlibOverlay\vcpkg.json must stay zlib 1.3.2 port-version 3 (the vcpkg port with the gzwrite CVE fix)." }
+$ZlibPatchText = Read-SourceText "$ZlibOverlay\CVE-2026-76844.patch"
+foreach ($Token in @('CVE-2026-85091', '+++ b/gzwrite.c', '+                state->strm.avail_in = 0;', '+                state->strm.next_in = state->in;')) {
+    if (-not $ZlibPatchText.Contains($Token)) { throw "$ZlibOverlay\CVE-2026-76844.patch is missing: $Token" }
+}
+if ($ZlibPatchText -match '[^\x00-\x7F]') { throw "$ZlibOverlay\CVE-2026-76844.patch must stay ASCII." }
 if (-not (Read-SourceText '.gitattributes').Contains('vcpkg_overlay_ports/**/*.patch -text')) { throw '.gitattributes must keep vcpkg overlay patches byte-for-byte (vcpkg_overlay_ports/**/*.patch -text).' }
 if (-not (Read-SourceText 'scripts\build.ps1').Contains("-DVCPKG_OVERLAY_PORTS=`$(Join-Path `$SourceDir 'vcpkg_overlay_ports')")) { throw 'scripts/build.ps1 must pass vcpkg_overlay_ports to vcpkg.' }
 foreach ($Token in @('$script:QuickSiftVcpkgPortFailurePattern', 'function Get-QuickSiftVcpkgPortFailureRule', 'Update-QuickSiftVcpkgPortFailure $Line', 'KeepOverPortFailure', 'MSB8036')) {
